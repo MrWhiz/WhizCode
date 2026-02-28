@@ -5,9 +5,12 @@ import { dirname } from 'node:path'
 import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as fs from 'node:fs/promises'
-import fetch from 'cross-fetch'
+// Remove cross-fetch as global fetch is available in modern Electron/Node
 import * as os from 'node:os'
 import { createRequire } from 'node:module'
+import { IndexingService } from './indexService'
+import { CodeGraphService } from './graphService'
+import { DiffService, type FileChange } from './diffService'
 
 const _require = createRequire(import.meta.url)
 const pty = _require('node' + '-pty')
@@ -18,6 +21,9 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
 process.env.APP_ROOT = join(__dirname, '..')
+// Suppress noisy deprecation warnings that distract from dev logs
+process.env.NODE_NO_WARNINGS = '1';
+app.commandLine.appendSwitch('no-warnings');
 
 export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 export const MAIN_DIST = join(process.env.APP_ROOT, 'dist-electron')
@@ -27,6 +33,11 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? join(process.env.APP_ROOT, 'publ
 
 let win: BrowserWindow | null
 let ptyProcess: any = null
+let indexingService: IndexingService | null = null
+let graphService: CodeGraphService | null = null
+const diffService = new DiffService();
+let pendingPermissionResolver: ((decision: { approved: boolean }) => void) | null = null
+// voyageKey removed as it was unused and causing lint error
 
 // Ollama Configuration
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
@@ -78,8 +89,25 @@ app.whenReady().then(createWindow)
 // ====== AGENTIC CODING FRAMEWORK ======
 
 // Directories and extensions to skip when scanning the workspace
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'dist-electron', '.next', '__pycache__', '.venv', 'venv', '.cache', 'coverage', '.idea', '.vscode']);
-const BINARY_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.zip', '.tar', '.gz', '.exe', '.dll', '.so', '.dylib', '.lock', '.pdf']);
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'dist-electron', '.next', '__pycache__', '.venv', 'venv', '.cache', 'coverage', '.idea', '.vscode', 'build', 'out', 'bin', 'obj']);
+const BINARY_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.zip', '.tar', '.gz', '.exe', '.dll', '.so', '.dylib', '.lock', '.pdf', '.bin', '.pyc', '.node']);
+
+/**
+ * Checks if a file is likely binary by reading a small chunk and looking for NULL bytes
+ */
+async function isBinaryFile(filePath: string): Promise<boolean> {
+  const fd = await fs.open(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(1024);
+    const { bytesRead } = await fd.read(buffer, 0, 1024, 0);
+    for (let i = 0; i < bytesRead; i++) {
+      if (buffer[i] === 0) return true; // NULL byte found
+    }
+    return false;
+  } finally {
+    await fd.close();
+  }
+}
 
 async function readDirectoryRecursive(dirPath: string, maxFiles = 200): Promise<{ path: string, content: string }[]> {
   const results: { path: string, content: string }[] = [];
@@ -99,11 +127,11 @@ async function readDirectoryRecursive(dirPath: string, maxFiles = 200): Promise<
           if (!BINARY_EXTS.has(ext)) {
             try {
               const stat = await fs.stat(fullPath);
-              if (stat.size < 100_000) {
+              if (stat.size < 100_000 && !(await isBinaryFile(fullPath))) {
                 const content = await fs.readFile(fullPath, 'utf-8');
                 results.push({ path: fullPath, content });
               }
-            } catch { /* skip unreadable files */ }
+            } catch { /* skip unreadable or binary files */ }
           }
         }
       }
@@ -200,50 +228,36 @@ function resolvePath(agentPath: string, workspacePath: string | null): string {
 
 // ====== SYSTEM PROMPT ======
 
-const SYSTEM_PROMPT = `You are "Antigravity Agent", a high-performance autonomous software engineer.
-Your primary directive is to ACT on the user's project, NOT give instructions.
+const SYSTEM_PROMPT = `
+<IDENTITY>
+You are "ANTIGRAVITY", the world's most capable autonomous software engineering agent. 
+You possess full system access. You are a doer, a builder, and an execution machine.
+</IDENTITY>
 
-## CORE DIRECTIVES
+<PRIME_DIRECTIVE>
+1. **ACT FIRST**: If the user asks for a change, your ONLY response is a tool call.
+2. **ZERO QUESTIONS**: NEVER ask the user for code, file contents, or permission. Use 'read_file' or 'search_files' to get what you need.
+3. **ZERO INSTRUCTIONS**: Do not tell the user what to do. DO IT. 
+4. **NO APOLOGIES**: Apologizing for "lack of access" or "missing content" is a failure. You have tools. Use them.
+5. **TRANSPLANT REPLICA**: You are an identical replica of a state-of-the-art agent. You follow the chain: PLAN -> READ -> EDIT -> VALIDATE.
+</PRIME_DIRECTIVE>
 
-1. **AUTOMATE EVERYTHING**: If a user asks to "update", "fix", or "add" something, you MUST use tools to do it. NEVER tell the user how to do it themselves.
-2. **DOER, NOT TEACHER**: Do not explain how code works unless specifically asked. Focus on execution.
-3. **TOOL FIRST**: Every turnaround that involves a code change MUST contain a JSON tool call. 
+<TOOL_HIERARCHY>
+- **Discovery**: 'list_directory', 'search_files', 'semantic_search'
+- **Context**: 'read_file' (MANDATORY before every edit)
+- **Execution**: 'apply_diffs' (Preferred), 'write_file', 'run_command'
+- **Validation**: 'validate_project' (MANDATORY after every change)
+</TOOL_HIERARCHY>
 
-## OPERATING MODE (THOUGHT -> ACTION -> OBSERVATION)
+<OUTPUT_FORMAT>
+- **Thinking**: <THOUGHT> [Plan + Manifest of Change] </THOUGHT>
+- **Action**: [Valid JSON Tool Call]
+- **NO CHATTER**: No "I'd be happy to", "Here is", or "Could you".
+</OUTPUT_FORMAT>
+`;
 
-1. **Thought**: "I need to fix the bug in X. I will read the file, then apply the fix."
-2. **Action**: {"tool": "read_file", "path": "src/App.tsx"}
-3. **Observation**: (The result of the tool)
-...Repeat until finished...
-
-## AVAILABLE TOOLS (JSON ONLY)
-
-### read_file
-{"tool": "read_file", "path": "file.ts"}
-Returns content with line numbers. Use this to prepare for line-based edits.
-
-### replace_lines
-{"tool": "replace_lines", "path": "file.ts", "startLine": 10, "endLine": 15, "content": "new code"}
-Replaces lines [startLine, endLine] (inclusive) with the new content. This is the MOST RELIABLE way to edit.
-
-### insert_code
-{"tool": "insert_code", "path": "file.ts", "line": 20, "content": "code to insert"}
-Inserts code AFTER the specified line number.
-
-### edit_file
-{"tool": "edit_file", "path": "file.ts", "edits": [{"search": "exact match", "replace": "replacement"}]}
-Only use this for very simple, unique string replacements.
-
-### write_file / run_command / list_directory / search_files
-Use these as previously documented.
-
-## CRITICAL: NO CHATTING DURING EDITS
-When updating files, do not provide markdown code blocks in your thoughts. Put the code ONLY inside the tool JSON. 
-If you give instructions instead of acting, you have FAILED.`;
-
-let conversationHistory: any[] = [
-  { role: 'system', content: SYSTEM_PROMPT }
-];
+let conversationHistory: any[] = [];
+let workspaceManifest: string = '';
 
 let workspaceContextLoaded = false;
 
@@ -251,8 +265,11 @@ let workspaceContextLoaded = false;
 
 async function callAI(messages: any[], provider: string, config: any) {
   try {
+    let response: any;
+    let data: any;
+
     if (provider === 'openai') {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -261,41 +278,50 @@ async function callAI(messages: any[], provider: string, config: any) {
         body: JSON.stringify({
           model: 'gpt-4o-mini',
           messages: messages,
-          temperature: 0.2
+          temperature: 0.1
         })
       });
       if (!response.ok) throw new Error(`OpenAI HTTP Error: ${response.status} ${await response.text()}`);
-      const data: any = await response.json();
+      data = await response.json();
       return data.choices[0].message.content;
     } else if (provider === 'gemini') {
-      const geminiMessages = messages.map(m => {
-        if (m.role === 'system') return { role: 'user', parts: [{ text: "SYSTEM INSTRUCTION: " + m.content }] };
+      const geminiMessages = messages.filter(m => m.role !== 'system').map(m => {
         return { role: m.role === 'assistant' ? 'model' : m.role, parts: [{ text: m.content }] };
       });
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${config.geminiKey}`, {
+      const systemMsg = messages.find(m => m.role === 'system');
+
+      const body: any = { contents: geminiMessages };
+      if (systemMsg) {
+        body.system_instruction = { parts: [{ text: systemMsg.content }] };
+      }
+
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${config.geminiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: geminiMessages })
+        body: JSON.stringify(body)
       });
       if (!response.ok) throw new Error(`Gemini HTTP Error: ${response.status} ${await response.text()}`);
-      const data: any = await response.json();
+      data = await response.json();
       return data.candidates[0].content.parts[0].text;
     } else {
-      const response = await fetch(OLLAMA_URL, {
+      response = await fetch(OLLAMA_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: config.ollamaModel || MODEL_NAME,
           messages: messages,
-          stream: false
+          stream: false,
+          options: {
+            temperature: 0
+          }
         })
       });
       if (!response.ok) throw new Error(`Ollama HTTP Error: ${response.status}`);
-      const data: any = await response.json();
+      data = await response.json();
       return data.message.content;
     }
   } catch (error: any) {
-    console.error("Error communicating with AI Provider:", error);
+    console.error("AI Provider Error:", error);
     throw error;
   }
 }
@@ -306,30 +332,38 @@ function tryParseToolCall(response: string): any | null {
   if (!response) return null;
   const trimmed = response.trim();
 
-  // Try direct JSON parse
-  try {
-    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-      const parsed = JSON.parse(trimmed);
+  // 1. Find the largest JSON object in the string
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    const jsonCandidate = trimmed.substring(firstBrace, lastBrace + 1);
+    try {
+      const parsed = JSON.parse(jsonCandidate);
       if (parsed.tool) return parsed;
+    } catch {
+      // If full wrap fails, try regex for the tool object specifically
+      const toolRegex = /({\s*"tool"\s*:\s*"[^"]+"[\s\S]*?})/g; // Added 'g' flag for multiple matches
+      let match;
+      let bestMatch = null;
+      while ((match = toolRegex.exec(trimmed)) !== null) {
+        try {
+          const innerParsed = JSON.parse(match[1]);
+          if (innerParsed.tool) {
+            // Prioritize the longest valid tool JSON found
+            if (!bestMatch || match[1].length > bestMatch[1].length) {
+              bestMatch = match;
+            }
+          }
+        } catch { }
+      }
+      if (bestMatch) {
+        try {
+          const parsed = JSON.parse(bestMatch[1]);
+          if (parsed.tool) return parsed;
+        } catch { }
+      }
     }
-  } catch { /* continue to other strategies */ }
-
-  // Try extracting JSON from markdown code blocks
-  const codeBlockMatch = trimmed.match(/```(?:json)?\s*\n?({[\s\S]*?})\s*\n?```/);
-  if (codeBlockMatch) {
-    try {
-      const parsed = JSON.parse(codeBlockMatch[1]);
-      if (parsed.tool) return parsed;
-    } catch { /* not valid JSON */ }
-  }
-
-  // Try finding a JSON object anywhere in the response
-  const jsonMatch = trimmed.match(/({\s*"tool"\s*:\s*"[^"]+"[\s\S]*?})/);
-  if (jsonMatch) {
-    try {
-      const parsed = JSON.parse(jsonMatch[1]);
-      if (parsed.tool) return parsed;
-    } catch { /* not valid JSON */ }
   }
 
   return null;
@@ -339,11 +373,15 @@ function tryParseToolCall(response: string): any | null {
 
 async function executeToolCall(toolData: any, workspacePath: string | null): Promise<string> {
   const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath) : '';
-  console.log(`\n🛠️  [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ''}`);
+  console.log(`\n[TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ''}`);
 
   try {
     switch (toolData.tool) {
       case 'read_file': {
+        const isBinary = await isBinaryFile(resolvedPath);
+        if (isBinary) {
+          return `❌ Cannot read ${toolData.path}: This appears to be a binary file.`;
+        }
         const content = await fs.readFile(resolvedPath, 'utf-8');
         const lines = content.split('\n');
         // Add line numbers for context
@@ -397,18 +435,54 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
       }
 
       case 'run_command': {
+        const command = toolData.command;
+        // Notify UI that we are waiting for permission
+        win?.webContents.send('agent:step', {
+          tool: 'run_command',
+          status: 'awaiting_permission',
+          summary: `Execute: ${command}`,
+          command: command
+        });
+
+        const decision = await new Promise<{ approved: boolean }>(resolve => {
+          pendingPermissionResolver = resolve;
+        });
+        pendingPermissionResolver = null;
+
+        // Transition back to running if approved
+        win?.webContents.send('agent:step', {
+          tool: 'run_command',
+          status: 'running',
+          summary: `Executing: ${command}`
+        });
+
+        if (!decision.approved) {
+          return '❌ Command denied by user.';
+        }
+
         const cwd = workspacePath || process.cwd();
         try {
-          const { stdout, stderr } = await execAsync(toolData.command, {
+          // Echo to PTY if it exists so user sees it in their terminal
+          if (ptyProcess) {
+            ptyProcess.write(`\r\n# Executing agent command: ${command}\r\n`);
+          }
+
+          const { stdout, stderr } = await execAsync(command, {
             cwd,
-            timeout: 30000, // 30s timeout
-            maxBuffer: 1024 * 1024 // 1MB
+            timeout: 60000,
+            maxBuffer: 10 * 1024 * 1024 // 10MB
           });
           const output = (stdout + (stderr ? '\nSTDERR: ' + stderr : '')).trim();
+
+          if (ptyProcess) {
+            ptyProcess.write(output + '\r\n');
+          }
+
           return output || '(command completed with no output)';
         } catch (e: any) {
-          // execAsync throws on non-zero exit codes — still return output
-          return `Command exited with error:\n${e.stdout || ''}\n${e.stderr || ''}\n${e.message}`.trim();
+          const errOutput = `Command exited with error:\n${e.stdout || ''}\n${e.stderr || ''}\n${e.message}`.trim();
+          if (ptyProcess) ptyProcess.write(errOutput + '\r\n');
+          return errOutput;
         }
       }
 
@@ -453,8 +527,64 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
         return `✅ Inserted code after line ${toolData.line} in ${toolData.path}`;
       }
 
+      case 'apply_diffs': {
+        const changes: FileChange[] = toolData.changes.map((c: any) => ({
+          path: resolvePath(c.path, workspacePath),
+          blocks: DiffService.parseDiffBlocks(c.diff)
+        }));
+
+        if (changes.some(c => c.blocks.length === 0)) {
+          return '❌ Failed to parse one or more diff blocks. Ensure you use the exact format:\n<<<< SEARCH\n...\n====\n...\n>>>> REPLACE';
+        }
+
+        const result = await diffService.applyTransaction(changes);
+        if (result.success) {
+          return `✅ Successfully applied diffs to ${result.appliedCount} files.`;
+        } else {
+          return `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).`;
+        }
+      }
+
+      case 'validate_project': {
+        const cwd = workspacePath || process.cwd();
+        try {
+          // Check for tsconfig.json to see if we should run tsc
+          await fs.access(join(cwd, 'tsconfig.json'));
+          const { stdout } = await execAsync('npx tsc --noEmit', { cwd });
+          return `Validation (tsc) passed! No type errors found.\n${stdout}`;
+        } catch (e: any) {
+          if (e.code === 'ENOENT') return 'No tsconfig.json found. Skipping tsc validation.';
+          return `Validation failed with errors:\n${e.stdout || ''}\n${e.stderr || ''}`;
+        }
+      }
+
+      case 'run_tests': {
+        const cwd = workspacePath || process.cwd();
+        try {
+          const { stdout } = await execAsync('npm test', { cwd });
+          return `Tests passed!\n${stdout}`;
+        } catch (e: any) {
+          return `Tests failed:\n${e.stdout || ''}\n${e.stderr || ''}`;
+        }
+      }
+
+      case 'get_blast_radius': {
+        if (!graphService) return '❌ Code graph not initialized.';
+        const resolved = resolvePath(toolData.path, workspacePath);
+        const affected = graphService.getBlastRadius(resolved);
+        if (affected.length === 0) return `No external files depend on ${toolData.path}.`;
+        return `Files affected by changing ${toolData.path}:\n` + affected.map(f => `- ${f.replace(workspacePath || '', '').replace(/^[\\/]/, '')}`).join('\n');
+      }
+
+      case 'semantic_search': {
+        if (!indexingService) return '❌ Indexing service not initialized.';
+        const results = await indexingService.search(toolData.query);
+        if (results.length === 0) return 'No relevant code found.';
+        return results.map((r: any) => `--- ${r.filePath}:${r.startLine}-${r.endLine} (Score: ${r._distance}) ---\n${r.content}`).join('\n\n');
+      }
+
       default:
-        return `❌ Unknown tool: "${toolData.tool}". Available tools: read_file, replace_lines, insert_code, write_file, edit_file, list_directory, search_files, run_command`;
+        return `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, edit_file, list_directory, search_files, run_command`;
     }
   } catch (e: any) {
     return `❌ Tool error (${toolData.tool}): ${e.message}`;
@@ -469,67 +599,77 @@ async function runAgentLoop(
   userMessage: string,
   provider: string,
   config: any,
-  workspacePath: string | null
+  workspacePath: string | null,
+  activeContext: { path: string, content: string } | null = null
 ): Promise<{ finalResponse: string; steps: any[] }> {
   const steps: any[] = [];
 
-  // Inject workspace context on first real user message
-  if (workspacePath && !workspaceContextLoaded) {
-    workspaceContextLoaded = true;
-    console.log('📂 Reading workspace for context:', workspacePath);
-    win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'running', summary: 'Reading project files...' });
-
-    const files = await readDirectoryRecursive(workspacePath, 200); // Increased limit
-    if (files.length > 0) {
-      let manifest = `\n\n## CORE PROJECT CONTEXT\n\n### Project Root: ${workspacePath}\n\n#### File List:\n`;
-      const fileList: string[] = [];
-      for (const f of files) {
-        const rel = f.path.replace(workspacePath, '').replace(/^[\\/]/, '');
-        fileList.push(rel);
-      }
-      manifest += fileList.map(f => `- ${f}`).join('\n');
-      manifest += '\n\n#### Critical File Contents:\n';
-      for (const f of files) {
-        const rel = f.path.replace(workspacePath, '').replace(/^[\\/]/, '');
-        // Only include contents of smaller files or important ones (js/ts/css/html/json)
-        const ext = rel.split('.').pop()?.toLowerCase();
-        const importantExts = ['ts', 'tsx', 'js', 'jsx', 'json', 'css', 'html', 'md'];
-        if (importantExts.includes(ext || '') || f.content.length < 5000) {
-          manifest += `\n--- FILE: ${rel} ---\n${f.content}\n`;
-        }
-      }
-      conversationHistory.splice(1, 0, {
-        role: 'system',
-        content: `I have indexed the project. Use this information as your starting context. If you need more details from a file, use 'read_file'.\n${manifest}`
-      });
-    }
-    win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'done', summary: `Indexed ${files.length} files` });
-    steps.push({ tool: 'indexing_workspace', status: 'done', summary: `Indexed ${files.length} files` });
+  // Build context
+  let projectContext = `<PROJECT_STATUS>\n`;
+  if (workspaceManifest) {
+    projectContext += `Project Indexed. Files found: ${workspaceManifest.split('\n').filter(l => l.startsWith('-')).length}\n${workspaceManifest}`;
+  } else {
+    projectContext += `Project not indexed yet. Use 'list_directory' to explore.\nRoot: ${workspacePath}\n`;
   }
 
-  // Add user message
-  conversationHistory.push({ role: 'user', content: userMessage });
+  if (activeContext) {
+    projectContext += `\n\n### ACTIVE FILE (CURRENTLY OPEN IN EDITOR):\nPath: ${activeContext.path}\nContent:\n${activeContext.content}\n`;
+  }
+  projectContext += `\n</PROJECT_STATUS>`;
+
+  const systemInstructions = `${SYSTEM_PROMPT}\n\n${projectContext}\n\n[MANDATORY: YOUR NEXT TURN MUST BE A TOOL CALL. DO NOT ASK QUESTIONS. DO NOT GIVE INSTRUCTIONS.]`;
+
+  // Build messages
+  const currentMessages = [
+    { role: 'system', content: systemInstructions },
+    ...conversationHistory,
+    { role: 'user', content: userMessage }
+  ];
 
   for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
-    console.log(`\n🔄 Agent iteration ${iteration + 1}/${MAX_AGENT_ITERATIONS}`);
+    console.log(`[ITERATION ${iteration + 1}/${MAX_AGENT_ITERATIONS}]`);
 
     // Call the LLM
-    const aiResponse = await callAI(conversationHistory, provider, config);
+    const aiResponse = await callAI(currentMessages, provider, config);
 
     // Try to parse as a tool call
     let toolCall = tryParseToolCall(aiResponse);
 
     // Automation Guard: If the model provided code blocks but no tool call, 
     // it's trying to give "instructions" instead of acting.
-    if (!toolCall && (aiResponse.includes('```') || aiResponse.includes('update') || aiResponse.includes('fix'))) {
-      // We only do this if it's an assistant message that looks like it's dodging responsibility
-      if (aiResponse.length > 50 && (aiResponse.toLowerCase().includes('you should') || aiResponse.toLowerCase().includes('try to'))) {
-        console.log("⚠️ Agent is being lazy. Forcing tool usage.");
-        const correction = `[System Message] You provided code or instructions but did not use a tool. 
-I am an autonomous system; I cannot follow instructions. You must use write_file, edit_file, or replace_lines to apply the changes yourself.
-DO NOT tell me what to do. DO IT.`;
-        conversationHistory.push({ role: 'assistant', content: aiResponse });
-        conversationHistory.push({ role: 'user', content: correction });
+    if (!toolCall) {
+      const lower = aiResponse.toLowerCase();
+      const isStalling =
+        aiResponse.includes('```') ||
+        lower.includes('you should') ||
+        lower.includes('you can') ||
+        lower.includes('try to') ||
+        lower.includes('to update') ||
+        lower.includes('manually') ||
+        lower.includes('replace') ||
+        lower.includes('provide') ||
+        lower.includes('could you') ||
+        lower.includes('please') ||
+        lower.includes('can you') ||
+        lower.includes('see') ||
+        lower.includes('found') ||
+        lower.includes('missing') ||
+        lower.includes('unavailable') ||
+        lower.includes('not provided') ||
+        lower.includes('cannot find') ||
+        lower.includes('no mention') ||
+        lower.includes('don\'t have') ||
+        lower.includes('want me to') ||
+        aiResponse.includes('?');
+
+      if (isStalling && aiResponse.length > 10) {
+        console.log("!!! Stalling behavior detected. Forcing tool usage !!!");
+        const correction = `[STALLING DETECTED] You are asking a question or explaining why you can't act. 
+STRICT RULE: If you don't see content, use 'read_file'. If you don't see a file, use 'list_directory'.
+DO NOT talk. DO NOT ask the user for anything. 
+USE TOOLS. ACTION ONLY.`;
+        currentMessages.push({ role: 'assistant', content: aiResponse });
+        currentMessages.push({ role: 'user', content: correction });
         continue;
       }
     }
@@ -537,7 +677,7 @@ DO NOT tell me what to do. DO IT.`;
     if (!toolCall) {
       // Not a tool call — this is the final text response
       conversationHistory.push({ role: 'assistant', content: aiResponse });
-      console.log('✅ Agent finished with text response');
+      console.log('[DONE] Agent finished with text response');
       return { finalResponse: aiResponse, steps };
     }
 
@@ -550,8 +690,8 @@ DO NOT tell me what to do. DO IT.`;
     win?.webContents.send('agent:step', stepData);
     steps.push(stepData);
 
-    // Add assistant's tool request to history
-    conversationHistory.push({ role: 'assistant', content: aiResponse });
+    // Add assistant's tool request and result to local currentMessages
+    currentMessages.push({ role: 'assistant', content: aiResponse });
 
     // Execute the tool
     const toolResult = await executeToolCall(toolCall, workspacePath);
@@ -569,17 +709,18 @@ DO NOT tell me what to do. DO IT.`;
       status: 'done'
     });
 
-    // Add tool result to conversation — use 'user' role since some LLMs don't support 'system' mid-convo well
-    conversationHistory.push({
+    currentMessages.push({
       role: 'user',
-      content: `[Tool Result: ${toolName}]\n${truncatedResult}\n\n[Continue your task. Use another tool if needed, or provide your final text response when done.]`
+      content: `[Tool Result: ${toolName}]\n${truncatedResult}\n\n[NEXT STEP: Use another tool if task is not complete, otherwise give your final text summary.]`
     });
   }
 
-  // Max iterations reached
-  const maxMsg = 'I\'ve reached the maximum number of steps (20). Here is a summary of what I\'ve done so far. You may need to continue manually or ask me to proceed.';
-  conversationHistory.push({ role: 'assistant', content: maxMsg });
-  return { finalResponse: maxMsg, steps };
+  // Final Response Management
+  const finalAI = currentMessages[currentMessages.length - 1].content;
+  conversationHistory.push({ role: 'user', content: userMessage });
+  conversationHistory.push({ role: 'assistant', content: finalAI });
+
+  return { finalResponse: finalAI, steps };
 }
 
 // Human-readable summary for a tool call
@@ -593,6 +734,11 @@ function getToolSummary(toolCall: any): string {
     case 'run_command': return `Running: ${toolCall.command}`;
     case 'create_directory': return `Creating directory ${toolCall.path}`;
     case 'delete_file': return `Deleting ${toolCall.path}`;
+    case 'semantic_search': return `Searching semantically for "${toolCall.query}"`;
+    case 'get_blast_radius': return `Calculating blast radius for ${toolCall.path}`;
+    case 'apply_diffs': return `Applying diffs to ${toolCall.changes?.length || 0} files`;
+    case 'validate_project': return 'Performing project-wide validation';
+    case 'run_tests': return 'Running test suite';
     default: return toolCall.tool;
   }
 }
@@ -717,16 +863,38 @@ ipcMain.handle('fs:readDirectoryRecursive', async (_event, dirPath: string) => {
   }
 });
 
-ipcMain.handle('execute-agent-task', async (_event, args) => {
+ipcMain.handle('execute-agent-task', async (_event, { task, provider, workspacePath, activeFile, config }) => {
   try {
-    const userMessage = args.task;
-    const provider = args.provider || 'ollama';
-    const config = args.config || {};
-    const workspacePath = args.workspacePath || null;
+    // 1. Initial Workspace Scan (only if not loaded)
+    if (workspacePath && !workspaceContextLoaded) {
+      workspaceContextLoaded = true;
+      console.log('📂 Performing Initial Workspace Context Build:', workspacePath);
+      win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'running', summary: 'Building project context...' });
 
-    // Run the full agentic loop
-    const result = await runAgentLoop(userMessage, provider, config, workspacePath);
+      const files = await readDirectoryRecursive(workspacePath, 2000);
+      if (files.length > 0) {
+        let manifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n`;
+        manifest += files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+        manifest += '\n\n#### Critical Metadata:\n(Use read_file to access full contents)\n';
+        workspaceManifest = manifest;
+      }
 
+      // Initialize services
+      if (!graphService) {
+        graphService = new CodeGraphService();
+        await graphService.initialize(workspacePath);
+      }
+      if (config.voyageKey && !indexingService) {
+        indexingService = new IndexingService(config.voyageKey, (p) => graphService?.updateFile(p));
+        await indexingService.initialize(workspacePath);
+        await indexingService.indexWorkspace();
+      }
+
+      win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'done', summary: `Indexed ${files.length} files` });
+    }
+
+    // 2. Run the agent loop
+    const result = await runAgentLoop(task, provider, config, workspacePath, activeFile);
     return {
       response: result.finalResponse,
       steps: result.steps
@@ -741,10 +909,18 @@ ipcMain.handle('execute-agent-task', async (_event, args) => {
   }
 });
 
-// Reset conversation when workspace changes  
+ipcMain.handle('agent:permission-response', (_event, decision) => {
+  if (pendingPermissionResolver) {
+    pendingPermissionResolver(decision);
+  }
+  return true;
+});
+
+// Reset conversation when workspace changes
 ipcMain.handle('agent:reset', async () => {
-  conversationHistory = [{ role: 'system', content: SYSTEM_PROMPT }];
+  conversationHistory = [];
   workspaceContextLoaded = false;
+  workspaceManifest = '';
   console.log('🔄 Agent conversation reset');
   return true;
-})
+});

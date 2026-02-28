@@ -1,9 +1,10 @@
 export interface AgentStep {
     tool: string;
-    status: 'running' | 'done' | 'error';
+    status: 'running' | 'done' | 'error' | 'awaiting_permission';
     summary: string;
     result?: string;
     iteration?: number;
+    command?: string;
 }
 
 export interface Message {

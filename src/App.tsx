@@ -35,14 +35,23 @@ function App() {
   const [chatWidth, setChatWidth] = useState(400)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
 
-  // AI Settings
-  const [aiProvider, setAiProvider] = useState<AIProvider>('ollama')
-  const [ollamaModel, setOllamaModel] = useState('llama3')
-  const [openaiKey, setOpenaiKey] = useState('')
-  const [geminiKey, setGeminiKey] = useState('')
+  // AI Settings Persistence
+  const [aiProvider, setAiProvider] = useState<AIProvider>(() => (localStorage.getItem('aiProvider') as AIProvider) || 'ollama')
+  const [ollamaModel, setOllamaModel] = useState(() => localStorage.getItem('ollamaModel') || 'llama3')
+  const [openaiKey, setOpenaiKey] = useState(() => localStorage.getItem('openaiKey') || '')
+  const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('geminiKey') || '')
+
   const [ollamaModels, setOllamaModels] = useState<string[]>([])
   const [ollamaError, setOllamaError] = useState<string | null>(null)
   const [ollamaChecking, setOllamaChecking] = useState(false)
+
+  // Save Settings on Change
+  useEffect(() => {
+    localStorage.setItem('aiProvider', aiProvider)
+    localStorage.setItem('ollamaModel', ollamaModel)
+    localStorage.setItem('openaiKey', openaiKey)
+    localStorage.setItem('geminiKey', geminiKey)
+  }, [aiProvider, ollamaModel, openaiKey, geminiKey])
 
   // Handle Ollama Models
   useEffect(() => {
@@ -229,10 +238,12 @@ function App() {
 
     try {
       if (ipc) {
+        const activeFile = openFiles.find(f => f.path === activeFileId);
         const result = await ipc.invoke('execute-agent-task', {
           task: userMsg.content,
           provider: aiProvider,
           workspacePath,
+          activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
           config: { ollamaModel, openaiKey, geminiKey }
         })
         const response = typeof result === 'string' ? result : result?.response || 'No response';
@@ -245,6 +256,13 @@ function App() {
       setIsLoading(false)
       setAgentSteps([])
       if (ipc) ipc.off('agent:step', stepHandler);
+    }
+  }
+
+  const handlePermissionResponse = async (approved: boolean) => {
+    const ipc = (window as any).ipcRenderer;
+    if (ipc) {
+      await ipc.invoke('agent:permission-response', { approved });
     }
   }
 
@@ -263,6 +281,9 @@ function App() {
       case 'list_directory': return '📂';
       case 'search_files': return '🔍';
       case 'run_command': return '⚡';
+      case 'apply_diffs': return '🚀';
+      case 'validate_project': return '🛡️';
+      case 'run_tests': return '🧪';
       case 'indexing_workspace': return '📦';
       default: return '🛠️';
     }
@@ -340,6 +361,7 @@ function App() {
           handleKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
           getToolIcon={getToolIcon}
           messagesEndRef={messagesEndRef}
+          handlePermissionResponse={handlePermissionResponse}
           settingsProps={{
             isSettingsOpen, setIsSettingsOpen, aiProvider, setAiProvider, ollamaModel, setOllamaModel,
             ollamaModels, ollamaChecking, ollamaError, refreshOllamaModels, openaiKey, setOpenaiKey, geminiKey, setGeminiKey

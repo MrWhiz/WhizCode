@@ -1010,3 +1010,41 @@
   font-weight: bold;
   flex-shrink: 0;
 }
+
+/* Permission Gateway Controls */
+.permission-controls {
+  display: flex;
+  gap: 6px;
+  margin-left: 8px;
+}
+
+.perm-btn {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 3px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.perm-btn.approve {
+  background: #2ea44f;
+  color: white;
+}
+
+.perm-btn.approve:hover {
+  background: #2c974b;
+}
+
+.perm-btn.deny {
+  background: transparent;
+  border-color: var(--border-color);
+  color: var(--text-secondary);
+}
+
+.perm-btn.deny:hover {
+  background: var(--vscode-hover);
+  color: var(--text-primary);
+}

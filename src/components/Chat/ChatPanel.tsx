@@ -22,6 +22,7 @@ interface ChatPanelProps {
     handleKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
     getToolIcon: (tool: string) => string;
     messagesEndRef: React.RefObject<HTMLDivElement | null>;
+    handlePermissionResponse: (approved: boolean) => void;
     // Settings props
     settingsProps: any;
 }
@@ -42,6 +43,7 @@ export const ChatPanel = ({
     handleKeyDown,
     getToolIcon,
     messagesEndRef,
+    handlePermissionResponse,
     settingsProps
 }: ChatPanelProps) => {
     if (!isChatOpen) return null;
@@ -154,6 +156,12 @@ export const ChatPanel = ({
                                                 )}
                                                 <span className="agent-step-summary">{step.summary}</span>
                                                 {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                                                {step.status === 'awaiting_permission' && (
+                                                    <div className="permission-controls">
+                                                        <button className="perm-btn approve" onClick={() => handlePermissionResponse(true)}>Run</button>
+                                                        <button className="perm-btn deny" onClick={() => handlePermissionResponse(false)}>Deny</button>
+                                                    </div>
+                                                )}
                                             </div>
                                         ))}
                                     </div>

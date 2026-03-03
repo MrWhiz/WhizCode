@@ -1,7 +1,20 @@
 import { join, dirname, resolve, extname } from 'node:path';
 import * as fs from 'node:fs/promises';
-import Parser from 'tree-sitter';
-import TypeScript from 'tree-sitter-typescript';
+import { createRequire } from 'node:module';
+
+const _require = createRequire(import.meta.url)
+/** 
+ * WE USE DYNAMIC REQUIRE FOR NATIVE MODULES TO PREVENT VITE FROM TRYING TO BUNDLE BINARY DATA 
+ */
+let treeSitter: any;
+let treeSitterTypeScript: any;
+
+try {
+    treeSitter = _require('tree-sitter');
+    treeSitterTypeScript = _require('tree-sitter-typescript');
+} catch (e) {
+    console.error("Failed to load native modules in CodeGraphService:", e);
+}
 
 export interface GraphNode {
     path: string;
@@ -10,13 +23,15 @@ export interface GraphNode {
 }
 
 export class CodeGraphService {
-    private parser: Parser;
+    private parser: any;
     private graph: Map<string, GraphNode> = new Map();
     private workspacePath: string | null = null;
 
     constructor() {
-        this.parser = new Parser();
-        this.parser.setLanguage(TypeScript.tsx);
+        if (treeSitter) {
+            this.parser = new treeSitter();
+            this.parser.setLanguage(treeSitterTypeScript.tsx);
+        }
     }
 
     async initialize(workspacePath: string) {
@@ -68,20 +83,24 @@ export class CodeGraphService {
     }
 
     private async processFile(filePath: string) {
+        if (!this.parser) return;
         try {
             const content = await fs.readFile(filePath, 'utf-8');
             const tree = this.parser.parse(content);
 
             const imports: string[] = [];
 
-            const query = new Parser.Query(TypeScript.tsx, `
+            // Corrected queries for tree-sitter-typescript.
+            // (import_statement source: (string) @path)
+            // (export_statement source: (string) @path)
+            const query = new treeSitter.Query(treeSitterTypeScript.tsx, `
         (import_statement source: (string) @import.path)
-        (import_alias source: (string) @import.path)
         (export_statement source: (string) @import.path)
       `);
 
             const captures = query.captures(tree.rootNode);
             for (const capture of captures) {
+                // capture.node is the (string) node in both cases
                 let importPath = capture.node.text.replace(/['"]/g, '');
                 const resolvedPath = await this.resolveImport(importPath, filePath);
                 if (resolvedPath && !imports.includes(resolvedPath)) {
@@ -174,10 +193,10 @@ export class CodeGraphService {
     getGraphSummary(): any {
         const summary: any = {};
         for (const [path, node] of this.graph.entries()) {
-            const relPath = this.workspacePath ? path.replace(this.workspacePath, '').replace(/^[\\/]/, '') : path;
+            const relPath = this.workspacePath ? path.replace(this.workspacePath.replace(/\\/g, '/'), '').replace(/^[\\/]/, '') : path;
             summary[relPath] = {
-                imports: node.imports.map(i => this.workspacePath ? i.replace(this.workspacePath, '').replace(/^[\\/]/, '') : i),
-                dependents: node.dependents.map(d => this.workspacePath ? d.replace(this.workspacePath, '').replace(/^[\\/]/, '') : d)
+                imports: node.imports.map(i => this.workspacePath ? i.replace(this.workspacePath.replace(/\\/g, '/'), '').replace(/^[\\/]/, '') : i),
+                dependents: node.dependents.map(d => this.workspacePath ? d.replace(this.workspacePath.replace(/\\/g, '/'), '').replace(/^[\\/]/, '') : d)
             };
         }
         return summary;

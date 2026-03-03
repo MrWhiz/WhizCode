@@ -5,6 +5,7 @@ export interface AgentStep {
     result?: string;
     iteration?: number;
     command?: string;
+    logs?: string[];
 }
 
 export interface Message {
@@ -27,9 +28,14 @@ export interface OpenFileProps {
 
 export type AIProvider = 'ollama' | 'openai' | 'gemini';
 
-export interface AISettings {
+export interface ModelConfig {
     provider: AIProvider;
-    ollamaModel: string;
+    model: string;
+}
+
+export interface AISettings {
+    planner: ModelConfig;
+    executor: ModelConfig;
     openaiKey: string;
     geminiKey: string;
 }

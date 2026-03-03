@@ -2,12 +2,13 @@ import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
-import { exec } from 'node:child_process'
+import { exec, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as fs from 'node:fs/promises'
 // Remove cross-fetch as global fetch is available in modern Electron/Node
 import * as os from 'node:os'
 import { createRequire } from 'node:module'
+import * as chokidar from 'chokidar'
 import { IndexingService } from './indexService'
 import { CodeGraphService } from './graphService'
 import { DiffService, type FileChange } from './diffService'
@@ -36,12 +37,14 @@ let ptyProcess: any = null
 let indexingService: IndexingService | null = null
 let graphService: CodeGraphService | null = null
 const diffService = new DiffService();
+let workspaceWatcher: chokidar.FSWatcher | null = null;
 let pendingPermissionResolver: ((decision: { approved: boolean }) => void) | null = null
+let abortRequested = false;
 // voyageKey removed as it was unused and causing lint error
 
 // Ollama Configuration
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
-const MODEL_NAME = 'llama3'; // User should change this to their local model if needed
+const MODEL_NAME = 'deepseek-coder-v2:latest'; // Optimized for local coding
 
 function createWindow() {
   win = new BrowserWindow({
@@ -109,8 +112,8 @@ async function isBinaryFile(filePath: string): Promise<boolean> {
   }
 }
 
-async function readDirectoryRecursive(dirPath: string, maxFiles = 200): Promise<{ path: string, content: string }[]> {
-  const results: { path: string, content: string }[] = [];
+async function readDirectoryRecursive(dirPath: string, maxFiles = 2000): Promise<{ path: string }[]> {
+  const results: { path: string }[] = [];
   async function walk(currentPath: string) {
     if (results.length >= maxFiles) return;
     try {
@@ -119,19 +122,14 @@ async function readDirectoryRecursive(dirPath: string, maxFiles = 200): Promise<
         if (results.length >= maxFiles) break;
         const fullPath = join(currentPath, entry.name);
         if (entry.isDirectory()) {
+          // Skip hidden and noise directories
           if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
             await walk(fullPath);
           }
         } else {
           const ext = '.' + entry.name.split('.').pop()?.toLowerCase();
           if (!BINARY_EXTS.has(ext)) {
-            try {
-              const stat = await fs.stat(fullPath);
-              if (stat.size < 100_000 && !(await isBinaryFile(fullPath))) {
-                const content = await fs.readFile(fullPath, 'utf-8');
-                results.push({ path: fullPath, content });
-              }
-            } catch { /* skip unreadable or binary files */ }
+            results.push({ path: fullPath });
           }
         }
       }
@@ -226,31 +224,64 @@ function resolvePath(agentPath: string, workspacePath: string | null): string {
   return agentPath;
 }
 
-// ====== SYSTEM PROMPT ======
+// ====== SYSTEM PROMPTS ======
 
-const SYSTEM_PROMPT = `
+const PLANNER_SYSTEM_PROMPT = `
 <IDENTITY>
-You are "ANTIGRAVITY", the world's most capable autonomous software engineering agent. 
+You are the "WHIZCODE ARCHITECT". Your role is to analyze user requests and project context to create a foolproof implementation plan.
+</IDENTITY>
+
+<PRIME_DIRECTIVE>
+1. **STRATEGIZE**: Break down the task into logical, sequential steps.
+2. **ENVIRONMENT**: Always start by checking the environment and prerequisites. Identify if dependencies (node_modules, venv, go.mod, etc.) are present and properly configured. Include setup steps if they are missing.
+3. **CONTEXTUALIZE**: Identify which files need to be read, modified, or created.
+4. **VALIDATE**: Ensure the plan includes testing and verification steps.
+5. **NO TOOLS**: Do not use tools yourself. Output a clean, detailed Markdown plan.
+</PRIME_DIRECTIVE>
+
+<OUTPUT_FORMAT>
+# IMPLEMENTATION PLAN
+1. [Phase 1: Environment & Discovery] - Check for required runtimes/dependencies and list relevant files.
+2. [Phase 2: Setup] - Install dependencies or create virtual environments if necessary.
+3. [Phase 3: Implementation] - Perform the core task.
+4. [Phase 4: Verification] - Run tests or validate project.
+</OUTPUT_FORMAT>
+`;
+
+const EXECUTOR_SYSTEM_PROMPT = `
+<IDENTITY>
+You are the "WHIZCODE EXECUTOR", a high-speed autonomous coding engine. 
 You possess full system access. You are a doer, a builder, and an execution machine.
 </IDENTITY>
 
 <PRIME_DIRECTIVE>
-1. **ACT FIRST**: If the user asks for a change, your ONLY response is a tool call.
-2. **ZERO QUESTIONS**: NEVER ask the user for code, file contents, or permission. Use 'read_file' or 'search_files' to get what you need.
-3. **ZERO INSTRUCTIONS**: Do not tell the user what to do. DO IT. 
-4. **NO APOLOGIES**: Apologizing for "lack of access" or "missing content" is a failure. You have tools. Use them.
-5. **TRANSPLANT REPLICA**: You are an identical replica of a state-of-the-art agent. You follow the chain: PLAN -> READ -> EDIT -> VALIDATE.
+1. **ACT FIRST**: While the task is in progress, your response should be a tool call.
+2. **FOLLOW THE PLAN**: Execute the plan perfectly. **NEVER skip environment checks** specified in the plan.
+3. **COMPLETION**: Once ALL steps in the plan are finished, DO NOT call any more tools. Instead, provide a final technical summary of your work and state that the task is complete.
+4. **ZERO QUESTIONS**: NEVER ask the user for permission or code. Use your tools.
 </PRIME_DIRECTIVE>
 
 <TOOL_HIERARCHY>
-- **Discovery**: 'list_directory', 'search_files', 'semantic_search'
-- **Context**: 'read_file' (MANDATORY before every edit)
-- **Execution**: 'apply_diffs' (Preferred), 'write_file', 'run_command'
+- **Discovery**: 'list_directory' (path), 'search_files' (pattern, include), 'semantic_search' (query)
+- **Context**: 'read_file' (path) (MANDATORY before every edit). Use 'run_command' (command) to check versions or environment status.
+- **Execution**: 
+  - 'apply_diffs' (changes: [{path, diff}]): Preferred for multi-line edits.
+  - 'write_file' (path, content): Best for new files.
+  - 'run_command' (command): For terminal operations.
 - **Validation**: 'validate_project' (MANDATORY after every change)
 </TOOL_HIERARCHY>
 
+<TOOL_SCHEMAS>
+- read_file: {"tool": "read_file", "path": "string"}
+- write_file: {"tool": "write_file", "path": "string", "content": "string"}
+- edit_file: {"tool": "edit_file", "path": "string", "edits": [{"search": "string", "replace": "string"}]}
+- list_directory: {"tool": "list_directory", "path": "string"}
+- run_command: {"tool": "run_command", "command": "string"}
+- apply_diffs: {"tool": "apply_diffs", "changes": [{"path": "string", "diff": "string"}]}
+</TOOL_SCHEMAS>
+
 <OUTPUT_FORMAT>
-- **Thinking**: <THOUGHT> [Plan + Manifest of Change] </THOUGHT>
+- **Thinking**: <THOUGHT> [What phase are you on? Are dependencies met? Current action?] </THOUGHT>
 - **Action**: [Valid JSON Tool Call]
 - **NO CHATTER**: No "I'd be happy to", "Here is", or "Could you".
 </OUTPUT_FORMAT>
@@ -263,10 +294,11 @@ let workspaceContextLoaded = false;
 
 // ====== LLM PROVIDER CALLS ======
 
-async function callAI(messages: any[], provider: string, config: any) {
+async function callAI(messages: any[], modelConfig: { provider: string, model: string }, config: any) {
   try {
     let response: any;
     let data: any;
+    const { provider, model } = modelConfig;
 
     if (provider === 'openai') {
       response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -276,7 +308,7 @@ async function callAI(messages: any[], provider: string, config: any) {
           'Authorization': `Bearer ${config.openaiKey}`
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini',
+          model: model || 'gpt-4o',
           messages: messages,
           temperature: 0.1
         })
@@ -295,7 +327,7 @@ async function callAI(messages: any[], provider: string, config: any) {
         body.system_instruction = { parts: [{ text: systemMsg.content }] };
       }
 
-      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${config.geminiKey}`, {
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model || 'gemini-1.5-flash'}:generateContent?key=${config.geminiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -308,7 +340,7 @@ async function callAI(messages: any[], provider: string, config: any) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: config.ollamaModel || MODEL_NAME,
+          model: model || MODEL_NAME,
           messages: messages,
           stream: false,
           options: {
@@ -371,33 +403,47 @@ function tryParseToolCall(response: string): any | null {
 
 // ====== TOOL EXECUTOR ======
 
-async function executeToolCall(toolData: any, workspacePath: string | null): Promise<string> {
+async function executeToolCall(toolData: any, workspacePath: string | null): Promise<{ result: string; logs?: string[]; abort?: boolean }> {
   const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath) : '';
   console.log(`\n[TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ''}`);
 
   try {
     switch (toolData.tool) {
       case 'read_file': {
+        if (!toolData.path) return { result: '❌ Error: Tool "read_file" requires a "path" parameter.' };
         const isBinary = await isBinaryFile(resolvedPath);
         if (isBinary) {
-          return `❌ Cannot read ${toolData.path}: This appears to be a binary file.`;
+          return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
         }
         const content = await fs.readFile(resolvedPath, 'utf-8');
         const lines = content.split('\n');
         // Add line numbers for context
-        return lines.map((line, i) => `${i + 1}: ${line}`).join('\n');
+        return { result: lines.map((line, i) => `${i + 1}: ${line}`).join('\n') };
       }
 
       case 'write_file': {
+        if (!toolData.path) {
+          return { result: '❌ Error: Tool "write_file" requires a "path" parameter.' };
+        }
         // Ensure parent directory exists
         const dir = dirname(resolvedPath);
         await fs.mkdir(dir, { recursive: true });
         await fs.writeFile(resolvedPath, toolData.content, 'utf-8');
         const lineCount = toolData.content.split('\n').length;
-        return `✅ Successfully wrote ${lineCount} lines to ${toolData.path}`;
+
+        // Refresh manifest so agent sees new file immediately
+        if (workspacePath) {
+          const files = await readDirectoryRecursive(workspacePath, 3000);
+          workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+            files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+        }
+
+        return { result: `✅ Successfully wrote ${lineCount} lines to ${toolData.path}` };
       }
 
       case 'edit_file': {
+        if (!toolData.path) return { result: '❌ Error: Tool "edit_file" requires a "path" parameter.' };
+        if (!toolData.edits) return { result: '❌ Error: Tool "edit_file" requires an "edits" parameter.' };
         let content = await fs.readFile(resolvedPath, 'utf-8');
         const edits = toolData.edits || [];
         let editCount = 0;
@@ -413,28 +459,39 @@ async function executeToolCall(toolData: any, workspacePath: string | null): Pro
             const contentTrimmed = content.replace(/\s+/g, ' ');
 
             if (contentTrimmed.includes(searchTrimmed.replace(/\s+/g, ' '))) {
-              return `❌ edit_file failed for ${toolData.path}: The search string exists but whitespace/indentation did not match exactly. 
+              return {
+                result: `❌ edit_file failed for ${toolData.path}: The search string exists but whitespace/indentation did not match exactly. 
 Please 'read_file' again to get the EXACT indentation or use the 'write_file' tool to overwrite the file if the edit is complex.
-Searched for: "${edit.search.substring(0, 50)}..."`;
+Searched for: "${edit.search.substring(0, 50)}..."`
+              };
             } else {
-              return `❌ edit_file failed: could not find the following code block in ${toolData.path}:\n\n${edit.search}\n\nMake sure you have the latest content via 'read_file'.`;
+              return { result: `❌ edit_file failed: could not find the following code block in ${toolData.path}:\n\n${edit.search}\n\nMake sure you have the latest content via 'read_file'.` };
             }
           }
         }
         await fs.writeFile(resolvedPath, content, 'utf-8');
-        return `✅ Applied ${editCount} edit(s) to ${toolData.path}`;
+
+        // Refresh manifest
+        if (workspacePath) {
+          const files = await readDirectoryRecursive(workspacePath, 3000);
+          workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+            files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+        }
+
+        return { result: `✅ Applied ${editCount} edit(s) to ${toolData.path}` };
       }
 
       case 'list_directory': {
-        return await listDirectory(resolvedPath || workspacePath || '.');
+        return { result: await listDirectory(resolvedPath || workspacePath || '.') };
       }
 
       case 'search_files': {
         const searchRoot = workspacePath || '.';
-        return await searchFiles(searchRoot, toolData.pattern, toolData.include);
+        return { result: await searchFiles(searchRoot, toolData.pattern, toolData.include) };
       }
 
       case 'run_command': {
+        if (!toolData.command) return { result: '❌ Error: Tool "run_command" requires a "command" parameter.' };
         const command = toolData.command;
         // Notify UI that we are waiting for permission
         win?.webContents.send('agent:step', {
@@ -449,51 +506,108 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
         });
         pendingPermissionResolver = null;
 
-        // Transition back to running if approved
-        win?.webContents.send('agent:step', {
-          tool: 'run_command',
-          status: 'running',
-          summary: `Executing: ${command}`
-        });
-
         if (!decision.approved) {
-          return '❌ Command denied by user.';
+          return { result: '❌ Command denied by user.', abort: true };
         }
 
         const cwd = workspacePath || process.cwd();
+        const logs: string[] = [];
+
+        // Transition to running if approved
+        win?.webContents.send('agent:step', {
+          tool: 'run_command',
+          status: 'running',
+          summary: `Executing: ${command}`,
+          logs: logs
+        });
+
         try {
-          // Echo to PTY if it exists so user sees it in their terminal
           if (ptyProcess) {
             ptyProcess.write(`\r\n# Executing agent command: ${command}\r\n`);
           }
 
-          const { stdout, stderr } = await execAsync(command, {
-            cwd,
-            timeout: 60000,
-            maxBuffer: 10 * 1024 * 1024 // 10MB
-          });
-          const output = (stdout + (stderr ? '\nSTDERR: ' + stderr : '')).trim();
+          const fullOutput = await new Promise<string>((resolve, reject) => {
+            const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
+            const shellArgs = process.platform === 'win32' ? ['-Command', command] : ['-c', command];
 
-          if (ptyProcess) {
-            ptyProcess.write(output + '\r\n');
+            const child = spawn(shell, shellArgs, { cwd, shell: true });
+            let output = '';
+
+            const handleData = (data: any) => {
+              const str = data.toString();
+              output += str;
+              if (ptyProcess) ptyProcess.write(str);
+
+              const lines = str.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
+              if (lines.length > 0) {
+                logs.push(...lines);
+                // Only keep last 100 lines for the UI to avoid lag
+                if (logs.length > 100) logs.splice(0, logs.length - 100);
+
+                win?.webContents.send('agent:step', {
+                  tool: 'run_command',
+                  status: 'running',
+                  summary: `Executing: ${command}`,
+                  logs: [...logs]
+                });
+              }
+            };
+
+            child.stdout?.on('data', handleData);
+            child.stderr?.on('data', handleData);
+
+            child.on('close', (code) => {
+              if (code === 0) {
+                resolve(output.trim() || '(command completed with no output)');
+              } else {
+                resolve(`Command exited with code ${code}:\n${output}`.trim());
+              }
+            });
+
+            child.on('error', (err) => {
+              reject(err);
+            });
+          });
+
+          // Refresh manifest after command execution (might have created files/dirs like venv)
+          if (workspacePath) {
+            const files = await readDirectoryRecursive(workspacePath, 3000);
+            workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+              files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
           }
 
-          return output || '(command completed with no output)';
+          return { result: fullOutput, logs };
         } catch (e: any) {
-          const errOutput = `Command exited with error:\n${e.stdout || ''}\n${e.stderr || ''}\n${e.message}`.trim();
+          const errOutput = `Command failed: ${e.message}`.trim();
           if (ptyProcess) ptyProcess.write(errOutput + '\r\n');
-          return errOutput;
+          return { result: errOutput, logs };
         }
       }
 
       case 'create_directory': {
         await fs.mkdir(resolvedPath, { recursive: true });
-        return `✅ Created directory: ${toolData.path}`;
+
+        // Refresh manifest
+        if (workspacePath) {
+          const files = await readDirectoryRecursive(workspacePath, 3000);
+          workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+            files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+        }
+
+        return { result: `✅ Created directory: ${toolData.path}` };
       }
 
       case 'delete_file': {
         await fs.unlink(resolvedPath);
-        return `✅ Deleted: ${toolData.path}`;
+
+        // Refresh manifest
+        if (workspacePath) {
+          const files = await readDirectoryRecursive(workspacePath, 3000);
+          workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+            files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+        }
+
+        return { result: `✅ Deleted: ${toolData.path}` };
       }
 
       case 'replace_lines': {
@@ -509,7 +623,15 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
         ];
 
         await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
-        return `✅ Replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}`;
+
+        // Refresh manifest
+        if (workspacePath) {
+          const files = await readDirectoryRecursive(workspacePath, 3000);
+          workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+            files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+        }
+
+        return { result: `✅ Replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
       }
 
       case 'insert_code': {
@@ -524,7 +646,15 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
         ];
 
         await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
-        return `✅ Inserted code after line ${toolData.line} in ${toolData.path}`;
+
+        // Refresh manifest
+        if (workspacePath) {
+          const files = await readDirectoryRecursive(workspacePath, 3000);
+          workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+            files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+        }
+
+        return { result: `✅ Inserted code after line ${toolData.line} in ${toolData.path}` };
       }
 
       case 'apply_diffs': {
@@ -534,14 +664,20 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
         }));
 
         if (changes.some(c => c.blocks.length === 0)) {
-          return '❌ Failed to parse one or more diff blocks. Ensure you use the exact format:\n<<<< SEARCH\n...\n====\n...\n>>>> REPLACE';
+          return { result: '❌ Failed to parse one or more diff blocks. Ensure you use the exact format:\n<<<< SEARCH\n...\n====\n...\n>>>> REPLACE' };
         }
 
         const result = await diffService.applyTransaction(changes);
         if (result.success) {
-          return `✅ Successfully applied diffs to ${result.appliedCount} files.`;
+          // Refresh manifest after applying diffs
+          if (workspacePath) {
+            const files = await readDirectoryRecursive(workspacePath, 3000);
+            workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+              files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+          }
+          return { result: `✅ Successfully applied diffs to ${result.appliedCount} files.` };
         } else {
-          return `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).`;
+          return { result: `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).` };
         }
       }
 
@@ -551,10 +687,10 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
           // Check for tsconfig.json to see if we should run tsc
           await fs.access(join(cwd, 'tsconfig.json'));
           const { stdout } = await execAsync('npx tsc --noEmit', { cwd });
-          return `Validation (tsc) passed! No type errors found.\n${stdout}`;
+          return { result: `Validation (tsc) passed! No type errors found.\n${stdout}` };
         } catch (e: any) {
-          if (e.code === 'ENOENT') return 'No tsconfig.json found. Skipping tsc validation.';
-          return `Validation failed with errors:\n${e.stdout || ''}\n${e.stderr || ''}`;
+          if (e.code === 'ENOENT') return { result: 'No tsconfig.json found. Skipping tsc validation.' };
+          return { result: `Validation failed with errors:\n${e.stdout || ''}\n${e.stderr || ''}` };
         }
       }
 
@@ -562,32 +698,32 @@ Searched for: "${edit.search.substring(0, 50)}..."`;
         const cwd = workspacePath || process.cwd();
         try {
           const { stdout } = await execAsync('npm test', { cwd });
-          return `Tests passed!\n${stdout}`;
+          return { result: `Tests passed!\n${stdout}` };
         } catch (e: any) {
-          return `Tests failed:\n${e.stdout || ''}\n${e.stderr || ''}`;
+          return { result: `Tests failed:\n${e.stdout || ''}\n${e.stderr || ''}` };
         }
       }
 
       case 'get_blast_radius': {
-        if (!graphService) return '❌ Code graph not initialized.';
+        if (!graphService) return { result: '❌ Code graph not initialized.' };
         const resolved = resolvePath(toolData.path, workspacePath);
         const affected = graphService.getBlastRadius(resolved);
-        if (affected.length === 0) return `No external files depend on ${toolData.path}.`;
-        return `Files affected by changing ${toolData.path}:\n` + affected.map(f => `- ${f.replace(workspacePath || '', '').replace(/^[\\/]/, '')}`).join('\n');
+        if (affected.length === 0) return { result: `No external files depend on ${toolData.path}.` };
+        return { result: `Files affected by changing ${toolData.path}:\n` + affected.map(f => `- ${f.replace(workspacePath || '', '').replace(/^[\\/]/, '')}`).join('\n') };
       }
 
       case 'semantic_search': {
-        if (!indexingService) return '❌ Indexing service not initialized.';
+        if (!indexingService) return { result: '❌ Indexing service not initialized.' };
         const results = await indexingService.search(toolData.query);
-        if (results.length === 0) return 'No relevant code found.';
-        return results.map((r: any) => `--- ${r.filePath}:${r.startLine}-${r.endLine} (Score: ${r._distance}) ---\n${r.content}`).join('\n\n');
+        if (results.length === 0) return { result: 'No relevant code found.' };
+        return { result: results.map((r: any) => `--- ${r.filePath}:${r.startLine}-${r.endLine} (Score: ${r._distance}) ---\n${r.content}`).join('\n\n') };
       }
 
       default:
-        return `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, edit_file, list_directory, search_files, run_command`;
+        return { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, edit_file, list_directory, search_files, run_command` };
     }
   } catch (e: any) {
-    return `❌ Tool error (${toolData.tool}): ${e.message}`;
+    return { result: `❌ Tool error (${toolData.tool}): ${e.message}` };
   }
 }
 
@@ -597,87 +733,96 @@ const MAX_AGENT_ITERATIONS = 20;
 
 async function runAgentLoop(
   userMessage: string,
-  provider: string,
+  planner: { provider: string, model: string },
+  executor: { provider: string, model: string },
   config: any,
   workspacePath: string | null,
   activeContext: { path: string, content: string } | null = null
 ): Promise<{ finalResponse: string; steps: any[] }> {
   const steps: any[] = [];
+  abortRequested = false;
 
-  // Build context
-  let projectContext = `<PROJECT_STATUS>\n`;
+  // 1. Build project context
+  let projectStatus = `<PROJECT_STATUS>\n`;
   if (workspaceManifest) {
-    projectContext += `Project Indexed. Files found: ${workspaceManifest.split('\n').filter(l => l.startsWith('-')).length}\n${workspaceManifest}`;
+    projectStatus += `Project Indexed. Files found: ${workspaceManifest.split('\n').filter(l => l.startsWith('-')).length}\n${workspaceManifest}`;
   } else {
-    projectContext += `Project not indexed yet. Use 'list_directory' to explore.\nRoot: ${workspacePath}\n`;
+    projectStatus += `Project not indexed yet. Root: ${workspacePath}\n`;
   }
-
   if (activeContext) {
-    projectContext += `\n\n### ACTIVE FILE (CURRENTLY OPEN IN EDITOR):\nPath: ${activeContext.path}\nContent:\n${activeContext.content}\n`;
+    projectStatus += `\n\n### ACTIVE FILE (CURRENTLY OPEN IN EDITOR):\nPath: ${activeContext.path}\nContent:\n${activeContext.content}\n`;
   }
-  projectContext += `\n</PROJECT_STATUS>`;
+  projectStatus += `\n</PROJECT_STATUS>`;
 
-  const systemInstructions = `${SYSTEM_PROMPT}\n\n${projectContext}\n\n[MANDATORY: YOUR NEXT TURN MUST BE A TOOL CALL. DO NOT ASK QUESTIONS. DO NOT GIVE INSTRUCTIONS.]`;
+  // 2. PHASE 1: PLANNING
+  win?.webContents.send('agent:step', { tool: 'planning', status: 'running', summary: 'Generating implementation plan...' });
 
-  // Build messages
-  const currentMessages = [
-    { role: 'system', content: systemInstructions },
+  const plannerMessages = [
+    { role: 'system', content: `${PLANNER_SYSTEM_PROMPT}\n\n${projectStatus}` },
     ...conversationHistory,
     { role: 'user', content: userMessage }
   ];
 
+  const plan = await callAI(plannerMessages, planner, config);
+  console.log('[PLAN]\n', plan);
+
+  const planStep: any = { tool: 'planning', status: 'awaiting_permission', summary: 'Architectural Plan Ready', result: plan };
+  win?.webContents.send('agent:step', planStep);
+
+  const decision = await new Promise<{ approved: boolean }>(resolve => {
+    pendingPermissionResolver = resolve;
+  });
+  pendingPermissionResolver = null;
+
+  if (!decision.approved) {
+    planStep.status = 'done';
+    planStep.summary = 'Plan Rejected';
+    win?.webContents.send('agent:step', planStep);
+    steps.push(planStep);
+    const cancelMsg = "⚠️ Plan rejected by user. Stopping task.";
+    conversationHistory.push({ role: 'assistant', content: cancelMsg });
+    return { finalResponse: cancelMsg, steps };
+  }
+
+  planStep.status = 'done';
+  planStep.summary = 'Plan Approved';
+  win?.webContents.send('agent:step', planStep);
+  steps.push(planStep);
+
+  // 3. PHASE 2: EXECUTION
+  const executorInstructions = `${EXECUTOR_SYSTEM_PROMPT}\n\n${projectStatus}\n\n<PLAN>\n${plan}\n</PLAN>\n\n[ACT NOW: Start from the first step of the plan. Output a tool call.]`;
+
+  const currentMessages = [
+    { role: 'system', content: executorInstructions },
+    ...conversationHistory,
+    { role: 'user', content: `Task: ${userMessage}` }
+  ];
+
   for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
+    if (abortRequested) {
+      console.log("[ABORT] Agent loop stopped by user.");
+      const abortMsg = "⚠️ Task cancelled by user.";
+      conversationHistory.push({ role: 'assistant', content: abortMsg });
+      return { finalResponse: abortMsg, steps };
+    }
     console.log(`[ITERATION ${iteration + 1}/${MAX_AGENT_ITERATIONS}]`);
 
-    // Call the LLM
-    const aiResponse = await callAI(currentMessages, provider, config);
-
-    // Try to parse as a tool call
+    // Call Executor
+    const aiResponse = await callAI(currentMessages, executor, config);
     let toolCall = tryParseToolCall(aiResponse);
 
-    // Automation Guard: If the model provided code blocks but no tool call, 
-    // it's trying to give "instructions" instead of acting.
     if (!toolCall) {
-      const lower = aiResponse.toLowerCase();
-      const isStalling =
-        aiResponse.includes('```') ||
-        lower.includes('you should') ||
-        lower.includes('you can') ||
-        lower.includes('try to') ||
-        lower.includes('to update') ||
-        lower.includes('manually') ||
-        lower.includes('replace') ||
-        lower.includes('provide') ||
-        lower.includes('could you') ||
-        lower.includes('please') ||
-        lower.includes('can you') ||
-        lower.includes('see') ||
-        lower.includes('found') ||
-        lower.includes('missing') ||
-        lower.includes('unavailable') ||
-        lower.includes('not provided') ||
-        lower.includes('cannot find') ||
-        lower.includes('no mention') ||
-        lower.includes('don\'t have') ||
-        lower.includes('want me to') ||
-        aiResponse.includes('?');
-
-      if (isStalling && aiResponse.length > 10) {
-        console.log("!!! Stalling behavior detected. Forcing tool usage !!!");
-        const correction = `[STALLING DETECTED] You are asking a question or explaining why you can't act. 
-STRICT RULE: If you don't see content, use 'read_file'. If you don't see a file, use 'list_directory'.
-DO NOT talk. DO NOT ask the user for anything. 
-USE TOOLS. ACTION ONLY.`;
+      // Stalling check
+      if (aiResponse.length > 5 && (aiResponse.includes('```') || aiResponse.includes('?'))) {
+        console.log("[WAIT] Stalling detected. Forcing action...");
         currentMessages.push({ role: 'assistant', content: aiResponse });
-        currentMessages.push({ role: 'user', content: correction });
+        currentMessages.push({ role: 'user', content: 'STRICT RULE: YOUR RESPONSE MUST BE A JSON TOOL CALL. DO NOT TALK. ACTION ONLY.' });
         continue;
       }
-    }
 
-    if (!toolCall) {
-      // Not a tool call — this is the final text response
+      // Final response
+      conversationHistory.push({ role: 'user', content: userMessage });
       conversationHistory.push({ role: 'assistant', content: aiResponse });
-      console.log('[DONE] Agent finished with text response');
       return { finalResponse: aiResponse, steps };
     }
 
@@ -685,37 +830,36 @@ USE TOOLS. ACTION ONLY.`;
     const toolName = toolCall.tool;
     const toolSummary = getToolSummary(toolCall);
 
-    // Send step start to frontend
     const stepData = { tool: toolName, status: 'running', summary: toolSummary, iteration: iteration + 1 };
     win?.webContents.send('agent:step', stepData);
     steps.push(stepData);
 
-    // Add assistant's tool request and result to local currentMessages
     currentMessages.push({ role: 'assistant', content: aiResponse });
+    const { result: toolResult, logs, abort } = await executeToolCall(toolCall, workspacePath);
 
-    // Execute the tool
-    const toolResult = await executeToolCall(toolCall, workspacePath);
-
-    // Truncate very long results to avoid context overflow
     const truncatedResult = toolResult.length > 15000
-      ? toolResult.substring(0, 15000) + '\n... (truncated, ' + toolResult.length + ' chars total)'
+      ? toolResult.substring(0, 15000) + '\n... (truncated)'
       : toolResult;
 
-    // Update step with result
     steps[steps.length - 1].status = 'done';
-    steps[steps.length - 1].result = truncatedResult.substring(0, 500); // short preview for frontend
-    win?.webContents.send('agent:step', {
-      ...steps[steps.length - 1],
-      status: 'done'
-    });
+    steps[steps.length - 1].result = truncatedResult.substring(0, 500);
+    if (logs) steps[steps.length - 1].logs = logs;
+
+    win?.webContents.send('agent:step', { ...steps[steps.length - 1], status: 'done' });
+
+    if (abort) {
+      console.log(`[ABORT] Stopping loop due to tool abort signal (e.g. denial)`);
+      const finalMsg = `The user denied the command: ${toolCall.command || toolName}. Stopping task.`;
+      conversationHistory.push({ role: 'assistant', content: finalMsg });
+      return { finalResponse: finalMsg, steps };
+    }
 
     currentMessages.push({
       role: 'user',
-      content: `[Tool Result: ${toolName}]\n${truncatedResult}\n\n[NEXT STEP: Use another tool if task is not complete, otherwise give your final text summary.]`
+      content: `[Result: ${toolName}]\n${truncatedResult}\n\n[NEXT STEP: If the implementation plan is fully executed and verified, provide your FINAL RESPONSE now. Otherwise, continue with the next tool call.]`
     });
   }
 
-  // Final Response Management
   const finalAI = currentMessages[currentMessages.length - 1].content;
   conversationHistory.push({ role: 'user', content: userMessage });
   conversationHistory.push({ role: 'assistant', content: finalAI });
@@ -725,22 +869,53 @@ USE TOOLS. ACTION ONLY.`;
 
 // Human-readable summary for a tool call
 function getToolSummary(toolCall: any): string {
+  const path = toolCall.path || '(missing path)';
   switch (toolCall.tool) {
-    case 'read_file': return `Reading ${toolCall.path}`;
-    case 'write_file': return `Writing ${toolCall.path}`;
-    case 'edit_file': return `Editing ${toolCall.path} (${toolCall.edits?.length || 0} edits)`;
-    case 'list_directory': return `Listing ${toolCall.path || 'project root'}`;
-    case 'search_files': return `Searching for "${toolCall.pattern}"${toolCall.include ? ` in ${toolCall.include}` : ''}`;
-    case 'run_command': return `Running: ${toolCall.command}`;
-    case 'create_directory': return `Creating directory ${toolCall.path}`;
-    case 'delete_file': return `Deleting ${toolCall.path}`;
-    case 'semantic_search': return `Searching semantically for "${toolCall.query}"`;
-    case 'get_blast_radius': return `Calculating blast radius for ${toolCall.path}`;
+    case 'read_file': return `Reading ${path}`;
+    case 'write_file': return `Writing ${path}`;
+    case 'edit_file': return `Editing ${path} (${toolCall.edits?.length || 0} edits)`;
+    case 'list_directory': return `Listing ${path}`;
+    case 'search_files': return `Searching for "${toolCall.pattern || '?'}"${toolCall.include ? ` in ${toolCall.include}` : ''}`;
+    case 'run_command': return `Running: ${toolCall.command || '(missing command)'}`;
+    case 'create_directory': return `Creating directory ${path}`;
+    case 'delete_file': return `Deleting ${path}`;
+    case 'semantic_search': return `Searching semantically for "${toolCall.query || '?'}"`;
+    case 'get_blast_radius': return `Calculating blast radius for ${path}`;
     case 'apply_diffs': return `Applying diffs to ${toolCall.changes?.length || 0} files`;
     case 'validate_project': return 'Performing project-wide validation';
     case 'run_tests': return 'Running test suite';
     default: return toolCall.tool;
   }
+}
+
+// ------ WORKSPACE FILE WATCHER ------
+function setupWorkspaceWatcher(watchPath: string) {
+  if (workspaceWatcher) {
+    workspaceWatcher.close();
+    workspaceWatcher = null;
+  }
+
+  workspaceWatcher = chokidar.watch(watchPath, {
+    ignored: /(^|[\\/\\])(node_modules|\.git|dist|dist-electron|build|\.next|__pycache__|\.venv|venv|\.cache|coverage)([\\/\\]|$)/,
+    persistent: true,
+    ignoreInitial: true,
+    depth: 20,
+    awaitWriteFinish: {
+      stabilityThreshold: 300,
+      pollInterval: 100
+    }
+  });
+
+  const notifyRenderer = (type: string, filePath: string) => {
+    win?.webContents.send('fs:directoryChanged', { type, filePath });
+  };
+
+  workspaceWatcher.on('add', (path: string) => notifyRenderer('add', path));
+  workspaceWatcher.on('addDir', (path: string) => notifyRenderer('addDir', path));
+  workspaceWatcher.on('unlink', (path: string) => notifyRenderer('unlink', path));
+  workspaceWatcher.on('unlinkDir', (path: string) => notifyRenderer('unlinkDir', path));
+
+  console.log(`[WATCHER] Watching workspace: ${watchPath}`);
 }
 
 // ------ MENU HANDLERS ------
@@ -753,9 +928,14 @@ ipcMain.handle('dialog:openFile', async () => {
 
 ipcMain.handle('dialog:openFolder', async () => {
   if (!win) return { canceled: true };
-  return await dialog.showOpenDialog(win, {
+  const result = await dialog.showOpenDialog(win, {
     properties: ['openDirectory']
   });
+  // Start watching the selected folder
+  if (!result.canceled && result.filePaths?.length > 0) {
+    setupWorkspaceWatcher(result.filePaths[0]);
+  }
+  return result;
 });
 
 ipcMain.handle('dialog:saveFile', async (_event, content) => {
@@ -863,15 +1043,18 @@ ipcMain.handle('fs:readDirectoryRecursive', async (_event, dirPath: string) => {
   }
 });
 
-ipcMain.handle('execute-agent-task', async (_event, { task, provider, workspacePath, activeFile, config }) => {
+ipcMain.handle('execute-agent-task', async (_event, { task, planner, executor, workspacePath, activeFile, config }) => {
   try {
     // 1. Initial Workspace Scan (only if not loaded)
     if (workspacePath && !workspaceContextLoaded) {
       workspaceContextLoaded = true;
-      console.log('📂 Performing Initial Workspace Context Build:', workspacePath);
+      console.log('[INDEXING] Building project manifest:', workspacePath);
       win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'running', summary: 'Building project context...' });
 
-      const files = await readDirectoryRecursive(workspacePath, 2000);
+      // Start watching workspace for file changes
+      setupWorkspaceWatcher(workspacePath);
+
+      const files = await readDirectoryRecursive(workspacePath, 3000); // Increased limit but lightweight
       if (files.length > 0) {
         let manifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n`;
         manifest += files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
@@ -894,7 +1077,7 @@ ipcMain.handle('execute-agent-task', async (_event, { task, provider, workspaceP
     }
 
     // 2. Run the agent loop
-    const result = await runAgentLoop(task, provider, config, workspacePath, activeFile);
+    const result = await runAgentLoop(task, planner, executor, config, workspacePath, activeFile);
     return {
       response: result.finalResponse,
       steps: result.steps
@@ -907,6 +1090,14 @@ ipcMain.handle('execute-agent-task', async (_event, { task, provider, workspaceP
       steps: []
     };
   }
+});
+
+ipcMain.handle('agent:stop', () => {
+  abortRequested = true;
+  if (pendingPermissionResolver) {
+    pendingPermissionResolver({ approved: false });
+  }
+  return true;
 });
 
 ipcMain.handle('agent:permission-response', (_event, decision) => {

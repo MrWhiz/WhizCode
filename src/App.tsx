@@ -26,7 +26,8 @@ function App() {
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [activeFileId, setActiveFileId] = useState<string | null>(null)
   const [openFiles, setOpenFiles] = useState<OpenFileProps[]>([])
-  const [isSidebarOpen] = useState(true)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true)
+  const [sidebarWidth, setSidebarWidth] = useState(250)
   const [isTerminalOpen, setIsTerminalOpen] = useState(false)
   const [terminalHeight, setTerminalHeight] = useState(250)
 
@@ -35,9 +36,14 @@ function App() {
   const [chatWidth, setChatWidth] = useState(400)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
 
-  // AI Settings Persistence
-  const [aiProvider, setAiProvider] = useState<AIProvider>(() => (localStorage.getItem('aiProvider') as AIProvider) || 'ollama')
-  const [ollamaModel, setOllamaModel] = useState(() => localStorage.getItem('ollamaModel') || 'llama3')
+  // AI Settings Persistence (Planner)
+  const [plannerProvider, setPlannerProvider] = useState<AIProvider>(() => (localStorage.getItem('plannerProvider') as AIProvider) || 'ollama')
+  const [plannerModel, setPlannerModel] = useState(() => localStorage.getItem('plannerModel') || 'llama3')
+
+  // AI Settings Persistence (Executor)
+  const [executorProvider, setExecutorProvider] = useState<AIProvider>(() => (localStorage.getItem('executorProvider') as AIProvider) || 'ollama')
+  const [executorModel, setExecutorModel] = useState(() => localStorage.getItem('executorModel') || 'llama3')
+
   const [openaiKey, setOpenaiKey] = useState(() => localStorage.getItem('openaiKey') || '')
   const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('geminiKey') || '')
 
@@ -47,18 +53,20 @@ function App() {
 
   // Save Settings on Change
   useEffect(() => {
-    localStorage.setItem('aiProvider', aiProvider)
-    localStorage.setItem('ollamaModel', ollamaModel)
+    localStorage.setItem('plannerProvider', plannerProvider)
+    localStorage.setItem('plannerModel', plannerModel)
+    localStorage.setItem('executorProvider', executorProvider)
+    localStorage.setItem('executorModel', executorModel)
     localStorage.setItem('openaiKey', openaiKey)
     localStorage.setItem('geminiKey', geminiKey)
-  }, [aiProvider, ollamaModel, openaiKey, geminiKey])
+  }, [plannerProvider, plannerModel, executorProvider, executorModel, openaiKey, geminiKey])
 
   // Handle Ollama Models
   useEffect(() => {
-    if (isSettingsOpen && aiProvider === 'ollama') {
+    if (isSettingsOpen && (plannerProvider === 'ollama' || executorProvider === 'ollama')) {
       refreshOllamaModels();
     }
-  }, [isSettingsOpen, aiProvider]);
+  }, [isSettingsOpen, plannerProvider, executorProvider]);
 
   const refreshOllamaModels = async () => {
     const ipc = (window as any).ipcRenderer;
@@ -74,8 +82,9 @@ function App() {
       } else {
         setOllamaModels(res);
         setOllamaError(null);
-        if (res.length > 0 && !res.includes(ollamaModel)) {
-          setOllamaModel(res[0]);
+        if (res.length > 0) {
+          if (!res.includes(plannerModel)) setPlannerModel(res[0]);
+          if (!res.includes(executorModel)) setExecutorModel(res[0]);
         }
       }
     } catch {
@@ -87,6 +96,22 @@ function App() {
   };
 
   // Resize Handlers
+  const handleSidebarResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarWidth;
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const newWidth = startWidth + (moveEvent.clientX - startX);
+      setSidebarWidth(Math.max(160, Math.min(newWidth, 600)));
+    };
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+    };
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+  };
+
   const handleTerminalResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startY = e.clientY;
@@ -224,7 +249,10 @@ function App() {
     const ipc = (window as any).ipcRenderer;
     const stepHandler = (_event: any, step: AgentStep) => {
       setAgentSteps(prev => {
-        const existingIdx = prev.findIndex(s => s.tool === step.tool && s.status === 'running');
+        const existingIdx = prev.findIndex(s =>
+          s.tool === step.tool &&
+          (step.iteration !== undefined ? s.iteration === step.iteration : s.status === 'running')
+        );
         if (existingIdx >= 0) {
           const newSteps = [...prev];
           newSteps[existingIdx] = step;
@@ -241,10 +269,11 @@ function App() {
         const activeFile = openFiles.find(f => f.path === activeFileId);
         const result = await ipc.invoke('execute-agent-task', {
           task: userMsg.content,
-          provider: aiProvider,
+          planner: { provider: plannerProvider, model: plannerModel },
+          executor: { provider: executorProvider, model: executorModel },
           workspacePath,
           activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
-          config: { ollamaModel, openaiKey, geminiKey }
+          config: { openaiKey, geminiKey }
         })
         const response = typeof result === 'string' ? result : result?.response || 'No response';
         const steps = typeof result === 'object' ? result?.steps || [] : [];
@@ -259,10 +288,17 @@ function App() {
     }
   }
 
-  const handlePermissionResponse = async (approved: boolean) => {
+  const handlePermissionResponse = async (approved: boolean, _stepIdx?: number) => {
     const ipc = (window as any).ipcRenderer;
     if (ipc) {
       await ipc.invoke('agent:permission-response', { approved });
+    }
+  }
+
+  const handleStop = async () => {
+    const ipc = (window as any).ipcRenderer;
+    if (ipc) {
+      await ipc.invoke('agent:stop');
     }
   }
 
@@ -285,6 +321,7 @@ function App() {
       case 'validate_project': return '🛡️';
       case 'run_tests': return '🧪';
       case 'indexing_workspace': return '📦';
+      case 'planning': return '📋';
       default: return '🛠️';
     }
   }
@@ -306,22 +343,30 @@ function App() {
       />
 
       <div className="main-content">
-        <ActivityBar isChatOpen={isChatOpen} setIsChatOpen={setIsChatOpen} />
+        <ActivityBar
+          isChatOpen={isChatOpen}
+          setIsChatOpen={setIsChatOpen}
+          isSidebarOpen={isSidebarOpen}
+          setIsSidebarOpen={setIsSidebarOpen}
+        />
 
         {isSidebarOpen && (
-          <aside className="sidebar">
-            <div className="sidebar-header">
-              <span>EXPLORER</span>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></svg>
-            </div>
-            <div className="sidebar-section-header" onClick={() => { }}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
-              <strong>{workspacePath ? workspacePath.split(/[/\\]/).pop()?.toUpperCase() : 'WHIZCODE'}</strong>
-            </div>
-            <div className="chat-history">
-              {workspacePath ? <FileTree path={workspacePath} onFileOpen={handleFileOpen} /> : <div className="empty-state">No folder opened.</div>}
-            </div>
-          </aside>
+          <>
+            <aside className="sidebar" style={{ width: `${sidebarWidth}px` }}>
+              <div className="sidebar-header">
+                <span>EXPLORER</span>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></svg>
+              </div>
+              <div className="sidebar-section-header" onClick={() => { }}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                <strong>{workspacePath ? workspacePath.split(/[/\\]/).pop()?.toUpperCase() : 'WHIZCODE'}</strong>
+              </div>
+              <div className="chat-history">
+                {workspacePath ? <FileTree path={workspacePath} onFileOpen={handleFileOpen} /> : <div className="empty-state">No folder opened.</div>}
+              </div>
+            </aside>
+            <div className="sidebar-resize-handle" onMouseDown={handleSidebarResize} />
+          </>
         )}
 
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -362,8 +407,11 @@ function App() {
           getToolIcon={getToolIcon}
           messagesEndRef={messagesEndRef}
           handlePermissionResponse={handlePermissionResponse}
+          handleStop={handleStop}
           settingsProps={{
-            isSettingsOpen, setIsSettingsOpen, aiProvider, setAiProvider, ollamaModel, setOllamaModel,
+            isSettingsOpen, setIsSettingsOpen,
+            plannerProvider, setPlannerProvider, plannerModel, setPlannerModel,
+            executorProvider, setExecutorProvider, executorModel, setExecutorModel,
             ollamaModels, ollamaChecking, ollamaError, refreshOllamaModels, openaiKey, setOpenaiKey, geminiKey, setGeminiKey
           }}
         />

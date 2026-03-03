@@ -22,10 +22,27 @@ interface ChatPanelProps {
     handleKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
     getToolIcon: (tool: string) => string;
     messagesEndRef: React.RefObject<HTMLDivElement | null>;
-    handlePermissionResponse: (approved: boolean) => void;
+    handlePermissionResponse: (approved: boolean, stepIdx?: number) => void;
+    handleStop: () => void;
     // Settings props
     settingsProps: any;
 }
+
+const LogContainer = ({ logs }: { logs: string[] }) => {
+    const logsEndRef = React.useRef<HTMLDivElement>(null);
+    React.useEffect(() => {
+        logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, [logs]);
+
+    return (
+        <div className="agent-step-logs">
+            {logs.map((log, li) => (
+                <span key={li} className="log-line">{log}</span>
+            ))}
+            <div ref={logsEndRef} />
+        </div>
+    );
+};
 
 export const ChatPanel = ({
     chatWidth,
@@ -44,8 +61,15 @@ export const ChatPanel = ({
     getToolIcon,
     messagesEndRef,
     handlePermissionResponse,
+    handleStop,
     settingsProps
 }: ChatPanelProps) => {
+    const [respondedSteps, setRespondedSteps] = React.useState<Record<number, boolean>>({});
+
+    const onPermissionClick = (approved: boolean, idx: number) => {
+        setRespondedSteps(prev => ({ ...prev, [idx]: true }));
+        handlePermissionResponse(approved, idx);
+    };
     if (!isChatOpen) return null;
 
     return (
@@ -92,9 +116,14 @@ export const ChatPanel = ({
                                 <div className="agent-steps">
                                     {msg.steps.map((step, si) => (
                                         <div key={si} className={`agent-step ${step.status}`}>
-                                            <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
-                                            <span className="agent-step-summary">{step.summary}</span>
-                                            {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                                            <div className="agent-step-header">
+                                                <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
+                                                <span className="agent-step-summary">{step.summary}</span>
+                                                {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                                            </div>
+                                            {step.logs && step.logs.length > 0 && (
+                                                <LogContainer logs={step.logs} />
+                                            )}
                                         </div>
                                     ))}
                                 </div>
@@ -149,17 +178,64 @@ export const ChatPanel = ({
                                     <div className="agent-steps live">
                                         {agentSteps.map((step, si) => (
                                             <div key={si} className={`agent-step ${step.status}`}>
-                                                {step.status === 'running' ? (
-                                                    <div className="spinner" style={{ width: 10, height: 10 }}></div>
-                                                ) : (
-                                                    <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
+                                                <div className="agent-step-header">
+                                                    {step.status === 'running' ? (
+                                                        <div className="spinner" style={{ width: 10, height: 10 }}></div>
+                                                    ) : (
+                                                        <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
+                                                    )}
+                                                    <span className="agent-step-summary">{step.summary}</span>
+                                                    {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                                                </div>
+                                                {step.tool === 'planning' && step.result && (
+                                                    <div className="agent-plan-preview">
+                                                        <ReactMarkdown
+                                                            remarkPlugins={[remarkGfm]}
+                                                            components={{
+                                                                code({ node, inline, className, children, ...props }: any) {
+                                                                    const match = /language-(\w+)/.exec(className || '');
+                                                                    const codeString = String(children).replace(/\n$/, '');
+                                                                    return !inline && match ? (
+                                                                        <SyntaxHighlighter
+                                                                            style={vscDarkPlus as any}
+                                                                            language={match[1]}
+                                                                            PreTag="div"
+                                                                            customStyle={{
+                                                                                margin: '4px 0',
+                                                                                borderRadius: '4px',
+                                                                                fontSize: '11px',
+                                                                                padding: '6px'
+                                                                            }}
+                                                                        >
+                                                                            {codeString}
+                                                                        </SyntaxHighlighter>
+                                                                    ) : (
+                                                                        <code className="inline-code" {...props}>
+                                                                            {children}
+                                                                        </code>
+                                                                    );
+                                                                }
+                                                            }}
+                                                        >
+                                                            {step.result}
+                                                        </ReactMarkdown>
+                                                    </div>
                                                 )}
-                                                <span className="agent-step-summary">{step.summary}</span>
-                                                {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                                                {step.logs && step.logs.length > 0 && (
+                                                    <LogContainer logs={step.logs} />
+                                                )}
                                                 {step.status === 'awaiting_permission' && (
                                                     <div className="permission-controls">
-                                                        <button className="perm-btn approve" onClick={() => handlePermissionResponse(true)}>Run</button>
-                                                        <button className="perm-btn deny" onClick={() => handlePermissionResponse(false)}>Deny</button>
+                                                        <button
+                                                            className="perm-btn approve"
+                                                            onClick={() => onPermissionClick(true, si)}
+                                                            disabled={respondedSteps[si] || !isLoading}
+                                                        >Run</button>
+                                                        <button
+                                                            className="perm-btn deny"
+                                                            onClick={() => onPermissionClick(false, si)}
+                                                            disabled={respondedSteps[si] || !isLoading}
+                                                        >Deny</button>
                                                     </div>
                                                 )}
                                             </div>
@@ -188,12 +264,20 @@ export const ChatPanel = ({
                             rows={1}
                             disabled={isLoading}
                         />
-                        <button className="send-btn" onClick={handleSend} disabled={!input.trim() || isLoading}>
-                            <svg className="send-icon" viewBox="0 0 24 24">
-                                <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                                <path d="M22 2L15 22L11 13L2 9L22 2Z" fill="currentColor" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                            </svg>
-                        </button>
+                        {!isLoading ? (
+                            <button className="send-btn" onClick={handleSend} disabled={!input.trim() || isLoading}>
+                                <svg className="send-icon" viewBox="0 0 24 24">
+                                    <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                    <path d="M22 2L15 22L11 13L2 9L22 2Z" fill="currentColor" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                                </svg>
+                            </button>
+                        ) : (
+                            <button className="stop-btn" onClick={handleStop} title="Stop Agent">
+                                <svg className="stop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" fill="currentColor"></rect>
+                                </svg>
+                            </button>
+                        )}
                     </div>
                 </div>
             </div>

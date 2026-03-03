@@ -20,6 +20,7 @@ export const TerminalPane = () => {
                 theme: { background: '#1e1e1e', foreground: '#cccccc' },
                 fontFamily: "'Consolas', 'Courier New', monospace",
                 fontSize: 14,
+                scrollback: 10000,
             })
             const fitAddon = new FitAddon()
             term.loadAddon(fitAddon)

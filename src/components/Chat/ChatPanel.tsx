@@ -44,6 +44,180 @@ const LogContainer = ({ logs }: { logs: string[] }) => {
     );
 };
 
+const EditDetails = ({ data }: { data: any }) => {
+    const [isOpen, setIsOpen] = React.useState(false);
+
+    if (!data) return null;
+
+    return (
+        <div className="agent-step-details" style={{ marginTop: '8px' }}>
+            <div
+                className="details-toggle"
+                onClick={() => setIsOpen(!isOpen)}
+                style={{
+                    fontSize: '11px',
+                    color: 'var(--accent-primary)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    userSelect: 'none',
+                    fontWeight: 600
+                }}
+            >
+                {isOpen ? '⊖ Hide Changes' : '⊕ View Changes'}
+            </div>
+            {isOpen && (
+                <div className="details-content" style={{
+                    marginTop: '8px',
+                    background: 'rgba(0,0,0,0.2)',
+                    borderRadius: '4px',
+                    overflow: 'hidden',
+                    border: '1px solid var(--border-color)'
+                }}>
+                    {data.edits ? (
+                        data.edits.map((edit: any, i: number) => (
+                            <div key={i} className="edit-block-preview" style={{ padding: '8px', borderBottom: i < data.edits.length - 1 ? '1px solid var(--border-color)' : 'none' }}>
+                                <div style={{ fontSize: '10px', color: '#f14c4c', fontWeight: 600, marginBottom: '4px' }}>REMOVE</div>
+                                <pre style={{ margin: '0 0 8px 0', fontSize: '11px', whiteSpace: 'pre-wrap', color: '#ff8888', background: 'rgba(241,76,76,0.05)', padding: '4px', borderRadius: '2px' }}>{edit.search}</pre>
+                                <div style={{ fontSize: '10px', color: '#89d185', fontWeight: 600, marginBottom: '4px' }}>ADD</div>
+                                <pre style={{ margin: 0, fontSize: '11px', whiteSpace: 'pre-wrap', color: '#89d185', background: 'rgba(137,209,133,0.05)', padding: '4px', borderRadius: '2px' }}>{edit.replace}</pre>
+                            </div>
+                        ))
+                    ) : data.changes ? (
+                        data.changes.map((change: any, i: number) => (
+                            <div key={i} className="edit-block-preview" style={{ padding: '8px', borderBottom: i < data.changes.length - 1 ? '1px solid var(--border-color)' : 'none' }}>
+                                <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '6px', color: 'var(--text-secondary)' }}>{change.path}</div>
+                                <pre style={{ margin: 0, fontSize: '11px', whiteSpace: 'pre-wrap', fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>{change.diff}</pre>
+                            </div>
+                        ))
+                    ) : null}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const MessageContent = ({ content, role }: { content: string, role: string }) => {
+    if (role !== 'assistant') return <>{content}</>;
+
+    // 1. Extract and clean thought blocks
+    const thoughtRegex = /<THOUGHT>([\s\S]*?)<\/THOUGHT>/gi;
+    const thoughts: string[] = [];
+    let match;
+    let cleanContent = content;
+
+    while ((match = thoughtRegex.exec(content)) !== null) {
+        thoughts.push(match[1].trim());
+    }
+
+    // Normalize and strip all possible internal control tags
+    cleanContent = content
+        .replace(thoughtRegex, '')
+        .replace(/<IDENTITY>[\s\S]*?<\/IDENTITY>/gi, '')
+        .replace(/<PRIME_DIRECTIVE>[\s\S]*?<\/PRIME_DIRECTIVE>/gi, '')
+        .replace(/<PLAN>[\s\S]*?<\/PLAN>/gi, '')
+        .replace(/<PROJECT_STATUS>[\s\S]*?<\/PROJECT_STATUS>/gi, '')
+        .replace(/<OUTPUT_FORMAT>[\s\S]*?<\/OUTPUT_FORMAT>/gi, '')
+        .trim();
+
+    // 2. Detect if the remaining content is just a JSON-like completion summary
+    let isJsonSummary = false;
+    if (cleanContent.startsWith('{') && cleanContent.endsWith('}') && cleanContent.includes('"status"')) {
+        try {
+            isJsonSummary = true;
+        } catch (e) { }
+    }
+
+    return (
+        <div className="assistant-content-wrapper">
+            {thoughts.length > 0 && (
+                <div className="thought-process" style={{
+                    marginBottom: '12px',
+                    background: 'rgba(0, 0, 0, 0.2)',
+                    borderRadius: '6px',
+                    borderLeft: '3px solid var(--accent-primary)',
+                    padding: '8px 10px'
+                }}>
+                    <div className="thought-header" style={{
+                        fontSize: '10px',
+                        fontWeight: 700,
+                        color: 'var(--text-tertiary)',
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.5px',
+                        marginBottom: '4px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px'
+                    }}>
+                        <span style={{ opacity: 0.6 }}>🧠</span> REASONING
+                    </div>
+                    {thoughts.map((t, i) => (
+                        <div key={i} className="thought-body" style={{
+                            fontSize: '11.5px',
+                            color: 'var(--text-secondary)',
+                            fontStyle: 'italic',
+                            lineHeight: '1.4'
+                        }}>{t}</div>
+                    ))}
+                </div>
+            )}
+            <div className="message-main-body">
+                {isJsonSummary ? (
+                    <SyntaxHighlighter
+                        style={vscDarkPlus as any}
+                        language="json"
+                        PreTag="div"
+                        customStyle={{
+                            margin: '8px 0',
+                            borderRadius: '6px',
+                            fontSize: '12px',
+                            border: '1px solid var(--border-color)',
+                            background: 'rgba(0,0,0,0.3)'
+                        }}
+                    >
+                        {cleanContent}
+                    </SyntaxHighlighter>
+                ) : (
+                    <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                            code({ className, children, ...props }) {
+                                const match = /language-(\w+)/.exec(className || '');
+                                const codeString = String(children).replace(/\n$/, '');
+                                return match ? (
+                                    <SyntaxHighlighter
+                                        style={vscDarkPlus as any}
+                                        language={match[1]}
+                                        PreTag="div"
+                                        customStyle={{
+                                            margin: '8px 0',
+                                            borderRadius: '6px',
+                                            fontSize: '12px',
+                                            border: '1px solid var(--border-color)',
+                                        }}
+                                    >
+                                        {codeString}
+                                    </SyntaxHighlighter>
+                                ) : (
+                                    <code className="inline-code" {...props}>
+                                        {children}
+                                    </code>
+                                );
+                            },
+                            a({ href, children }) {
+                                return <a href={href} target="_blank" rel="noreferrer" className="md-link">{children}</a>;
+                            },
+                        }}
+                    >
+                        {cleanContent}
+                    </ReactMarkdown>
+                )}
+            </div>
+        </div>
+    );
+};
+
 export const ChatPanel = ({
     chatWidth,
     handleChatResize,
@@ -65,11 +239,44 @@ export const ChatPanel = ({
     settingsProps
 }: ChatPanelProps) => {
     const [respondedSteps, setRespondedSteps] = React.useState<Record<number, boolean>>({});
+    const [alwaysRun, setAlwaysRun] = React.useState(false);
+    const [countdown, setCountdown] = React.useState<number | null>(null);
+
+    React.useEffect(() => {
+        if (!isLoading) {
+            setRespondedSteps({});
+            setCountdown(null);
+            // Reset alwaysRun on task completion? Or keep it? Usually better to reset for safety.
+            // setAlwaysRun(false); 
+        }
+    }, [isLoading]);
 
     const onPermissionClick = (approved: boolean, idx: number) => {
         setRespondedSteps(prev => ({ ...prev, [idx]: true }));
+        setCountdown(null);
         handlePermissionResponse(approved, idx);
     };
+
+    const pendingPermissionStepIdx = agentSteps.findIndex((s, i) => s.status === 'awaiting_permission' && !respondedSteps[i]);
+
+    // Handle auto-run logic
+    React.useEffect(() => {
+        if (alwaysRun && pendingPermissionStepIdx >= 0 && !respondedSteps[pendingPermissionStepIdx] && countdown === null) {
+            setCountdown(3); // 3 second countdown
+        } else if (!alwaysRun || pendingPermissionStepIdx < 0) {
+            setCountdown(null);
+        }
+    }, [alwaysRun, pendingPermissionStepIdx, respondedSteps]);
+
+    React.useEffect(() => {
+        if (countdown !== null && countdown > 0) {
+            const timer = setTimeout(() => setCountdown(countdown - 1), 1000);
+            return () => clearTimeout(timer);
+        } else if (countdown === 0 && pendingPermissionStepIdx >= 0) {
+            onPermissionClick(true, pendingPermissionStepIdx);
+        }
+    }, [countdown, pendingPermissionStepIdx]);
+
     if (!isChatOpen) return null;
 
     return (
@@ -121,6 +328,9 @@ export const ChatPanel = ({
                                                 <span className="agent-step-summary">{step.summary}</span>
                                                 {step.status === 'done' && <span className="agent-step-check">✓</span>}
                                             </div>
+                                            {step.data && (
+                                                <EditDetails data={step.data} />
+                                            )}
                                             {step.logs && step.logs.length > 0 && (
                                                 <LogContainer logs={step.logs} />
                                             )}
@@ -129,43 +339,7 @@ export const ChatPanel = ({
                                 </div>
                             )}
                             <div className="chat-msg-content">
-                                {msg.role === 'assistant' ? (
-                                    <ReactMarkdown
-                                        remarkPlugins={[remarkGfm]}
-                                        components={{
-                                            code({ className, children, ...props }) {
-                                                const match = /language-(\w+)/.exec(className || '');
-                                                const codeString = String(children).replace(/\n$/, '');
-                                                return match ? (
-                                                    <SyntaxHighlighter
-                                                        style={vscDarkPlus as any}
-                                                        language={match[1]}
-                                                        PreTag="div"
-                                                        customStyle={{
-                                                            margin: '8px 0',
-                                                            borderRadius: '6px',
-                                                            fontSize: '12px',
-                                                            border: '1px solid var(--border-color)',
-                                                        }}
-                                                    >
-                                                        {codeString}
-                                                    </SyntaxHighlighter>
-                                                ) : (
-                                                    <code className="inline-code" {...props}>
-                                                        {children}
-                                                    </code>
-                                                );
-                                            },
-                                            a({ href, children }) {
-                                                return <a href={href} target="_blank" rel="noreferrer" className="md-link">{children}</a>;
-                                            },
-                                        }}
-                                    >
-                                        {msg.content}
-                                    </ReactMarkdown>
-                                ) : (
-                                    msg.content
-                                )}
+                                <MessageContent content={msg.content} role={msg.role} />
                             </div>
                         </div>
                     ))}
@@ -187,6 +361,9 @@ export const ChatPanel = ({
                                                     <span className="agent-step-summary">{step.summary}</span>
                                                     {step.status === 'done' && <span className="agent-step-check">✓</span>}
                                                 </div>
+                                                {step.data && (
+                                                    <EditDetails data={step.data} />
+                                                )}
                                                 {step.tool === 'planning' && step.result && (
                                                     <div className="agent-plan-preview">
                                                         <ReactMarkdown
@@ -224,20 +401,6 @@ export const ChatPanel = ({
                                                 {step.logs && step.logs.length > 0 && (
                                                     <LogContainer logs={step.logs} />
                                                 )}
-                                                {step.status === 'awaiting_permission' && (
-                                                    <div className="permission-controls">
-                                                        <button
-                                                            className="perm-btn approve"
-                                                            onClick={() => onPermissionClick(true, si)}
-                                                            disabled={respondedSteps[si] || !isLoading}
-                                                        >Run</button>
-                                                        <button
-                                                            className="perm-btn deny"
-                                                            onClick={() => onPermissionClick(false, si)}
-                                                            disabled={respondedSteps[si] || !isLoading}
-                                                        >Deny</button>
-                                                    </div>
-                                                )}
                                             </div>
                                         ))}
                                     </div>
@@ -255,6 +418,68 @@ export const ChatPanel = ({
                 </div>
 
                 <div className="chat-input-area">
+                    {pendingPermissionStepIdx >= 0 && (
+                        <div className="permission-controls-enhanced" style={{
+                            display: 'flex', flexDirection: 'column', gap: '10px',
+                            padding: '12px', background: 'var(--vscode-bg)',
+                            border: '1px solid var(--accent-primary)', borderRadius: '6px',
+                            marginBottom: '10px',
+                            boxShadow: '0 -4px 12px rgba(0,0,0,0.3)',
+                            borderLeft: '4px solid var(--accent-primary)'
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+                                <div style={{ fontSize: '18px', marginTop: '2px' }}>🛡️</div>
+                                <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ fontSize: '11px', color: 'var(--text-secondary)', fontWeight: 600, textTransform: 'uppercase', marginBottom: '4px' }}>
+                                        Permission Required
+                                    </div>
+                                    <div style={{
+                                        fontSize: '13px',
+                                        fontWeight: 400,
+                                        lineHeight: '1.4',
+                                        wordBreak: 'break-word',
+                                        overflowWrap: 'anywhere',
+                                        color: 'var(--text-primary)',
+                                        fontFamily: 'var(--font-mono)',
+                                        background: 'rgba(0,0,0,0.2)',
+                                        padding: '6px',
+                                        borderRadius: '4px'
+                                    }}>
+                                        {agentSteps[pendingPermissionStepIdx].summary}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderTop: '1px solid var(--border-color)', paddingTop: '8px' }}>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={alwaysRun}
+                                        onChange={(e) => setAlwaysRun(e.target.checked)}
+                                        style={{ accentColor: 'var(--accent-primary)' }}
+                                    />
+                                    <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>Always run in this interaction</span>
+                                </label>
+
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    <button
+                                        className="perm-btn deny"
+                                        onClick={() => onPermissionClick(false, pendingPermissionStepIdx)}
+                                        disabled={respondedSteps[pendingPermissionStepIdx] || !isLoading}
+                                        style={{ padding: '4px 12px' }}
+                                    >Deny</button>
+                                    <button
+                                        className="perm-btn approve"
+                                        onClick={() => onPermissionClick(true, pendingPermissionStepIdx)}
+                                        disabled={respondedSteps[pendingPermissionStepIdx] || !isLoading}
+                                        style={{ padding: '4px 20px', minWidth: '80px', position: 'relative' }}
+                                    >
+                                        {countdown !== null ? `Run (${countdown}s)` : 'Run'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                     <div className="chat-input-box">
                         <textarea
                             value={input}

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
@@ -40,7 +40,9 @@ const diffService = new DiffService();
 let workspaceWatcher: chokidar.FSWatcher | null = null;
 let pendingPermissionResolver: ((decision: { approved: boolean }) => void) | null = null
 let abortRequested = false;
-// voyageKey removed as it was unused and causing lint error
+let agentAbortController: AbortController | null = null;
+let currentActiveProcess: any | null = null;
+let currentWorkspacePath: string | null = null;
 
 // Ollama Configuration
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
@@ -56,6 +58,7 @@ function createWindow() {
       preload: join(__dirname, 'preload.mjs'),
       nodeIntegration: false,
       contextIsolation: true,
+      webviewTag: true
     },
     titleBarStyle: 'hidden',
     titleBarOverlay: {
@@ -241,8 +244,8 @@ You are the "WHIZCODE ARCHITECT". Your role is to analyze user requests and proj
 
 <OUTPUT_FORMAT>
 # IMPLEMENTATION PLAN
-1. [Phase 1: Environment & Discovery] - Check for required runtimes/dependencies and list relevant files.
-2. [Phase 2: Setup] - Install dependencies or create virtual environments if necessary.
+1. [Phase 1: Environment & Discovery] - Check for required runtimes/dependencies if not already verified in this conversation. Do NOT use or plan to use git commands like git log or git blame.
+2. [Phase 2: Setup] - Install dependencies or create virtual environments ONLY if they are missing or if new dependencies were added.
 3. [Phase 3: Implementation] - Perform the core task.
 4. [Phase 4: Verification] - Run tests or validate project.
 </OUTPUT_FORMAT>
@@ -259,6 +262,8 @@ You possess full system access. You are a doer, a builder, and an execution mach
 2. **FOLLOW THE PLAN**: Execute the plan perfectly. **NEVER skip environment checks** specified in the plan.
 3. **COMPLETION**: Once ALL steps in the plan are finished, DO NOT call any more tools. Instead, provide a final technical summary of your work and state that the task is complete.
 4. **ZERO QUESTIONS**: NEVER ask the user for permission or code. Use your tools.
+5. **TERMINAL AWARENESS**: Before running terminal commands, remember you are operating on a specific OS and Shell (e.g., Windows with PowerShell or macOS/Linux with bash). Tailor your commands strictly to the environment.
+6. **ANTI-LOOPING**: If a tool call fails or produces an error, DO NOT repeat the exact same tool call. Read the error, analyze the output, and change your approach entirely (e.g., fix syntax, change the command, verify paths via list_directory before blindly running).
 </PRIME_DIRECTIVE>
 
 <TOOL_HIERARCHY>
@@ -284,6 +289,7 @@ You possess full system access. You are a doer, a builder, and an execution mach
 - **Thinking**: <THOUGHT> [What phase are you on? Are dependencies met? Current action?] </THOUGHT>
 - **Action**: [Valid JSON Tool Call]
 - **NO CHATTER**: No "I'd be happy to", "Here is", or "Could you".
+- **JSON SAFETY**: Ensure ALL double quotes inside JSON string values (like "content" or "replace") are properly escaped as \\". Malformed JSON will cause the task to fail.
 </OUTPUT_FORMAT>
 `;
 
@@ -293,8 +299,7 @@ let workspaceManifest: string = '';
 let workspaceContextLoaded = false;
 
 // ====== LLM PROVIDER CALLS ======
-
-async function callAI(messages: any[], modelConfig: { provider: string, model: string }, config: any) {
+async function callAI(messages: any[], modelConfig: { provider: string, model: string }, config: any, signal?: AbortSignal) {
   try {
     let response: any;
     let data: any;
@@ -311,7 +316,8 @@ async function callAI(messages: any[], modelConfig: { provider: string, model: s
           model: model || 'gpt-4o',
           messages: messages,
           temperature: 0.1
-        })
+        }),
+        signal
       });
       if (!response.ok) throw new Error(`OpenAI HTTP Error: ${response.status} ${await response.text()}`);
       data = await response.json();
@@ -330,7 +336,8 @@ async function callAI(messages: any[], modelConfig: { provider: string, model: s
       response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model || 'gemini-1.5-flash'}:generateContent?key=${config.geminiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal
       });
       if (!response.ok) throw new Error(`Gemini HTTP Error: ${response.status} ${await response.text()}`);
       data = await response.json();
@@ -346,13 +353,15 @@ async function callAI(messages: any[], modelConfig: { provider: string, model: s
           options: {
             temperature: 0
           }
-        })
+        }),
+        signal
       });
       if (!response.ok) throw new Error(`Ollama HTTP Error: ${response.status}`);
       data = await response.json();
       return data.message.content;
     }
   } catch (error: any) {
+    if (error.name === 'AbortError') throw new Error('Task stopped by user');
     console.error("AI Provider Error:", error);
     throw error;
   }
@@ -364,38 +373,73 @@ function tryParseToolCall(response: string): any | null {
   if (!response) return null;
   const trimmed = response.trim();
 
-  // 1. Find the largest JSON object in the string
-  const firstBrace = trimmed.indexOf('{');
-  const lastBrace = trimmed.lastIndexOf('}');
+  // 1. Direct parse attempt
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed.tool) return parsed;
+  } catch (e) { }
 
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    const jsonCandidate = trimmed.substring(firstBrace, lastBrace + 1);
-    try {
-      const parsed = JSON.parse(jsonCandidate);
-      if (parsed.tool) return parsed;
-    } catch {
-      // If full wrap fails, try regex for the tool object specifically
-      const toolRegex = /({\s*"tool"\s*:\s*"[^"]+"[\s\S]*?})/g; // Added 'g' flag for multiple matches
-      let match;
-      let bestMatch = null;
-      while ((match = toolRegex.exec(trimmed)) !== null) {
-        try {
-          const innerParsed = JSON.parse(match[1]);
-          if (innerParsed.tool) {
-            // Prioritize the longest valid tool JSON found
-            if (!bestMatch || match[1].length > bestMatch[1].length) {
-              bestMatch = match;
-            }
+  // 2. Regex-based extraction (The "Dirty JSON" approach)
+  // LLMs often fail to escape double quotes inside JSON string values.
+  // We look for the "tool" first.
+  const toolMatch = /"tool"\s*:\s*"([^"]+)"/.exec(trimmed);
+  if (toolMatch) {
+    const tool = toolMatch[1];
+
+    // Basic extraction logic for common tools
+    if (tool === 'run_command') {
+      const commandMatch = /"command"\s*:\s*"([\s\S]*?)"\s*}/.exec(trimmed);
+      if (commandMatch) return { tool, command: commandMatch[1] };
+    }
+
+    if (tool === 'write_file' || tool === 'read_file' || tool === 'edit_file') {
+      const pathMatch = /"path"\s*:\s*"([^"]+)"/.exec(trimmed);
+      if (pathMatch) {
+        const path = pathMatch[1].replace(/\\/g, '/'); // Normalize path backslashes
+
+        if (tool === 'read_file') return { tool, path };
+        if (tool === 'write_file') {
+          const contentMatch = /"content"\s*:\s*"([\s\S]*?)"\s*}/.exec(trimmed);
+          if (contentMatch) return { tool, path, content: contentMatch[1] };
+        }
+        if (tool === 'edit_file') {
+          // Edits are arrays, harder to regex cleanly, but we can try to isolate the JSON block
+          const startIdx = trimmed.indexOf('{');
+          const lastIdx = trimmed.lastIndexOf('}');
+          if (startIdx !== -1 && lastIdx !== -1) {
+            let candidate = trimmed.substring(startIdx, lastIdx + 1);
+
+            // Try logic for unescaped quotes in edit values
+            try {
+              // This regex specifically targets unescaped quotes in search/replace blocks
+              const fixedCandidate = candidate.replace(/"(search|replace|content|command)"\s*:\s*"([\s\S]*?)"(?=\s*[,}])|"(search|replace|content|command)"\s*:\s*"([\s\S]*?)"(?=\s*\])/g, (_, key, val, key2, val2) => {
+                const finalKey = key || key2;
+                const finalVal = (val || val2).replace(/"/g, '\\"');
+                return `"${finalKey}": "${finalVal}"`;
+              });
+
+              const parsed = JSON.parse(fixedCandidate);
+              if (parsed.tool) return parsed;
+            } catch (e2) { }
           }
-        } catch { }
-      }
-      if (bestMatch) {
-        try {
-          const parsed = JSON.parse(bestMatch[1]);
-          if (parsed.tool) return parsed;
-        } catch { }
+        }
       }
     }
+  }
+
+  // 3. Last Resport: Fallback to the largest block with backslash fixing
+  let sanitized = trimmed;
+  sanitized = sanitized.replace(/"([^"]*)"/g, (_, p1) => {
+    return `"${p1.replace(/\\(?!["\\/bfnrtu])/g, '\\\\')}"`;
+  });
+
+  const toolRegex = /({\s*"tool"\s*:\s*"[^"]+"[\s\S]*?})/g;
+  let m;
+  while ((m = toolRegex.exec(sanitized)) !== null) {
+    try {
+      const parsedAgain = JSON.parse(m[1]);
+      if (parsedAgain.tool) return parsedAgain;
+    } catch { }
   }
 
   return null;
@@ -403,7 +447,7 @@ function tryParseToolCall(response: string): any | null {
 
 // ====== TOOL EXECUTOR ======
 
-async function executeToolCall(toolData: any, workspacePath: string | null): Promise<{ result: string; logs?: string[]; abort?: boolean }> {
+async function executeToolCall(toolData: any, workspacePath: string | null, iteration?: number): Promise<{ result: string; logs?: string[]; abort?: boolean; data?: any }> {
   const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath) : '';
   console.log(`\n[TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ''}`);
 
@@ -478,7 +522,10 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
         }
 
-        return { result: `✅ Applied ${editCount} edit(s) to ${toolData.path}` };
+        return {
+          result: `✅ Applied ${editCount} edit(s) to ${toolData.path}`,
+          data: { path: toolData.path, edits: toolData.edits }
+        };
       }
 
       case 'list_directory': {
@@ -498,7 +545,8 @@ Searched for: "${edit.search.substring(0, 50)}..."`
           tool: 'run_command',
           status: 'awaiting_permission',
           summary: `Execute: ${command}`,
-          command: command
+          command: command,
+          iteration: iteration
         });
 
         const decision = await new Promise<{ approved: boolean }>(resolve => {
@@ -518,7 +566,8 @@ Searched for: "${edit.search.substring(0, 50)}..."`
           tool: 'run_command',
           status: 'running',
           summary: `Executing: ${command}`,
-          logs: logs
+          logs: logs,
+          iteration: iteration
         });
 
         try {
@@ -531,7 +580,9 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             const shellArgs = process.platform === 'win32' ? ['-Command', command] : ['-c', command];
 
             const child = spawn(shell, shellArgs, { cwd, shell: true });
+            currentActiveProcess = child;
             let output = '';
+            let isResolved = false;
 
             const handleData = (data: any) => {
               const str = data.toString();
@@ -548,15 +599,49 @@ Searched for: "${edit.search.substring(0, 50)}..."`
                   tool: 'run_command',
                   status: 'running',
                   summary: `Executing: ${command}`,
-                  logs: [...logs]
+                  logs: [...logs],
+                  iteration: iteration
                 });
+
+                // Early success detection: If it looks like a server started, 
+                // return early so the agent doesn't stall for 15s.
+                const successMarkers = [
+                  'ready in', 'started on', 'local:', 'network:',
+                  'listening on', 'compiled successfully', 'available at'
+                ];
+                const lowerStr = str.toLowerCase();
+                if (successMarkers.some(marker => lowerStr.includes(marker))) {
+                  if (!isResolved) {
+                    setTimeout(() => { // Small delay to catch a few more lines
+                      if (isResolved) return;
+                      isResolved = true;
+                      clearTimeout(timeout);
+                      currentActiveProcess = null;
+                      resolve(`${output.trim()}\n\n[INFO]: Server/Process detected as READY and running in background.`);
+                    }, 500);
+                  }
+                }
               }
             };
 
             child.stdout?.on('data', handleData);
             child.stderr?.on('data', handleData);
 
+            // Timeout mechanism: If the command is long-running (like a server), 
+            // return partial output after 15 seconds so the agent can proceed.
+            const timeout = setTimeout(() => {
+              if (isResolved) return;
+              isResolved = true;
+              currentActiveProcess = null;
+              const resultMsg = output.trim() || '(No output yet, but process is still running)';
+              resolve(`${resultMsg}\n\n[INFO]: Command is still running in background.`);
+            }, 15000);
+
             child.on('close', (code) => {
+              if (isResolved) return;
+              clearTimeout(timeout);
+              isResolved = true;
+              currentActiveProcess = null;
               if (code === 0) {
                 resolve(output.trim() || '(command completed with no output)');
               } else {
@@ -565,9 +650,15 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             });
 
             child.on('error', (err) => {
+              if (isResolved) return;
+              clearTimeout(timeout);
+              isResolved = true;
+              currentActiveProcess = null;
               reject(err);
             });
           });
+
+          if (abortRequested) return { result: '⚠️ Task stopped by user.', abort: true };
 
           // Refresh manifest after command execution (might have created files/dirs like venv)
           if (workspacePath) {
@@ -675,7 +766,10 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
               files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
           }
-          return { result: `✅ Successfully applied diffs to ${result.appliedCount} files.` };
+          return {
+            result: `✅ Successfully applied diffs to ${result.appliedCount} files.`,
+            data: { changes: toolData.changes }
+          };
         } else {
           return { result: `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).` };
         }
@@ -742,6 +836,9 @@ async function runAgentLoop(
   const steps: any[] = [];
   abortRequested = false;
 
+  // Persist user message to history immediately
+  conversationHistory.push({ role: 'user', content: userMessage });
+
   // 1. Build project context
   let projectStatus = `<PROJECT_STATUS>\n`;
   if (workspaceManifest) {
@@ -749,10 +846,12 @@ async function runAgentLoop(
   } else {
     projectStatus += `Project not indexed yet. Root: ${workspacePath}\n`;
   }
-  if (activeContext) {
-    projectStatus += `\n\n### ACTIVE FILE (CURRENTLY OPEN IN EDITOR):\nPath: ${activeContext.path}\nContent:\n${activeContext.content}\n`;
-  }
   projectStatus += `\n</PROJECT_STATUS>`;
+
+  let activeFileSnippet = '';
+  if (activeContext) {
+    activeFileSnippet = `\n\n### ACTIVE FILE (CURRENTLY OPEN IN EDITOR):\nPath: ${activeContext.path}\nContent:\n${activeContext.content}\n`;
+  }
 
   // 2. PHASE 1: PLANNING
   win?.webContents.send('agent:step', { tool: 'planning', status: 'running', summary: 'Generating implementation plan...' });
@@ -763,7 +862,7 @@ async function runAgentLoop(
     { role: 'user', content: userMessage }
   ];
 
-  const plan = await callAI(plannerMessages, planner, config);
+  const plan = await callAI(plannerMessages, planner, config, agentAbortController?.signal);
   console.log('[PLAN]\n', plan);
 
   const planStep: any = { tool: 'planning', status: 'awaiting_permission', summary: 'Architectural Plan Ready', result: plan };
@@ -790,13 +889,19 @@ async function runAgentLoop(
   steps.push(planStep);
 
   // 3. PHASE 2: EXECUTION
-  const executorInstructions = `${EXECUTOR_SYSTEM_PROMPT}\n\n${projectStatus}\n\n<PLAN>\n${plan}\n</PLAN>\n\n[ACT NOW: Start from the first step of the plan. Output a tool call.]`;
+  // We keep the system prompt lean and provide the project status/manifest in the FIRST user message
+  // of the execution phase to avoid stale context issues in the system prompt.
+  const executorInstructions = `${EXECUTOR_SYSTEM_PROMPT}\n\n[ACT NOW: Start from the first step of the plan. Output a tool call.]`;
 
   const currentMessages = [
     { role: 'system', content: executorInstructions },
-    ...conversationHistory,
-    { role: 'user', content: `Task: ${userMessage}` }
+    ...conversationHistory.slice(0, -1), // Everything except the user message we just pushed
+    { role: 'user', content: `Task: ${userMessage}\n\n${projectStatus}${activeFileSnippet}\n\n<PLAN>\n${plan}\n</PLAN>` }
   ];
+
+  let previousToolCallStr = '';
+  let toolHistory: string[] = []; // To detect ping-pong loops
+  let repeatCount = 0;
 
   for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
     if (abortRequested) {
@@ -808,7 +913,7 @@ async function runAgentLoop(
     console.log(`[ITERATION ${iteration + 1}/${MAX_AGENT_ITERATIONS}]`);
 
     // Call Executor
-    const aiResponse = await callAI(currentMessages, executor, config);
+    const aiResponse = await callAI(currentMessages, executor, config, agentAbortController?.signal);
     let toolCall = tryParseToolCall(aiResponse);
 
     if (!toolCall) {
@@ -821,9 +926,40 @@ async function runAgentLoop(
       }
 
       // Final response
-      conversationHistory.push({ role: 'user', content: userMessage });
       conversationHistory.push({ role: 'assistant', content: aiResponse });
       return { finalResponse: aiResponse, steps };
+    }
+
+    const currentToolCallStr = JSON.stringify({ tool: toolCall.tool, path: toolCall.path, command: toolCall.command });
+
+    // 1. Detect direct repetition
+    if (currentToolCallStr === previousToolCallStr) {
+      repeatCount++;
+      if (repeatCount >= 1) {
+        const warningMsg = `[SYSTEM WARNING] You are repeating the exact same tool call. STOP. If the previous attempt failed or didn't produce the result you expected, you MUST change your strategy. DO NOT repeat the same operation unless you have fixed the underlying issue.`;
+        currentMessages.push({ role: 'assistant', content: aiResponse });
+        currentMessages.push({ role: 'user', content: warningMsg });
+        continue;
+      }
+    } else {
+      repeatCount = 0;
+      previousToolCallStr = currentToolCallStr;
+    }
+
+    // 2. Detect "Ping-Pong" loops (alternating between two tools like edit -> validate -> edit)
+    toolHistory.push(currentToolCallStr);
+    if (toolHistory.length > 4) toolHistory.shift();
+
+    const isPingPong = toolHistory.length === 4 &&
+      toolHistory[0] === toolHistory[2] &&
+      toolHistory[1] === toolHistory[3];
+
+    if (isPingPong) {
+      const loopWarning = `[LOOP DETECTED] You are alternating between the same two operations. This usually means your "fix" isn't working or is being reverted by another tool. READ THE PREVIOUS OUTPUT CAREFULLY. You must change your approach completely. Maybe use 'read_file' to see what's actually on disk.`;
+      currentMessages.push({ role: 'assistant', content: aiResponse });
+      currentMessages.push({ role: 'user', content: loopWarning });
+      toolHistory = []; // Reset history after warning
+      continue;
     }
 
     // It's a tool call — execute it
@@ -835,7 +971,7 @@ async function runAgentLoop(
     steps.push(stepData);
 
     currentMessages.push({ role: 'assistant', content: aiResponse });
-    const { result: toolResult, logs, abort } = await executeToolCall(toolCall, workspacePath);
+    const { result: toolResult, logs, abort, data: resultData } = await executeToolCall(toolCall, workspacePath, iteration + 1);
 
     const truncatedResult = toolResult.length > 15000
       ? toolResult.substring(0, 15000) + '\n... (truncated)'
@@ -845,6 +981,8 @@ async function runAgentLoop(
     steps[steps.length - 1].result = truncatedResult.substring(0, 500);
     if (logs) steps[steps.length - 1].logs = logs;
 
+    if (resultData) steps[steps.length - 1].data = resultData;
+
     win?.webContents.send('agent:step', { ...steps[steps.length - 1], status: 'done' });
 
     if (abort) {
@@ -853,7 +991,6 @@ async function runAgentLoop(
       conversationHistory.push({ role: 'assistant', content: finalMsg });
       return { finalResponse: finalMsg, steps };
     }
-
     currentMessages.push({
       role: 'user',
       content: `[Result: ${toolName}]\n${truncatedResult}\n\n[NEXT STEP: If the implementation plan is fully executed and verified, provide your FINAL RESPONSE now. Otherwise, continue with the next tool call.]`
@@ -861,10 +998,19 @@ async function runAgentLoop(
   }
 
   const finalAI = currentMessages[currentMessages.length - 1].content;
-  conversationHistory.push({ role: 'user', content: userMessage });
   conversationHistory.push({ role: 'assistant', content: finalAI });
 
   return { finalResponse: finalAI, steps };
+}
+
+async function refreshManifest(workspacePath: string) {
+  const files = await readDirectoryRecursive(workspacePath, 3000);
+  if (files.length > 0) {
+    let manifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n`;
+    manifest += files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+    manifest += '\n\n#### Critical Metadata:\n(Use read_file to access full contents)\n';
+    workspaceManifest = manifest;
+  }
 }
 
 // Human-readable summary for a tool call
@@ -908,6 +1054,10 @@ function setupWorkspaceWatcher(watchPath: string) {
 
   const notifyRenderer = (type: string, filePath: string) => {
     win?.webContents.send('fs:directoryChanged', { type, filePath });
+    // Refresh manifest on file changes to keep agent context up-to-date
+    if (currentWorkspacePath) {
+      refreshManifest(currentWorkspacePath).catch(console.error);
+    }
   };
 
   workspaceWatcher.on('add', (path: string) => notifyRenderer('add', path));
@@ -987,6 +1137,7 @@ ipcMain.handle('fs:readDirectory', async (_event, dirPath) => {
 });
 
 ipcMain.on('app:exit', () => app.quit());
+ipcMain.handle('app:open-external', (_event, url) => shell.openExternal(url));
 
 // ------ TERMINAL HANDLERS ------
 ipcMain.on('terminal:spawn', () => {
@@ -1021,6 +1172,16 @@ ipcMain.on('terminal:resize', (_event, cols, rows) => {
   }
 });
 
+ipcMain.handle('terminal:reset', () => {
+  if (ptyProcess) {
+    try {
+      ptyProcess.kill();
+    } catch (e) { }
+    ptyProcess = null;
+  }
+  return true;
+});
+
 // ------ AI INFRASTRUCTURE ------
 
 ipcMain.handle('ollama:getModels', async () => {
@@ -1045,35 +1206,38 @@ ipcMain.handle('fs:readDirectoryRecursive', async (_event, dirPath: string) => {
 
 ipcMain.handle('execute-agent-task', async (_event, { task, planner, executor, workspacePath, activeFile, config }) => {
   try {
-    // 1. Initial Workspace Scan (only if not loaded)
-    if (workspacePath && !workspaceContextLoaded) {
+    abortRequested = false;
+    agentAbortController = new AbortController();
+
+    // 1. Initial Workspace Scan or Path Change
+    if (workspacePath && (workspacePath !== currentWorkspacePath || !workspaceContextLoaded)) {
+      const isNewWorkspace = workspacePath !== currentWorkspacePath;
+      currentWorkspacePath = workspacePath;
       workspaceContextLoaded = true;
+
       console.log('[INDEXING] Building project manifest:', workspacePath);
       win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'running', summary: 'Building project context...' });
 
       // Start watching workspace for file changes
       setupWorkspaceWatcher(workspacePath);
 
-      const files = await readDirectoryRecursive(workspacePath, 3000); // Increased limit but lightweight
-      if (files.length > 0) {
-        let manifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n`;
-        manifest += files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
-        manifest += '\n\n#### Critical Metadata:\n(Use read_file to access full contents)\n';
-        workspaceManifest = manifest;
-      }
+      await refreshManifest(workspacePath);
 
-      // Initialize services
-      if (!graphService) {
+      // Initialize or reset services
+      if (isNewWorkspace || !graphService) {
         graphService = new CodeGraphService();
         await graphService.initialize(workspacePath);
       }
-      if (config.voyageKey && !indexingService) {
+      if (config.voyageKey && (isNewWorkspace || !indexingService)) {
         indexingService = new IndexingService(config.voyageKey, (p) => graphService?.updateFile(p));
         await indexingService.initialize(workspacePath);
         await indexingService.indexWorkspace();
       }
 
-      win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'done', summary: `Indexed ${files.length} files` });
+      win?.webContents.send('agent:step', { tool: 'indexing_workspace', status: 'done', summary: `Indexed workspace context` });
+    } else if (workspacePath) {
+      // Background refresh only if needed (don't show UI step for this to avoid annoyance)
+      refreshManifest(workspacePath).catch(() => { });
     }
 
     // 2. Run the agent loop
@@ -1094,8 +1258,20 @@ ipcMain.handle('execute-agent-task', async (_event, { task, planner, executor, w
 
 ipcMain.handle('agent:stop', () => {
   abortRequested = true;
+  if (agentAbortController) {
+    agentAbortController.abort();
+    agentAbortController = null;
+  }
   if (pendingPermissionResolver) {
     pendingPermissionResolver({ approved: false });
+  }
+  if (currentActiveProcess) {
+    try {
+      currentActiveProcess.kill();
+    } catch (e) {
+      console.error('Failed to kill active process:', e);
+    }
+    currentActiveProcess = null;
   }
   return true;
 });

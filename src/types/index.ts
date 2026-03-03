@@ -6,6 +6,7 @@ export interface AgentStep {
     iteration?: number;
     command?: string;
     logs?: string[];
+    data?: any;
 }
 
 export interface Message {

@@ -5,7 +5,10 @@ interface ActivityBarProps {
     setIsSidebarOpen: (open: boolean) => void;
 }
 
-export const ActivityBar = ({ isChatOpen, setIsChatOpen, isSidebarOpen, setIsSidebarOpen }: ActivityBarProps) => {
+export const ActivityBar = ({
+    isChatOpen, setIsChatOpen,
+    isSidebarOpen, setIsSidebarOpen
+}: ActivityBarProps) => {
     return (
         <div className="activity-bar">
             <svg

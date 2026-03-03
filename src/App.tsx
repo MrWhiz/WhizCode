@@ -30,13 +30,14 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(250)
   const [isTerminalOpen, setIsTerminalOpen] = useState(false)
   const [terminalHeight, setTerminalHeight] = useState(250)
+  const [terminalKey, setTerminalKey] = useState(0)
 
   // Chat Panel
   const [isChatOpen, setIsChatOpen] = useState(true)
   const [chatWidth, setChatWidth] = useState(400)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
 
-  // AI Settings Persistence (Planner)
+
   const [plannerProvider, setPlannerProvider] = useState<AIProvider>(() => (localStorage.getItem('plannerProvider') as AIProvider) || 'ollama')
   const [plannerModel, setPlannerModel] = useState(() => localStorage.getItem('plannerModel') || 'llama3')
 
@@ -145,6 +146,10 @@ function App() {
     document.addEventListener('mouseup', onMouseUp);
   };
 
+
+
+
+
   // Fyle Operations
   const handleFileOpen = async (path: string, name: string) => {
     const existingFile = openFiles.find(f => f.path === path)
@@ -251,7 +256,7 @@ function App() {
       setAgentSteps(prev => {
         const existingIdx = prev.findIndex(s =>
           s.tool === step.tool &&
-          (step.iteration !== undefined ? s.iteration === step.iteration : s.status === 'running')
+          (step.iteration !== undefined ? s.iteration === step.iteration : s.status !== 'done' && s.status !== 'error')
         );
         if (existingIdx >= 0) {
           const newSteps = [...prev];
@@ -288,9 +293,18 @@ function App() {
     }
   }
 
-  const handlePermissionResponse = async (approved: boolean, _stepIdx?: number) => {
+  const handlePermissionResponse = async (approved: boolean, stepIdx?: number) => {
     const ipc = (window as any).ipcRenderer;
     if (ipc) {
+      if (stepIdx !== undefined && agentSteps[stepIdx]) {
+        const step = agentSteps[stepIdx];
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: approved
+            ? `✅ **Permission granted**: ${step.summary}`
+            : `❌ **Permission denied**: ${step.summary}`
+        }]);
+      }
       await ipc.invoke('agent:permission-response', { approved });
     }
   }
@@ -384,11 +398,32 @@ function App() {
           {isTerminalOpen && (
             <div style={{ height: `${terminalHeight}px`, display: 'flex', flexDirection: 'column', borderTop: '1px solid var(--vscode-bg-secondary)' }}>
               <div style={{ height: '4px', cursor: 'row-resize', backgroundColor: 'var(--vscode-hover)' }} onMouseDown={handleTerminalResize} />
-              <div className="tabs"><div className="tab active">Terminal</div></div>
-              <div style={{ flex: 1, background: '#1e1e1e', padding: 8 }}><TerminalPane /></div>
+              <div className="tabs" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingRight: '10px' }}>
+                <div className="tab active">Terminal</div>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    onClick={async () => {
+                      await (window as any).ipcRenderer?.invoke('terminal:reset');
+                      setTerminalKey(k => k + 1);
+                    }}
+                    style={{ background: 'var(--vscode-button-bg)', color: 'white', border: 'none', padding: '2px 8px', borderRadius: '2px', cursor: 'pointer', fontSize: '12px' }}
+                  >
+                    Clear Terminal
+                  </button>
+                  <button
+                    onClick={() => (window as any).ipcRenderer?.invoke('app:open-external', 'http://localhost:5173')}
+                    style={{ background: 'var(--vscode-button-bg)', color: 'white', border: 'none', padding: '2px 8px', borderRadius: '2px', cursor: 'pointer', fontSize: '12px' }}
+                  >
+                    Open App externally
+                  </button>
+                </div>
+              </div>
+              <div style={{ flex: 1, background: '#1e1e1e', padding: 8 }}><TerminalPane key={terminalKey} /></div>
             </div>
           )}
         </div>
+
+
 
         <ChatPanel
           chatWidth={chatWidth}
@@ -416,7 +451,7 @@ function App() {
           }}
         />
       </div>
-    </div>
+    </div >
   )
 }
 

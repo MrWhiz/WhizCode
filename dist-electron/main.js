@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog } from "electron";
+import { app, BrowserWindow, ipcMain, dialog, shell } from "electron";
 import * as sp from "node:path";
 import { resolve, join, relative, sep, dirname, extname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13018,6 +13018,9 @@ const diffService = new DiffService();
 let workspaceWatcher = null;
 let pendingPermissionResolver = null;
 let abortRequested = false;
+let agentAbortController = null;
+let currentActiveProcess = null;
+let currentWorkspacePath = null;
 const OLLAMA_URL = "http://127.0.0.1:11434/api/chat";
 const MODEL_NAME = "deepseek-coder-v2:latest";
 function createWindow() {
@@ -13029,7 +13032,8 @@ function createWindow() {
     webPreferences: {
       preload: join(__dirname$1, "preload.mjs"),
       nodeIntegration: false,
-      contextIsolation: true
+      contextIsolation: true,
+      webviewTag: true
     },
     titleBarStyle: "hidden",
     titleBarOverlay: {
@@ -13190,8 +13194,8 @@ You are the "WHIZCODE ARCHITECT". Your role is to analyze user requests and proj
 
 <OUTPUT_FORMAT>
 # IMPLEMENTATION PLAN
-1. [Phase 1: Environment & Discovery] - Check for required runtimes/dependencies and list relevant files.
-2. [Phase 2: Setup] - Install dependencies or create virtual environments if necessary.
+1. [Phase 1: Environment & Discovery] - Check for required runtimes/dependencies if not already verified in this conversation. Do NOT use or plan to use git commands like git log or git blame.
+2. [Phase 2: Setup] - Install dependencies or create virtual environments ONLY if they are missing or if new dependencies were added.
 3. [Phase 3: Implementation] - Perform the core task.
 4. [Phase 4: Verification] - Run tests or validate project.
 </OUTPUT_FORMAT>
@@ -13207,6 +13211,8 @@ You possess full system access. You are a doer, a builder, and an execution mach
 2. **FOLLOW THE PLAN**: Execute the plan perfectly. **NEVER skip environment checks** specified in the plan.
 3. **COMPLETION**: Once ALL steps in the plan are finished, DO NOT call any more tools. Instead, provide a final technical summary of your work and state that the task is complete.
 4. **ZERO QUESTIONS**: NEVER ask the user for permission or code. Use your tools.
+5. **TERMINAL AWARENESS**: Before running terminal commands, remember you are operating on a specific OS and Shell (e.g., Windows with PowerShell or macOS/Linux with bash). Tailor your commands strictly to the environment.
+6. **ANTI-LOOPING**: If a tool call fails or produces an error, DO NOT repeat the exact same tool call. Read the error, analyze the output, and change your approach entirely (e.g., fix syntax, change the command, verify paths via list_directory before blindly running).
 </PRIME_DIRECTIVE>
 
 <TOOL_HIERARCHY>
@@ -13232,12 +13238,13 @@ You possess full system access. You are a doer, a builder, and an execution mach
 - **Thinking**: <THOUGHT> [What phase are you on? Are dependencies met? Current action?] </THOUGHT>
 - **Action**: [Valid JSON Tool Call]
 - **NO CHATTER**: No "I'd be happy to", "Here is", or "Could you".
+- **JSON SAFETY**: Ensure ALL double quotes inside JSON string values (like "content" or "replace") are properly escaped as \\". Malformed JSON will cause the task to fail.
 </OUTPUT_FORMAT>
 `;
 let conversationHistory = [];
 let workspaceManifest = "";
 let workspaceContextLoaded = false;
-async function callAI(messages, modelConfig, config) {
+async function callAI(messages, modelConfig, config, signal) {
   try {
     let response;
     let data;
@@ -13253,7 +13260,8 @@ async function callAI(messages, modelConfig, config) {
           model: model || "gpt-4o",
           messages,
           temperature: 0.1
-        })
+        }),
+        signal
       });
       if (!response.ok) throw new Error(`OpenAI HTTP Error: ${response.status} ${await response.text()}`);
       data = await response.json();
@@ -13270,7 +13278,8 @@ async function callAI(messages, modelConfig, config) {
       response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model || "gemini-1.5-flash"}:generateContent?key=${config.geminiKey}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal
       });
       if (!response.ok) throw new Error(`Gemini HTTP Error: ${response.status} ${await response.text()}`);
       data = await response.json();
@@ -13286,13 +13295,15 @@ async function callAI(messages, modelConfig, config) {
           options: {
             temperature: 0
           }
-        })
+        }),
+        signal
       });
       if (!response.ok) throw new Error(`Ollama HTTP Error: ${response.status}`);
       data = await response.json();
       return data.message.content;
     }
   } catch (error) {
+    if (error.name === "AbortError") throw new Error("Task stopped by user");
     console.error("AI Provider Error:", error);
     throw error;
   }
@@ -13300,40 +13311,63 @@ async function callAI(messages, modelConfig, config) {
 function tryParseToolCall(response) {
   if (!response) return null;
   const trimmed = response.trim();
-  const firstBrace = trimmed.indexOf("{");
-  const lastBrace = trimmed.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    const jsonCandidate = trimmed.substring(firstBrace, lastBrace + 1);
-    try {
-      const parsed = JSON.parse(jsonCandidate);
-      if (parsed.tool) return parsed;
-    } catch {
-      const toolRegex = /({\s*"tool"\s*:\s*"[^"]+"[\s\S]*?})/g;
-      let match;
-      let bestMatch = null;
-      while ((match = toolRegex.exec(trimmed)) !== null) {
-        try {
-          const innerParsed = JSON.parse(match[1]);
-          if (innerParsed.tool) {
-            if (!bestMatch || match[1].length > bestMatch[1].length) {
-              bestMatch = match;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed.tool) return parsed;
+  } catch (e) {
+  }
+  const toolMatch = /"tool"\s*:\s*"([^"]+)"/.exec(trimmed);
+  if (toolMatch) {
+    const tool = toolMatch[1];
+    if (tool === "run_command") {
+      const commandMatch = /"command"\s*:\s*"([\s\S]*?)"\s*}/.exec(trimmed);
+      if (commandMatch) return { tool, command: commandMatch[1] };
+    }
+    if (tool === "write_file" || tool === "read_file" || tool === "edit_file") {
+      const pathMatch = /"path"\s*:\s*"([^"]+)"/.exec(trimmed);
+      if (pathMatch) {
+        const path = pathMatch[1].replace(/\\/g, "/");
+        if (tool === "read_file") return { tool, path };
+        if (tool === "write_file") {
+          const contentMatch = /"content"\s*:\s*"([\s\S]*?)"\s*}/.exec(trimmed);
+          if (contentMatch) return { tool, path, content: contentMatch[1] };
+        }
+        if (tool === "edit_file") {
+          const startIdx = trimmed.indexOf("{");
+          const lastIdx = trimmed.lastIndexOf("}");
+          if (startIdx !== -1 && lastIdx !== -1) {
+            let candidate = trimmed.substring(startIdx, lastIdx + 1);
+            try {
+              const fixedCandidate = candidate.replace(/"(search|replace|content|command)"\s*:\s*"([\s\S]*?)"(?=\s*[,}])|"(search|replace|content|command)"\s*:\s*"([\s\S]*?)"(?=\s*\])/g, (_, key, val, key2, val2) => {
+                const finalKey = key || key2;
+                const finalVal = (val || val2).replace(/"/g, '\\"');
+                return `"${finalKey}": "${finalVal}"`;
+              });
+              const parsed = JSON.parse(fixedCandidate);
+              if (parsed.tool) return parsed;
+            } catch (e2) {
             }
           }
-        } catch {
-        }
-      }
-      if (bestMatch) {
-        try {
-          const parsed = JSON.parse(bestMatch[1]);
-          if (parsed.tool) return parsed;
-        } catch {
         }
       }
     }
   }
+  let sanitized = trimmed;
+  sanitized = sanitized.replace(/"([^"]*)"/g, (_, p1) => {
+    return `"${p1.replace(/\\(?!["\\/bfnrtu])/g, "\\\\")}"`;
+  });
+  const toolRegex = /({\s*"tool"\s*:\s*"[^"]+"[\s\S]*?})/g;
+  let m;
+  while ((m = toolRegex.exec(sanitized)) !== null) {
+    try {
+      const parsedAgain = JSON.parse(m[1]);
+      if (parsedAgain.tool) return parsedAgain;
+    } catch {
+    }
+  }
   return null;
 }
-async function executeToolCall(toolData, workspacePath) {
+async function executeToolCall(toolData, workspacePath, iteration) {
   const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath) : "";
   console.log(`
 [TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ""}`);
@@ -13406,7 +13440,10 @@ Make sure you have the latest content via 'read_file'.` };
 #### Directory Structure (File List):
 ` + files.map((f) => `- ${f.path.replace(workspacePath, "").replace(/^[\\/]/, "")}`).join("\n");
         }
-        return { result: `✅ Applied ${editCount} edit(s) to ${toolData.path}` };
+        return {
+          result: `✅ Applied ${editCount} edit(s) to ${toolData.path}`,
+          data: { path: toolData.path, edits: toolData.edits }
+        };
       }
       case "list_directory": {
         return { result: await listDirectory(resolvedPath || workspacePath || ".") };
@@ -13422,7 +13459,8 @@ Make sure you have the latest content via 'read_file'.` };
           tool: "run_command",
           status: "awaiting_permission",
           summary: `Execute: ${command}`,
-          command
+          command,
+          iteration
         });
         const decision = await new Promise((resolve2) => {
           pendingPermissionResolver = resolve2;
@@ -13437,7 +13475,8 @@ Make sure you have the latest content via 'read_file'.` };
           tool: "run_command",
           status: "running",
           summary: `Executing: ${command}`,
-          logs
+          logs,
+          iteration
         });
         try {
           if (ptyProcess) {
@@ -13446,10 +13485,12 @@ Make sure you have the latest content via 'read_file'.` };
 `);
           }
           const fullOutput = await new Promise((resolve2, reject) => {
-            const shell = process.platform === "win32" ? "powershell.exe" : "bash";
+            const shell2 = process.platform === "win32" ? "powershell.exe" : "bash";
             const shellArgs = process.platform === "win32" ? ["-Command", command] : ["-c", command];
-            const child = spawn(shell, shellArgs, { cwd, shell: true });
+            const child = spawn(shell2, shellArgs, { cwd, shell: true });
+            currentActiveProcess = child;
             let output = "";
+            let isResolved = false;
             const handleData = (data) => {
               const str = data.toString();
               output += str;
@@ -13462,13 +13503,50 @@ Make sure you have the latest content via 'read_file'.` };
                   tool: "run_command",
                   status: "running",
                   summary: `Executing: ${command}`,
-                  logs: [...logs]
+                  logs: [...logs],
+                  iteration
                 });
+                const successMarkers = [
+                  "ready in",
+                  "started on",
+                  "local:",
+                  "network:",
+                  "listening on",
+                  "compiled successfully",
+                  "available at"
+                ];
+                const lowerStr = str.toLowerCase();
+                if (successMarkers.some((marker) => lowerStr.includes(marker))) {
+                  if (!isResolved) {
+                    setTimeout(() => {
+                      if (isResolved) return;
+                      isResolved = true;
+                      clearTimeout(timeout);
+                      currentActiveProcess = null;
+                      resolve2(`${output.trim()}
+
+[INFO]: Server/Process detected as READY and running in background.`);
+                    }, 500);
+                  }
+                }
               }
             };
             child.stdout?.on("data", handleData);
             child.stderr?.on("data", handleData);
+            const timeout = setTimeout(() => {
+              if (isResolved) return;
+              isResolved = true;
+              currentActiveProcess = null;
+              const resultMsg = output.trim() || "(No output yet, but process is still running)";
+              resolve2(`${resultMsg}
+
+[INFO]: Command is still running in background.`);
+            }, 15e3);
             child.on("close", (code) => {
+              if (isResolved) return;
+              clearTimeout(timeout);
+              isResolved = true;
+              currentActiveProcess = null;
               if (code === 0) {
                 resolve2(output.trim() || "(command completed with no output)");
               } else {
@@ -13477,9 +13555,14 @@ ${output}`.trim());
               }
             });
             child.on("error", (err) => {
+              if (isResolved) return;
+              clearTimeout(timeout);
+              isResolved = true;
+              currentActiveProcess = null;
               reject(err);
             });
           });
+          if (abortRequested) return { result: "⚠️ Task stopped by user.", abort: true };
           if (workspacePath) {
             const files = await readDirectoryRecursive(workspacePath, 3e3);
             workspaceManifest = `## PROJECT MANIFEST
@@ -13584,7 +13667,10 @@ ${output}`.trim());
 #### Directory Structure (File List):
 ` + files.map((f) => `- ${f.path.replace(workspacePath, "").replace(/^[\\/]/, "")}`).join("\n");
           }
-          return { result: `✅ Successfully applied diffs to ${result.appliedCount} files.` };
+          return {
+            result: `✅ Successfully applied diffs to ${result.appliedCount} files.`,
+            data: { changes: toolData.changes }
+          };
         } else {
           return { result: `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).` };
         }
@@ -13641,6 +13727,7 @@ const MAX_AGENT_ITERATIONS = 20;
 async function runAgentLoop(userMessage, planner, executor, config, workspacePath, activeContext = null) {
   const steps = [];
   abortRequested = false;
+  conversationHistory.push({ role: "user", content: userMessage });
   let projectStatus = `<PROJECT_STATUS>
 `;
   if (workspaceManifest) {
@@ -13650,8 +13737,11 @@ ${workspaceManifest}`;
     projectStatus += `Project not indexed yet. Root: ${workspacePath}
 `;
   }
+  projectStatus += `
+</PROJECT_STATUS>`;
+  let activeFileSnippet = "";
   if (activeContext) {
-    projectStatus += `
+    activeFileSnippet = `
 
 ### ACTIVE FILE (CURRENTLY OPEN IN EDITOR):
 Path: ${activeContext.path}
@@ -13659,8 +13749,6 @@ Content:
 ${activeContext.content}
 `;
   }
-  projectStatus += `
-</PROJECT_STATUS>`;
   win?.webContents.send("agent:step", { tool: "planning", status: "running", summary: "Generating implementation plan..." });
   const plannerMessages = [
     { role: "system", content: `${PLANNER_SYSTEM_PROMPT}
@@ -13669,7 +13757,7 @@ ${projectStatus}` },
     ...conversationHistory,
     { role: "user", content: userMessage }
   ];
-  const plan = await callAI(plannerMessages, planner, config);
+  const plan = await callAI(plannerMessages, planner, config, agentAbortController?.signal);
   console.log("[PLAN]\n", plan);
   const planStep = { tool: "planning", status: "awaiting_permission", summary: "Architectural Plan Ready", result: plan };
   win?.webContents.send("agent:step", planStep);
@@ -13692,18 +13780,22 @@ ${projectStatus}` },
   steps.push(planStep);
   const executorInstructions = `${EXECUTOR_SYSTEM_PROMPT}
 
-${projectStatus}
-
-<PLAN>
-${plan}
-</PLAN>
-
 [ACT NOW: Start from the first step of the plan. Output a tool call.]`;
   const currentMessages = [
     { role: "system", content: executorInstructions },
-    ...conversationHistory,
-    { role: "user", content: `Task: ${userMessage}` }
+    ...conversationHistory.slice(0, -1),
+    // Everything except the user message we just pushed
+    { role: "user", content: `Task: ${userMessage}
+
+${projectStatus}${activeFileSnippet}
+
+<PLAN>
+${plan}
+</PLAN>` }
   ];
+  let previousToolCallStr = "";
+  let toolHistory = [];
+  let repeatCount = 0;
   for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
     if (abortRequested) {
       console.log("[ABORT] Agent loop stopped by user.");
@@ -13712,7 +13804,7 @@ ${plan}
       return { finalResponse: abortMsg, steps };
     }
     console.log(`[ITERATION ${iteration + 1}/${MAX_AGENT_ITERATIONS}]`);
-    const aiResponse = await callAI(currentMessages, executor, config);
+    const aiResponse = await callAI(currentMessages, executor, config, agentAbortController?.signal);
     let toolCall = tryParseToolCall(aiResponse);
     if (!toolCall) {
       if (aiResponse.length > 5 && (aiResponse.includes("```") || aiResponse.includes("?"))) {
@@ -13721,9 +13813,31 @@ ${plan}
         currentMessages.push({ role: "user", content: "STRICT RULE: YOUR RESPONSE MUST BE A JSON TOOL CALL. DO NOT TALK. ACTION ONLY." });
         continue;
       }
-      conversationHistory.push({ role: "user", content: userMessage });
       conversationHistory.push({ role: "assistant", content: aiResponse });
       return { finalResponse: aiResponse, steps };
+    }
+    const currentToolCallStr = JSON.stringify({ tool: toolCall.tool, path: toolCall.path, command: toolCall.command });
+    if (currentToolCallStr === previousToolCallStr) {
+      repeatCount++;
+      if (repeatCount >= 1) {
+        const warningMsg = `[SYSTEM WARNING] You are repeating the exact same tool call. STOP. If the previous attempt failed or didn't produce the result you expected, you MUST change your strategy. DO NOT repeat the same operation unless you have fixed the underlying issue.`;
+        currentMessages.push({ role: "assistant", content: aiResponse });
+        currentMessages.push({ role: "user", content: warningMsg });
+        continue;
+      }
+    } else {
+      repeatCount = 0;
+      previousToolCallStr = currentToolCallStr;
+    }
+    toolHistory.push(currentToolCallStr);
+    if (toolHistory.length > 4) toolHistory.shift();
+    const isPingPong = toolHistory.length === 4 && toolHistory[0] === toolHistory[2] && toolHistory[1] === toolHistory[3];
+    if (isPingPong) {
+      const loopWarning = `[LOOP DETECTED] You are alternating between the same two operations. This usually means your "fix" isn't working or is being reverted by another tool. READ THE PREVIOUS OUTPUT CAREFULLY. You must change your approach completely. Maybe use 'read_file' to see what's actually on disk.`;
+      currentMessages.push({ role: "assistant", content: aiResponse });
+      currentMessages.push({ role: "user", content: loopWarning });
+      toolHistory = [];
+      continue;
     }
     const toolName = toolCall.tool;
     const toolSummary = getToolSummary(toolCall);
@@ -13731,11 +13845,12 @@ ${plan}
     win?.webContents.send("agent:step", stepData);
     steps.push(stepData);
     currentMessages.push({ role: "assistant", content: aiResponse });
-    const { result: toolResult, logs, abort } = await executeToolCall(toolCall, workspacePath);
+    const { result: toolResult, logs, abort, data: resultData } = await executeToolCall(toolCall, workspacePath, iteration + 1);
     const truncatedResult = toolResult.length > 15e3 ? toolResult.substring(0, 15e3) + "\n... (truncated)" : toolResult;
     steps[steps.length - 1].status = "done";
     steps[steps.length - 1].result = truncatedResult.substring(0, 500);
     if (logs) steps[steps.length - 1].logs = logs;
+    if (resultData) steps[steps.length - 1].data = resultData;
     win?.webContents.send("agent:step", { ...steps[steps.length - 1], status: "done" });
     if (abort) {
       console.log(`[ABORT] Stopping loop due to tool abort signal (e.g. denial)`);
@@ -13752,9 +13867,22 @@ ${truncatedResult}
     });
   }
   const finalAI = currentMessages[currentMessages.length - 1].content;
-  conversationHistory.push({ role: "user", content: userMessage });
   conversationHistory.push({ role: "assistant", content: finalAI });
   return { finalResponse: finalAI, steps };
+}
+async function refreshManifest(workspacePath) {
+  const files = await readDirectoryRecursive(workspacePath, 3e3);
+  if (files.length > 0) {
+    let manifest = `## PROJECT MANIFEST
+
+### Root: ${workspacePath}
+
+#### Directory Structure (File List):
+`;
+    manifest += files.map((f) => `- ${f.path.replace(workspacePath, "").replace(/^[\\/]/, "")}`).join("\n");
+    manifest += "\n\n#### Critical Metadata:\n(Use read_file to access full contents)\n";
+    workspaceManifest = manifest;
+  }
 }
 function getToolSummary(toolCall) {
   const path = toolCall.path || "(missing path)";
@@ -13806,6 +13934,9 @@ function setupWorkspaceWatcher(watchPath) {
   });
   const notifyRenderer = (type2, filePath) => {
     win?.webContents.send("fs:directoryChanged", { type: type2, filePath });
+    if (currentWorkspacePath) {
+      refreshManifest(currentWorkspacePath).catch(console.error);
+    }
   };
   workspaceWatcher.on("add", (path) => notifyRenderer("add", path));
   workspaceWatcher.on("addDir", (path) => notifyRenderer("addDir", path));
@@ -13874,10 +14005,11 @@ ipcMain.handle("fs:readDirectory", async (_event, dirPath) => {
   }
 });
 ipcMain.on("app:exit", () => app.quit());
+ipcMain.handle("app:open-external", (_event, url) => shell.openExternal(url));
 ipcMain.on("terminal:spawn", () => {
   if (ptyProcess) return;
-  const shell = os.platform() === "win32" ? "powershell.exe" : "bash";
-  ptyProcess = pty.spawn(shell, [], {
+  const shell2 = os.platform() === "win32" ? "powershell.exe" : "bash";
+  ptyProcess = pty.spawn(shell2, [], {
     name: "xterm-color",
     cols: 80,
     rows: 30,
@@ -13902,6 +14034,16 @@ ipcMain.on("terminal:resize", (_event, cols, rows) => {
     }
   }
 });
+ipcMain.handle("terminal:reset", () => {
+  if (ptyProcess) {
+    try {
+      ptyProcess.kill();
+    } catch (e) {
+    }
+    ptyProcess = null;
+  }
+  return true;
+});
 ipcMain.handle("ollama:getModels", async () => {
   try {
     const res = await fetch("http://127.0.0.1:11434/api/tags");
@@ -13922,33 +14064,29 @@ ipcMain.handle("fs:readDirectoryRecursive", async (_event, dirPath) => {
 });
 ipcMain.handle("execute-agent-task", async (_event, { task, planner, executor, workspacePath, activeFile, config }) => {
   try {
-    if (workspacePath && !workspaceContextLoaded) {
+    abortRequested = false;
+    agentAbortController = new AbortController();
+    if (workspacePath && (workspacePath !== currentWorkspacePath || !workspaceContextLoaded)) {
+      const isNewWorkspace = workspacePath !== currentWorkspacePath;
+      currentWorkspacePath = workspacePath;
       workspaceContextLoaded = true;
       console.log("[INDEXING] Building project manifest:", workspacePath);
       win?.webContents.send("agent:step", { tool: "indexing_workspace", status: "running", summary: "Building project context..." });
       setupWorkspaceWatcher(workspacePath);
-      const files = await readDirectoryRecursive(workspacePath, 3e3);
-      if (files.length > 0) {
-        let manifest = `## PROJECT MANIFEST
-
-### Root: ${workspacePath}
-
-#### Directory Structure (File List):
-`;
-        manifest += files.map((f) => `- ${f.path.replace(workspacePath, "").replace(/^[\\/]/, "")}`).join("\n");
-        manifest += "\n\n#### Critical Metadata:\n(Use read_file to access full contents)\n";
-        workspaceManifest = manifest;
-      }
-      if (!graphService) {
+      await refreshManifest(workspacePath);
+      if (isNewWorkspace || !graphService) {
         graphService = new CodeGraphService();
         await graphService.initialize(workspacePath);
       }
-      if (config.voyageKey && !indexingService) {
+      if (config.voyageKey && (isNewWorkspace || !indexingService)) {
         indexingService = new IndexingService(config.voyageKey, (p) => graphService?.updateFile(p));
         await indexingService.initialize(workspacePath);
         await indexingService.indexWorkspace();
       }
-      win?.webContents.send("agent:step", { tool: "indexing_workspace", status: "done", summary: `Indexed ${files.length} files` });
+      win?.webContents.send("agent:step", { tool: "indexing_workspace", status: "done", summary: `Indexed workspace context` });
+    } else if (workspacePath) {
+      refreshManifest(workspacePath).catch(() => {
+      });
     }
     const result = await runAgentLoop(task, planner, executor, config, workspacePath, activeFile);
     return {
@@ -13965,8 +14103,20 @@ ipcMain.handle("execute-agent-task", async (_event, { task, planner, executor, w
 });
 ipcMain.handle("agent:stop", () => {
   abortRequested = true;
+  if (agentAbortController) {
+    agentAbortController.abort();
+    agentAbortController = null;
+  }
   if (pendingPermissionResolver) {
     pendingPermissionResolver({ approved: false });
+  }
+  if (currentActiveProcess) {
+    try {
+      currentActiveProcess.kill();
+    } catch (e) {
+      console.error("Failed to kill active process:", e);
+    }
+    currentActiveProcess = null;
   }
   return true;
 });

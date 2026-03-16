@@ -44,6 +44,53 @@ const LogContainer = ({ logs }: { logs: string[] }) => {
     );
 };
 
+const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, getToolIcon: (t: string) => string, isLive?: boolean }) => {
+    const [logsOpen, setLogsOpen] = React.useState(false);
+    const hasLogs = step.logs && step.logs.length > 0;
+    const canOpenLogs = step.tool === 'run_command' || hasLogs;
+
+    // Auto-open logs if the step is a running command
+    React.useEffect(() => {
+        if (isLive && step.status === 'running' && step.tool === 'run_command') {
+            setLogsOpen(true);
+        }
+    }, [isLive, step.status, step.tool]);
+
+    const handleClick = () => {
+        if (canOpenLogs) {
+            setLogsOpen(o => !o);
+        }
+    };
+
+    return (
+        <div className={`agent-step ${step.status}`}>
+            <div
+                className="agent-step-header"
+                onClick={handleClick}
+                style={{ 
+                    cursor: canOpenLogs ? 'pointer' : 'default',
+                    userSelect: 'none'
+                }}
+            >
+                {isLive && step.status === 'running' ? (
+                    <div className="spinner" style={{ width: 10, height: 10 }}></div>
+                ) : (
+                    <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
+                )}
+                <span className="agent-step-summary">{step.summary}</span>
+                {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                {canOpenLogs && (
+                    <span style={{ marginLeft: 'auto', fontSize: '10px', opacity: 0.7, paddingLeft: 6 }}>
+                        {logsOpen ? '▲' : '▼'}
+                    </span>
+                )}
+            </div>
+            {step.data && <EditDetails data={step.data} />}
+            {canOpenLogs && logsOpen && <LogContainer logs={step.logs && step.logs.length > 0 ? step.logs : ['(No logs yet)']} />}
+        </div>
+    );
+};
+
 const EditDetails = ({ data }: { data: any }) => {
     const [isOpen, setIsOpen] = React.useState(false);
 
@@ -322,19 +369,7 @@ export const ChatPanel = ({
                             {msg.steps && msg.steps.length > 0 && (
                                 <div className="agent-steps">
                                     {msg.steps.map((step, si) => (
-                                        <div key={si} className={`agent-step ${step.status}`}>
-                                            <div className="agent-step-header">
-                                                <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
-                                                <span className="agent-step-summary">{step.summary}</span>
-                                                {step.status === 'done' && <span className="agent-step-check">✓</span>}
-                                            </div>
-                                            {step.data && (
-                                                <EditDetails data={step.data} />
-                                            )}
-                                            {step.logs && step.logs.length > 0 && (
-                                                <LogContainer logs={step.logs} />
-                                            )}
-                                        </div>
+                                        <StepBlock key={si} step={step} getToolIcon={getToolIcon} />
                                     ))}
                                 </div>
                             )}
@@ -351,57 +386,7 @@ export const ChatPanel = ({
                                 {agentSteps.length > 0 ? (
                                     <div className="agent-steps live">
                                         {agentSteps.map((step, si) => (
-                                            <div key={si} className={`agent-step ${step.status}`}>
-                                                <div className="agent-step-header">
-                                                    {step.status === 'running' ? (
-                                                        <div className="spinner" style={{ width: 10, height: 10 }}></div>
-                                                    ) : (
-                                                        <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
-                                                    )}
-                                                    <span className="agent-step-summary">{step.summary}</span>
-                                                    {step.status === 'done' && <span className="agent-step-check">✓</span>}
-                                                </div>
-                                                {step.data && (
-                                                    <EditDetails data={step.data} />
-                                                )}
-                                                {step.tool === 'planning' && step.result && (
-                                                    <div className="agent-plan-preview">
-                                                        <ReactMarkdown
-                                                            remarkPlugins={[remarkGfm]}
-                                                            components={{
-                                                                code({ node, inline, className, children, ...props }: any) {
-                                                                    const match = /language-(\w+)/.exec(className || '');
-                                                                    const codeString = String(children).replace(/\n$/, '');
-                                                                    return !inline && match ? (
-                                                                        <SyntaxHighlighter
-                                                                            style={vscDarkPlus as any}
-                                                                            language={match[1]}
-                                                                            PreTag="div"
-                                                                            customStyle={{
-                                                                                margin: '4px 0',
-                                                                                borderRadius: '4px',
-                                                                                fontSize: '11px',
-                                                                                padding: '6px'
-                                                                            }}
-                                                                        >
-                                                                            {codeString}
-                                                                        </SyntaxHighlighter>
-                                                                    ) : (
-                                                                        <code className="inline-code" {...props}>
-                                                                            {children}
-                                                                        </code>
-                                                                    );
-                                                                }
-                                                            }}
-                                                        >
-                                                            {step.result}
-                                                        </ReactMarkdown>
-                                                    </div>
-                                                )}
-                                                {step.logs && step.logs.length > 0 && (
-                                                    <LogContainer logs={step.logs} />
-                                                )}
-                                            </div>
+                                            <StepBlock key={si} step={step} getToolIcon={getToolIcon} isLive={true} />
                                         ))}
                                     </div>
                                 ) : (
@@ -418,6 +403,30 @@ export const ChatPanel = ({
                 </div>
 
                 <div className="chat-input-area">
+                    {isLoading && (
+                        <div className="agent-status-indicator" style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            padding: '8px 12px',
+                            background: 'rgba(0, 122, 204, 0.1)',
+                            border: '1px solid rgba(0, 122, 204, 0.3)',
+                            borderRadius: '4px',
+                            marginBottom: '10px',
+                            fontSize: '11px',
+                            color: 'var(--accent-primary)',
+                            fontWeight: 500
+                        }}>
+                            <div className="spinner" style={{ width: 10, height: 10 }}></div>
+                            <span>
+                                {agentSteps.length > 0 && agentSteps[agentSteps.length - 1].status === 'running'
+                                    ? agentSteps[agentSteps.length - 1].summary
+                                    : agentSteps.length > 0 && agentSteps[agentSteps.length - 1].status === 'awaiting_permission'
+                                    ? 'Waiting for permission...'
+                                    : 'Thinking...'}
+                            </span>
+                        </div>
+                    )}
                     {pendingPermissionStepIdx >= 0 && (
                         <div className="permission-controls-enhanced" style={{
                             display: 'flex', flexDirection: 'column', gap: '10px',

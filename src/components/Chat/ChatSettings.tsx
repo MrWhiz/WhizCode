@@ -3,14 +3,14 @@ import type { AIProvider } from '../../types'
 interface ChatSettingsProps {
     isSettingsOpen: boolean;
     setIsSettingsOpen: (open: boolean) => void;
-    plannerProvider: AIProvider;
-    setPlannerProvider: (provider: AIProvider) => void;
-    plannerModel: string;
-    setPlannerModel: (model: string) => void;
-    executorProvider: AIProvider;
-    setExecutorProvider: (provider: AIProvider) => void;
-    executorModel: string;
-    setExecutorModel: (model: string) => void;
+    primaryModelProvider: AIProvider;
+    setPrimaryModelProvider: (provider: AIProvider) => void;
+    primaryModel: string;
+    setPrimaryModel: (model: string) => void;
+    toolModelProvider: AIProvider;
+    setToolModelProvider: (provider: AIProvider) => void;
+    toolModel: string;
+    setToolModel: (model: string) => void;
     ollamaModels: string[];
     ollamaChecking: boolean;
     ollamaError: string | null;
@@ -19,19 +19,21 @@ interface ChatSettingsProps {
     setOpenaiKey: (key: string) => void;
     geminiKey: string;
     setGeminiKey: (key: string) => void;
+    isAutopilotMode: boolean;
+    setIsAutopilotMode: (mode: boolean) => void;
 }
 
 export const ChatSettings = ({
     isSettingsOpen,
     setIsSettingsOpen,
-    plannerProvider,
-    setPlannerProvider,
-    plannerModel,
-    setPlannerModel,
-    executorProvider,
-    setExecutorProvider,
-    executorModel,
-    setExecutorModel,
+    primaryModelProvider,
+    setPrimaryModelProvider,
+    primaryModel,
+    setPrimaryModel,
+    toolModelProvider,
+    setToolModelProvider,
+    toolModel,
+    setToolModel,
     ollamaModels,
     ollamaChecking,
     ollamaError,
@@ -39,7 +41,9 @@ export const ChatSettings = ({
     openaiKey,
     setOpenaiKey,
     geminiKey,
-    setGeminiKey
+    setGeminiKey,
+    isAutopilotMode,
+    setIsAutopilotMode
 }: ChatSettingsProps) => {
 
     const providers = [
@@ -49,14 +53,16 @@ export const ChatSettings = ({
     ];
 
     const renderModelSelector = (
-        type: 'Planner' | 'Executor',
+        type: 'Primary' | 'Tool',
         provider: AIProvider,
         setProvider: (p: AIProvider) => void,
         model: string,
-        setModel: (m: string) => void
+        setModel: (m: string) => void,
+        description: string
     ) => (
         <div className="settings-model-group">
             <div className="settings-group-title">{type} Model</div>
+            <div className="settings-group-description">{description}</div>
             <div className="provider-selector-compact">
                 {providers.map(p => (
                     <button
@@ -105,11 +111,45 @@ export const ChatSettings = ({
 
             {isSettingsOpen && (
                 <div className="chat-settings-body">
-                    {renderModelSelector('Planner', plannerProvider, setPlannerProvider, plannerModel, setPlannerModel)}
+                    {renderModelSelector(
+                        'Primary', 
+                        primaryModelProvider, 
+                        setPrimaryModelProvider, 
+                        primaryModel, 
+                        setPrimaryModel,
+                        'For reasoning, planning, and decision-making'
+                    )}
 
                     <div className="settings-separator" />
 
-                    {renderModelSelector('Executor', executorProvider, setExecutorProvider, executorModel, setExecutorModel)}
+                    {renderModelSelector(
+                        'Tool', 
+                        toolModelProvider, 
+                        setToolModelProvider, 
+                        toolModel, 
+                        setToolModel,
+                        'For code generation and tool execution'
+                    )}
+
+                    <div className="settings-separator" />
+
+                    <div className="settings-section-title">Agent Mode</div>
+                    <div className="settings-field">
+                        <label className="settings-field-label" style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                            <input
+                                type="checkbox"
+                                checked={isAutopilotMode}
+                                onChange={(e) => setIsAutopilotMode(e.target.checked)}
+                                style={{ accentColor: 'var(--accent-primary)' }}
+                            />
+                            <span>Autopilot Mode</span>
+                        </label>
+                        <div className="settings-group-description" style={{ marginTop: 4, marginLeft: 24 }}>
+                            {isAutopilotMode 
+                                ? '🚀 Agent can modify files autonomously without approval'
+                                : '🛡️ Agent will ask for approval before modifying files'}
+                        </div>
+                    </div>
 
                     <div className="settings-separator" />
 

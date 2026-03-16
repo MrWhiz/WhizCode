@@ -1,7 +1,7 @@
 # Autopilot vs Supervised Mode
 
 ## Overview
-WhizCode now supports two operation modes that control how the agent interacts with your files, similar to Kiro's autonomy levels.
+WhizCode now supports two operation modes that control how the agent interacts with your files, similar to WhizCode's autonomy levels.
 
 ## Modes
 
@@ -191,9 +191,9 @@ webContents.send('agent:step', {
 - If false, requests permission via IPC
 - If true, executes immediately
 
-## Comparison with Kiro
+## Comparison with WhizCode
 
-| Feature | WhizCode | Kiro |
+| Feature | WhizCode | WhizCode |
 |---------|----------|------|
 | Autopilot Mode | ✅ | ✅ |
 | Supervised Mode | ✅ | ✅ |

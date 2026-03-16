@@ -1,8 +1,8 @@
 
 
 interface ActivityBarProps {
-    activeView: 'explorer' | 'search' | 'source-control' | 'tasks' | null
-    setActiveView: (view: 'explorer' | 'search' | 'source-control' | 'tasks' | null) => void
+    activeView: 'explorer' | 'search' | 'source-control' | null
+    setActiveView: (view: 'explorer' | 'search' | 'source-control' | null) => void
     isChatOpen: boolean
     setIsChatOpen: (open: boolean) => void
 }
@@ -37,15 +37,6 @@ export const ActivityBar = ({ activeView, setActiveView, isChatOpen, setIsChatOp
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <path d="M12 2v8M6.29 12.29l1.42 1.42M17.71 12.29l-1.42 1.42M2 12h8M14 12h8M6.29 11.71l1.42-1.42M17.71 11.71l-1.42-1.42" strokeLinecap="round" strokeLinejoin="round"/>
                     <path d="M18 18c0 1.1-.9 2-2 2H8c-1.1 0-2-.9-2-2v-3l6-6 6 6v3z"/>
-                </svg>
-            </div>
-            <div
-                className={`activity-item ${activeView === 'tasks' ? 'active' : ''}`}
-                onClick={() => setActiveView(activeView === 'tasks' ? null : 'tasks')}
-                title="To-Do List"
-            >
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <path d="m9 11 3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
             </div>
             <div

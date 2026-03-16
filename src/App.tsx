@@ -9,7 +9,6 @@ import { SourceControlPanel } from './components/Explorer/SourceControlPanel'
 import { EditorArea } from './components/Editor/EditorArea'
 import { ChatPanel } from './components/Chat/ChatPanel'
 import { TerminalPane } from './components/Terminal/TerminalPane'
-import { TodoListPanel } from './components/Explorer/TodoListPanel.tsx'
 
 // Types
 import type { Message, AgentStep, OpenFileProps, AIProvider } from './types'
@@ -29,7 +28,7 @@ function App() {
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [activeFileId, setActiveFileId] = useState<string | null>(null)
   const [openFiles, setOpenFiles] = useState<OpenFileProps[]>([])
-  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | 'tasks' | null>('explorer')
+  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | null>('explorer')
   const [sidebarWidth, setSidebarWidth] = useState(260)
   const [isTerminalOpen, setIsTerminalOpen] = useState(false)
   const [terminalHeight, setTerminalHeight] = useState(250)
@@ -217,6 +216,64 @@ function App() {
     })
   }
 
+  // Handle file system changes from explorer
+  const handleFileDeleted = (deletedPath: string) => {
+    setOpenFiles(prev => {
+      const newFiles = prev.filter(f => !f.path.startsWith(deletedPath))
+      if (activeFileId && (activeFileId === deletedPath || activeFileId.startsWith(deletedPath + '/'))) {
+        setActiveFileId(newFiles.length > 0 ? newFiles[newFiles.length - 1].path : null)
+      }
+      return newFiles
+    })
+  }
+
+  const handleFileRenamed = (oldPath: string, newPath: string) => {
+    setOpenFiles(prev => prev.map(f => {
+      if (f.path === oldPath) {
+        const newName = newPath.split(/[/\\]/).pop() || f.name
+        return { ...f, path: newPath, name: newName }
+      } else if (f.path.startsWith(oldPath + '/')) {
+        // Handle files inside renamed folders
+        const relativePath = f.path.substring(oldPath.length)
+        return { ...f, path: newPath + relativePath }
+      }
+      return f
+    }))
+    
+    // Update active file ID if it was renamed
+    if (activeFileId === oldPath) {
+      setActiveFileId(newPath)
+    } else if (activeFileId && activeFileId.startsWith(oldPath + '/')) {
+      const relativePath = activeFileId.substring(oldPath.length)
+      setActiveFileId(newPath + relativePath)
+    }
+  }
+
+  // Check for deleted files periodically
+  useEffect(() => {
+    if (openFiles.length === 0) return
+
+    const checkFiles = async () => {
+      const ipc = (window as any).ipcRenderer
+      if (!ipc) return
+
+      const filesToCheck = [...openFiles]
+      for (const file of filesToCheck) {
+        try {
+          const exists = await ipc.invoke('fs:checkFileExists', file.path)
+          if (!exists) {
+            handleFileDeleted(file.path)
+          }
+        } catch (error) {
+          console.error('Error checking file existence:', error)
+        }
+      }
+    }
+
+    const interval = setInterval(checkFiles, 5000) // Check every 5 seconds
+    return () => clearInterval(interval)
+  }, [openFiles])
+
   const handleContentChange = (newContent: string | undefined) => {
     if (newContent !== undefined) {
       setOpenFiles(prev => prev.map(f => f.path === activeFileId ? { ...f, content: newContent } : f))
@@ -248,7 +305,24 @@ function App() {
     const ipc = (window as any).ipcRenderer
     const stepHandler = (_event: any, step: AgentStep) => {
       setAgentSteps(prev => {
-        const existingIdx = prev.findIndex(s => s.tool === step.tool && (step.iteration !== undefined ? s.iteration === step.iteration : s.status !== 'done' && s.status !== 'error'))
+        // Use requestId for precise matching if available
+        if ((step as any).requestId) {
+          const existingIdx = prev.findIndex(s => (s as any).requestId === (step as any).requestId)
+          if (existingIdx >= 0) {
+            const newSteps = [...prev]
+            newSteps[existingIdx] = step
+            return newSteps
+          }
+          return [...prev, step]
+        }
+        
+        // Fallback to original logic for steps without requestId
+        const existingIdx = prev.findIndex(s => 
+          s.tool === step.tool && 
+          s.iteration === step.iteration &&
+          (s.status === 'running' || s.status === 'awaiting_permission')
+        )
+        
         if (existingIdx >= 0) {
           const newSteps = [...prev]
           newSteps[existingIdx] = step
@@ -318,14 +392,18 @@ function App() {
   const handlePermissionResponse = async (approved: boolean, stepIdx?: number) => {
     const ipc = (window as any).ipcRenderer
     if (ipc) {
+      let requestId: string | undefined;
+      
       if (stepIdx !== undefined && agentSteps[stepIdx]) {
         const step = agentSteps[stepIdx]
+        requestId = (step as any).requestId; // Get the requestId from the step
         setMessages(prev => [...prev, {
           role: 'assistant',
           content: approved ? `✅ **Permission granted**: ${step.summary}` : `❌ **Permission denied**: ${step.summary}`
         }])
       }
-      await ipc.invoke('agent:permission-response', { approved })
+      
+      await ipc.invoke('agent:permission-response', { approved, requestId })
     }
   }
 
@@ -353,6 +431,7 @@ function App() {
       case 'validate_project': return '🛡️'
       case 'run_tests': return '🧪'
       case 'indexing_workspace': return '📦'
+      case 'continue_iterations': return '🔄'
       default: return '🛠️'
     }
   }
@@ -432,7 +511,16 @@ function App() {
                     <strong>{workspacePath ? workspacePath.split(/[/\\]/).pop()?.toUpperCase() : 'WHIZCODE'}</strong>
                   </div>
                   <div className="chat-history">
-                    {workspacePath ? <FileTree path={workspacePath} onFileOpen={handleFileOpen} /> : <div className="empty-state">No folder opened.</div>}
+                    {workspacePath ? (
+                      <FileTree 
+                        path={workspacePath} 
+                        onFileOpen={handleFileOpen}
+                        onFileDeleted={handleFileDeleted}
+                        onFileRenamed={handleFileRenamed}
+                      />
+                    ) : (
+                      <div className="empty-state">No folder opened.</div>
+                    )}
                   </div>
                 </>
               )}
@@ -443,10 +531,6 @@ function App() {
 
               {activeView === 'source-control' && (
                 <SourceControlPanel workspacePath={workspacePath} />
-              )}
-
-              {activeView === 'tasks' && (
-                <TodoListPanel />
               )}
             </aside>
             <div className="sidebar-resize-handle" onMouseDown={handleSidebarResize} />

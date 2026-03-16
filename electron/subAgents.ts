@@ -1,5 +1,5 @@
 // Sub-Agent System for WhizCode
-// Implements Kiro-like specialized agents for different tasks
+// Implements WhizCode-like specialized agents for different tasks
 
 export interface SubAgentConfig {
   name: string;

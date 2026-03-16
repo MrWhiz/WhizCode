@@ -79,7 +79,7 @@ ollama pull <model-name>
 
 ## 📚 More Help
 
-- Full guide: [KIRO-SETUP-GUIDE.md](KIRO-SETUP-GUIDE.md)
+- Full guide: [WHIZCODE-SETUP-GUIDE.md](WHIZCODE-SETUP-GUIDE.md)
 - Changes: [.agents/CHANGES.md](.agents/CHANGES.md)
 - Details: [.agents/implementation-summary.md](.agents/implementation-summary.md)
 

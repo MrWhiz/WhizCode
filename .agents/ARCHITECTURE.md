@@ -1,4 +1,4 @@
-# WhizCode Architecture - Kiro-Style Agent
+# WhizCode Architecture - WhizCode-Style Agent
 
 ## System Overview
 
@@ -18,7 +18,7 @@
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │           Electron Main Process                       │  │
 │  │  ┌─────────────────────────────────────────────────┐ │  │
-│  │  │         Kiro-Style Agent Loop                   │ │  │
+│  │  │         WhizCode-Style Agent Loop                   │ │  │
 │  │  │  ┌──────────────┐      ┌──────────────┐        │ │  │
 │  │  │  │ Primary Model│      │  Tool Model  │        │ │  │
 │  │  │  │  (Reasoning) │      │   (Coding)   │        │ │  │

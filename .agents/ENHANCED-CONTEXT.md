@@ -1,7 +1,7 @@
 # Enhanced Context System
 
 ## Overview
-The agent now has access to rich contextual information automatically included in every request, similar to Kiro's context system.
+The agent now has access to rich contextual information automatically included in every request, similar to WhizCode's context system.
 
 ## Available Context
 

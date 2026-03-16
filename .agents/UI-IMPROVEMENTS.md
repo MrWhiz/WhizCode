@@ -1,7 +1,7 @@
-# UI Improvements - VS Code/Kiro Style
+# UI Improvements - VS Code/WhizCode Style
 
 ## Overview
-Simplified the frontend to match VS Code/Kiro's clean, minimal design while keeping essential features.
+Simplified the frontend to match VS Code/WhizCode's clean, minimal design while keeping essential features.
 
 ## What Was Removed (Overloaded Features)
 

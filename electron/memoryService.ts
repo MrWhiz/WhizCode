@@ -11,7 +11,7 @@ export class MemoryManager {
   private memoryDir: string;
 
   constructor(workspaceRoot: string) {
-    this.memoryDir = join(workspaceRoot, '.kiro', 'memory');
+    this.memoryDir = join(workspaceRoot, '.whizcode', 'memory');
   }
 
   async initialize() {

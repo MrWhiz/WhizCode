@@ -1,7 +1,7 @@
 # Hooks System
 
 ## Overview
-The Hooks System provides event-driven automation for WhizCode, similar to Kiro's hooks. Hooks allow you to automatically trigger actions when specific events occur.
+The Hooks System provides event-driven automation for WhizCode, similar to WhizCode's hooks. Hooks allow you to automatically trigger actions when specific events occur.
 
 ## Hook Types
 
@@ -167,7 +167,7 @@ You can also use regex patterns to match tool names:
 
 Hooks are stored in:
 ```
-.kiro/hooks/
+.whizcode/hooks/
   ├── lint-on-save.json
   ├── review-writes.json
   └── test-after-task.json
@@ -202,7 +202,7 @@ await ipcRenderer.invoke('hooks:reload');
 
 ### Via File System
 
-1. Create a JSON file in `.kiro/hooks/`
+1. Create a JSON file in `.whizcode/hooks/`
 2. Name it `{hook-id}.json`
 3. Add hook configuration
 4. Reload hooks or restart app
@@ -316,9 +316,9 @@ If the hook output indicates denial, the tool call is blocked.
 - Custom hook actions
 - Hook versioning
 
-## Comparison with Kiro
+## Comparison with WhizCode
 
-| Feature | WhizCode | Kiro |
+| Feature | WhizCode | WhizCode |
 |---------|----------|------|
 | File Events | ✅ | ✅ |
 | Tool Events | ✅ | ✅ |

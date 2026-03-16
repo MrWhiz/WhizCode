@@ -12,7 +12,7 @@ export class HistoryManager {
   private historyDir: string;
 
   constructor(workspaceRoot: string) {
-    this.historyDir = join(workspaceRoot, '.kiro', 'history');
+    this.historyDir = join(workspaceRoot, '.whizcode', 'history');
   }
 
   async initialize() {

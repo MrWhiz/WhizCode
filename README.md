@@ -1,24 +1,24 @@
-# WhizCode - Kiro-Style Autonomous AI Coding IDE
+# WhizCode - WhizCode-Style Autonomous AI Coding IDE
 
-WhizCode is an autonomous AI coding assistant with a VS Code-inspired interface, powered by local LLMs through Ollama. Now featuring Kiro-style autonomous agent behavior with flexible multi-model support.
+WhizCode is an autonomous AI coding assistant with a VS Code-inspired interface, powered by local LLMs through Ollama. Now featuring WhizCode-style autonomous agent behavior with flexible multi-model support.
 
 Built with React, TypeScript, Vite, and Electron.
 
-## ✨ What's New - Kiro Alignment
+## ✨ What's New - WhizCode Alignment
 
-WhizCode now uses a **unified autonomous agent** inspired by Kiro, with:
+WhizCode now uses a **unified autonomous agent** inspired by WhizCode, with:
 - 🤖 **Autonomous behavior** - No forced approval steps, natural conversation flow
 - 🧠 **Multi-model optimization** - Use different models for reasoning vs coding
 - 💭 **Visible thinking** - See the agent's reasoning process
 - 🔄 **Smart loop prevention** - Automatic detection and correction
 - 📝 **Concise responses** - Minimal, conversational summaries
 
-See [KIRO-SETUP-GUIDE.md](KIRO-SETUP-GUIDE.md) for detailed configuration.
+See [WHIZCODE-SETUP-GUIDE.md](WHIZCODE-SETUP-GUIDE.md) for detailed configuration.
 
 ## Features
 
 ### Core Capabilities
-- **Autonomous Agent**: Kiro-style behavior with proactive tool usage
+- **Autonomous Agent**: WhizCode-style behavior with proactive tool usage
 - **Multi-Model Support**: Separate models for reasoning and code generation
 - **15+ Tools**: File operations, search, terminal, validation, and more
 - **9 New Tools**: readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace
@@ -138,7 +138,7 @@ Tool: deepseek-coder-v2:16b (Ollama)
 5. Select your Tool Model (for coding)
 6. Add API keys if using OpenAI or Gemini
 
-See [KIRO-SETUP-GUIDE.md](KIRO-SETUP-GUIDE.md) for detailed configuration guide.
+See [WHIZCODE-SETUP-GUIDE.md](WHIZCODE-SETUP-GUIDE.md) for detailed configuration guide.
 
 ## Usage
 

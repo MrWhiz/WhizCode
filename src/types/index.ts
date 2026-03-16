@@ -7,6 +7,7 @@ export interface AgentStep {
     command?: string;
     logs?: string[];
     data?: any;
+    requestId?: string;
 }
 
 export interface Message {

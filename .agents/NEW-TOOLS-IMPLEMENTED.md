@@ -1,7 +1,7 @@
 # New Tools Implemented
 
 ## Overview
-Added 9 new powerful tools to WhizCode, bringing the total from 15 to 24 tools. These tools bring the IDE much closer to Kiro's capabilities.
+Added 9 new powerful tools to WhizCode, bringing the total from 15 to 24 tools. These tools bring the IDE much closer to WhizCode's capabilities.
 
 ## New Tools
 

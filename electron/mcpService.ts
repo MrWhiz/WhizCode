@@ -2,7 +2,7 @@
 // Model Context Protocol client — connects to external tool servers
 // and exposes their tools dynamically to the WhizCode agent.
 //
-// Config file: {workspace}/.kiro/mcp-servers.json
+// Config file: {workspace}/.whizcode/mcp-servers.json
 // Example config:
 // {
 //   "servers": [
@@ -169,13 +169,13 @@ export class MCPManager {
   private configPath: string;
 
   constructor(workspaceRoot: string) {
-    this.configPath = join(workspaceRoot, '.kiro', 'mcp-servers.json');
+    this.configPath = join(workspaceRoot, '.whizcode', 'mcp-servers.json');
   }
 
   async initialize(): Promise<void> {
     const configs = await this.loadConfig();
     if (configs.length === 0) {
-      console.log('[MCP] No server configs found. Create .kiro/mcp-servers.json to add servers.');
+      console.log('[MCP] No server configs found. Create .whizcode/mcp-servers.json to add servers.');
       return;
     }
 

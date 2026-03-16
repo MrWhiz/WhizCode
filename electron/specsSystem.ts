@@ -1,6 +1,6 @@
 // ====== SPECS SYSTEM ======
 // Structured feature development: Requirements → Design → Implementation
-// Each spec lives in .kiro/specs/{feature-name}/ with 3 documents.
+// Each spec lives in .whizcode/specs/{feature-name}/ with 3 documents.
 
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
@@ -38,7 +38,7 @@ export class SpecsManager {
   private specsDir: string;
 
   constructor(workspaceRoot: string) {
-    this.specsDir = join(workspaceRoot, '.kiro', 'specs');
+    this.specsDir = join(workspaceRoot, '.whizcode', 'specs');
   }
 
   async initialize() {

@@ -1,8 +1,8 @@
-# Kiro-Style Agent Setup Guide
+# WhizCode-Style Agent Setup Guide
 
 ## Quick Start
 
-Your WhizCode IDE now uses a Kiro-inspired autonomous agent system with flexible multi-model support optimized for local LLMs.
+Your WhizCode IDE now uses a WhizCode-inspired autonomous agent system with flexible multi-model support optimized for local LLMs.
 
 ## Model Configuration
 
@@ -91,7 +91,7 @@ Why: Use cloud for reasoning, local for code generation.
 - Waits for your approval
 - Then executes the plan
 
-**New Behavior (Kiro-style):**
+**New Behavior (WhizCode-style):**
 - Agent acts autonomously
 - No forced approval steps (except for terminal commands)
 - More natural conversation flow

@@ -1,13 +1,13 @@
-# Kiro Alignment Implementation Summary
+# WhizCode Alignment Implementation Summary
 
 ## Overview
-Successfully transformed WhizCode from a two-phase planner/executor architecture to a unified Kiro-style autonomous agent while preserving multi-model support for local LLM optimization.
+Successfully transformed WhizCode from a two-phase planner/executor architecture to a unified WhizCode-style autonomous agent while preserving multi-model support for local LLM optimization.
 
 ## Key Changes Implemented
 
 ### 1. Unified System Prompt (electron/main.ts)
 **Replaced:** Separate PLANNER_SYSTEM_PROMPT and EXECUTOR_SYSTEM_PROMPT  
-**With:** Single comprehensive KIRO_SYSTEM_PROMPT including:
+**With:** Single comprehensive WHIZCODE_SYSTEM_PROMPT including:
 - Identity and personality (friendly, knowledgeable, supportive)
 - Detailed capabilities list
 - Response style guidelines (concise, minimal, conversational)
@@ -204,7 +204,7 @@ Tool: qwen2.5-coder:3b (fast coding)
 
 ## Conclusion
 
-The IDE now behaves more like Kiro with:
+The IDE now behaves more like WhizCode with:
 - Autonomous, proactive behavior
 - Natural conversation flow
 - Flexible multi-model support for local LLM optimization

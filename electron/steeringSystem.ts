@@ -1,5 +1,5 @@
 // Steering Files System for WhizCode
-// Custom instructions and guidelines similar to Kiro
+// Custom instructions and guidelines similar to WhizCode
 
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
@@ -30,7 +30,7 @@ export class SteeringManager {
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
-    this.steeringDir = join(workspaceRoot, '.kiro', 'steering');
+    this.steeringDir = join(workspaceRoot, '.whizcode', 'steering');
   }
 
   async initialize() {

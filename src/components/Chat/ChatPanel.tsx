@@ -168,7 +168,29 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
         .replace(/<OUTPUT_FORMAT>[\s\S]*?<\/OUTPUT_FORMAT>/gi, '')
         .trim();
 
-    // 2. Detect if the remaining content is just a JSON-like completion summary
+    // 2. Hide tool call JSONs - detect if content contains any tool call JSON patterns
+    const toolCallPatterns = [
+        '"tool":',
+        '"file_path":',
+        '"content":',
+        '"function_calls"',
+        '"invoke"',
+        '"antml:function_calls"',
+        '"write_file"',
+        '"read_file"',
+        '"edit_file"',
+        '"run_command"',
+        '"list_directory"'
+    ];
+    
+    const hasToolCallJson = toolCallPatterns.some(pattern => cleanContent.includes(pattern)) ||
+                           (cleanContent.includes('{') && cleanContent.includes('"tool"'));
+    
+    if (hasToolCallJson) {
+        return null; // Hide tool call JSONs completely
+    }
+
+    // 3. Detect if the remaining content is just a JSON-like completion summary
     let isJsonSummary = false;
     if (cleanContent.startsWith('{') && cleanContent.endsWith('}') && cleanContent.includes('"status"')) {
         try {
@@ -304,7 +326,9 @@ export const ChatPanel = ({
         handlePermissionResponse(approved, idx);
     };
 
-    const pendingPermissionStepIdx = agentSteps.findIndex((s, i) => s.status === 'awaiting_permission' && !respondedSteps[i]);
+    const pendingPermissionStepIdx = agentSteps.findIndex((s, i) => 
+        s.status === 'awaiting_permission' && !respondedSteps[i]
+    );
 
     // Handle auto-run logic
     React.useEffect(() => {

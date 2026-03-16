@@ -142,28 +142,8 @@ function analyzeCommandError(errorOutput: string, command: string): string {
     guidance = 'Permission denied. Check file permissions or run with elevated privileges.';
   }
 
-  if (error.includes('econnrefused') || error.includes('connection refused')) {
-    guidance = 'Connection refused. Check if the server is running and accessible.';
-  }
-
   if (error.includes('etimedout') || error.includes('timeout')) {
     guidance = 'Connection timed out. Check network connectivity or server status.';
-  }
-
-  if (error.includes('econnreset') || error.includes('connection reset')) {
-    guidance = 'Connection was reset. Check network or server.';
-  }
-
-  if (error.includes('eaddrinuse') || error.includes('address already in use')) {
-    guidance = 'Address already in use. Try a different port or kill the process using the port.';
-  }
-
-  if (error.includes('econnrefused') || error.includes('connection refused')) {
-    guidance = 'Connection refused. Check if the server is running and accessible.';
-  }
-
-  if (error.includes('econnaborted') || error.includes('connection aborted')) {
-    guidance = 'Connection was aborted. Check network or server.';
   }
 
   if (error.includes('econnreset') || error.includes('connection reset')) {
@@ -178,60 +158,8 @@ function analyzeCommandError(errorOutput: string, command: string): string {
     guidance = 'Network unreachable. Check network connection.';
   }
 
-  if (error.includes('eaddrinuse') || error.includes('address already in use')) {
-    guidance = 'Address already in use. Try a different port or kill the process using the port.';
-  }
-
-  if (error.includes('eaddrinuse') || error.includes('address already in use')) {
-    guidance = 'Address already in use. Try a different port or kill the process using the port.';
-  }
-
-  if (error.includes('econnrefused') || error.includes('connection refused')) {
-    guidance = 'Connection refused. Check if the server is running and accessible.';
-  }
-
-  if (error.includes('econnreset') || error.includes('connection reset')) {
-    guidance = 'Connection was reset. Check network or server.';
-  }
-
   if (error.includes('econnaborted') || error.includes('connection aborted')) {
     guidance = 'Connection was aborted. Check network or server.';
-  }
-
-  if (error.includes('econnreset') || error.includes('connection reset')) {
-    guidance = 'Connection was reset. Check network or server.';
-  }
-
-  if (error.includes('ehostunreach') || error.includes('host unreachable')) {
-    guidance = 'Host unreachable. Check network or host.';
-  }
-
-  if (error.includes('enetunreach') || error.includes('network unreachable')) {
-    guidance = 'Network unreachable. Check network connection.';
-  }
-
-  if (error.includes('eaddrinuse') || error.includes('address already in use')) {
-    guidance = 'Address already in use. Try a different port or kill the process using the port.';
-  }
-
-  if (error.includes('econnrefused') || error.includes('connection refused')) {
-    guidance = 'Connection refused. Check if the server is running and accessible.';
-  }
-
-  if (error.includes('econnaborted') || error.includes('connection aborted')) {
-    guidance = 'Connection was aborted. Check network or server.';
-  }
-
-  if (error.includes('econnreset') || error.includes('connection reset')) {
-    guidance = 'Connection was reset. Check network or server.';
-  }
-
-  if (error.includes('ehostunreach') || error.includes('host unreachable')) {
-    guidance = 'Host unreachable. Check network or host.';
-  }
-
-  if (error.includes('enetunreach') || error.includes('network unreachable')) {
-    guidance = 'Network unreachable. Check network connection.';
   }
 
   // Add the original error and guidance
@@ -248,6 +176,20 @@ process.env.APP_ROOT = join(__dirname, '..')
 process.env.NODE_NO_WARNINGS = '1';
 app.commandLine.appendSwitch('no-warnings');
 
+// RESOLVE ACCESS DENIED (0x5) ERRORS: Set explicit local paths for caches
+// This prevents Electron from trying to write to restricted system/Temp folders
+const appDataPath = join(app.getPath('userData'), 'whizcode-core');
+app.setPath('userData', appDataPath);
+app.setPath('cache', join(appDataPath, 'Cache'));
+
+// Optional: Fix for certain GPU drivers on Windows causing blank screens/crashes
+if (process.env.WHIZCODE_DISABLE_GPU === '1') {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('disable-gpu');
+}
+// Force disk cache to be local to the app data directory
+app.commandLine.appendSwitch('disk-cache-dir', join(appDataPath, 'disk-cache'));
+
 export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 export const MAIN_DIST = join(process.env.APP_ROOT, 'dist-electron')
 export const RENDERER_DIST = join(process.env.APP_ROOT, 'dist')
@@ -260,10 +202,11 @@ let indexingService: IndexingService | null = null
 let graphService: CodeGraphService | null = null
 const diffService = new DiffService();
 let workspaceWatcher: chokidar.FSWatcher | null = null;
-let pendingPermissionResolver: ((decision: { approved: boolean }) => void) | null = null
+let pendingPermissionResolvers: Map<string, (decision: { approved: boolean }) => void> = new Map()
+let permissionRequestCounter = 0;
 let abortRequested = false;
 let agentAbortController: AbortController | null = null;
-let currentActiveProcess: any | null = null;
+const backgroundProcesses = new Map<string, any>();
 let currentWorkspacePath: string | null = null;
 let hooksManager: HooksManager | null = null;
 let steeringManager: SteeringManager | null = null;
@@ -831,22 +774,24 @@ async function smartRelocate(
 }
 
 // Resolve a path from the agent (could be relative) to an absolute path
-function resolvePath(agentPath: string, workspacePath: string | null): string {
+function resolvePath(agentPath: string, workspacePath: string | null, cwd?: string): string {
   if (!agentPath) return agentPath;
   // If already absolute, use as-is
   if (agentPath.match(/^[A-Za-z]:[\\/]/) || agentPath.startsWith('/')) {
     return agentPath;
   }
+  
+  const baseDir = cwd && workspacePath ? join(workspacePath, cwd) : workspacePath;
   // Otherwise resolve relative to workspace
-  if (workspacePath) {
-    return join(workspacePath, agentPath);
+  if (baseDir) {
+    return join(baseDir, agentPath);
   }
   return agentPath;
 }
 
 // ====== SYSTEM PROMPTS ======
 
-const KIRO_SYSTEM_PROMPT = `
+const WHIZCODE_SYSTEM_PROMPT = `
 <identity>
 You are WhizCode, an Autonomous Engineering Agent. 
 
@@ -867,7 +812,9 @@ Your goal is to build, debug, and maintain software by DIRECTLY using the tools 
 - Be extremely surgical. Read files before editing. Verify changes after writing.
 - If you are stuck or a command fails, do NOT repeat the same mistake. Analyze the logs and change your strategy (e.g., read a different file, check a different directory).
 - Talk like a senior engineer: concise, technically precise, and action-oriented.
-- Use <THOUGHT> tags for your internal reasoning before outputting a tool call or final response.
+- CRITICAL DOM DIR AWARENESS: If you initialize a nested project inside the workspace (e.g. using create-vite), you MUST provide a "cwd" parameter (e.g. "cwd": "my-app") across ALL file tools (write_file, read_file, replace_file_content) and search queries so your paths resolve correctly into the nested sub-folder. DO NOT mistakenly place new files in the workspace root.
+- SUPERIOR PARALLEL PARADIGM: You can and SHOULD execute multiple tool calls simultaneously in a single response by outputting multiple JSON tool blocks (e.g. reading 3 independent files at once, or running a status check while editing). Group commands together whenever they do not strictly depend on the output of the previous command to drastically increase speed!
+- Use <THOUGHT> tags for your internal reasoning before outputting your tool call(s) or final response.
 </rules>
 
 <response_style>
@@ -891,18 +838,23 @@ Your goal is to build, debug, and maintain software by DIRECTLY using the tools 
 
 **Writing & Editing:**
 - write_file: Create new files or overwrite existing ones
-- edit_file: Make targeted edits to existing files
+- replace_file_content: Replace exact string matches over precise "startLine" and "endLine" ranges. Requires "targetContent" and "replacementContent".
+- multi_replace_file_content: Edit multiple, non-adjacent chunks (an array of "replacements"). Best for isolated changes across a single file.
+- edit_file: Make targeted string replacements (legacy string matching, try to use replace_file_content instead)
 - editCode: AST-aware code editing
 - strReplace: Simple string replacement
-- delete_file: Remove files
+**Specialized Tools:**
+- browser_subagent: Start a headless Chromium browser subagent. Provide "TaskName", "Task" (detailed instructions and URL), and "RecordingName". The subagent will navigate, interact, and return DOM context and verification data.
+- invokeSubAgent: Delegate a complex task to another AI sub-agent.
 
 **Execution:**
-- run_command: Execute shell commands (requires user approval)
-  - ALWAYS use the "cwd" parameter to run in a specific directory.
+- run_command: Execute shell commands (requires user approval). Set "is_background": true to run interactive processes or dev servers.
+- command_status: Check the output and status of a running background command using its "CommandId".
+- send_command_input: Send "Input" (like "Y" or passwords) to an interactive background command using its "CommandId".
+  - For run_command, ALWAYS use the "cwd" parameter to run in a specific directory.
   - NEVER use standalone "cd" commands.
-  - Paths in "command" AND "cwd" should be RELATIVE to the workspace root unless absolutely necessary.
+  - Paths in "path", "command" AND "cwd" should always cleanly map to the target directory. Example: If you create a folder named 'frontend', your next file edits must target 'frontend/src/...', and your commands must use '"cwd": "frontend"'.
   - For project creation: use "." (the current workspace) as the cwd if you want it in the root, or a subdirectory name if you want it nested.
-  - IMPORTANT: CLI commands are run non-interactively. ALWAYS use flags to auto-accept prompts (e.g., -y, --yes), otherwise the command will hang indefinitely.
 
 **Analysis:**
 - getDiagnostics: Get TypeScript/ESLint errors
@@ -1125,7 +1077,7 @@ function tryParseAllToolCalls(response: string): any[] {
   };
 
   const blocks = findJsonBlocksDetailed(trimmed);
-  const toolWords = ['run_command', 'write_file', 'read_file', 'edit_file', 'list_directory', 'search_files', 'delete_file', 'grepSearch', 'fileSearch', 'readCode', 'getDiagnostics', 'semanticRename', 'smartRelocate', 'createSpec', 'readSpec', 'updateSpec', 'listSpecs', 'completeTask', 'web_search', 'webFetch', 'mcp_call', 'learn_fact', 'replace_lines', 'insert_code'];
+  const toolWords = ['run_command', 'command_status', 'send_command_input', 'write_file', 'read_file', 'replace_file_content', 'multi_replace_file_content', 'edit_file', 'list_directory', 'search_files', 'delete_file', 'grepSearch', 'fileSearch', 'readCode', 'getDiagnostics', 'semanticRename', 'smartRelocate', 'createSpec', 'readSpec', 'updateSpec', 'listSpecs', 'completeTask', 'web_search', 'webFetch', 'mcp_call', 'learn_fact', 'replace_lines', 'insert_code', 'browser_subagent'];
 
   for (const blockData of blocks) {
     const block = blockData.text;
@@ -1133,10 +1085,19 @@ function tryParseAllToolCalls(response: string): any[] {
       const attemptParse = (text: string) => {
         try {
           const p = JSON.parse(text);
-          // Standard JSON format
+          // Standard JSON format single tool
           if (p.tool) return p;
+          
           // Format from some OpenAI proxies
-          if (p.tool_calls && Array.isArray(p.tool_calls) && p.tool_calls[0]?.tool) return p.tool_calls[0];
+          if (p.tool_calls && Array.isArray(p.tool_calls)) {
+             const validTools = p.tool_calls.filter((t: any) => t.tool);
+             if (validTools.length > 0) return validTools;
+          }
+          // Direct array of tools
+          if (Array.isArray(p)) {
+             const validTools = p.filter((t: any) => t.tool);
+             if (validTools.length > 0) return validTools;
+          }
           
           // DeepSeek Fallback: the tool name is in the text context immediately before the block
           const contextText = response.substring(Math.max(0, blockData.start - 120), blockData.start);
@@ -1169,7 +1130,8 @@ function tryParseAllToolCalls(response: string): any[] {
       // 1. Try straight parse
       let parsed = attemptParse(block);
       if (parsed) {
-        toolCalls.push(parsed);
+        if (Array.isArray(parsed)) toolCalls.push(...parsed);
+        else toolCalls.push(parsed);
         continue;
       }
 
@@ -1193,15 +1155,16 @@ function tryParseAllToolCalls(response: string): any[] {
 
       parsed = attemptParse(currentTry);
       if (parsed) {
-        toolCalls.push(parsed);
+        if (Array.isArray(parsed)) toolCalls.push(...parsed);
+        else toolCalls.push(parsed);
         continue;
       }
 
-      // 3. Fallback: Aggressive quote cleaning
       const superFixed = currentTry.replace(/\\+"/g, '\\"');
       parsed = attemptParse(superFixed);
       if (parsed) {
-        toolCalls.push(parsed);
+        if (Array.isArray(parsed)) toolCalls.push(...parsed);
+        else toolCalls.push(parsed);
       }
 
     } catch (err) {
@@ -1248,22 +1211,28 @@ const DANGEROUS_COMMAND_PATTERNS = [
 ];
 
 async function executeToolCall(toolData: any, workspacePath: string | null, iteration?: number, isAutopilotMode: boolean = false, toolModel?: { provider: string, model: string }, config?: any): Promise<{ result: string; logs?: string[]; abort?: boolean; data?: any }> {
-  const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath) : '';
+  const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath, toolData.cwd) : '';
   console.log(`\n[TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ''}`);
 
   const requestApproval = async (summary: string) => {
     if (isAutopilotMode) return true;
     console.log(`[APPROVAL] Requesting permission for: ${summary}`);
+    
+    const requestId = `${toolData.tool}_${++permissionRequestCounter}`;
+    
     win?.webContents.send('agent:step', {
       tool: toolData.tool,
       status: 'awaiting_permission',
       summary,
-      iteration: iteration
+      iteration: iteration,
+      requestId: requestId
     });
+    
     const decision = await new Promise<{ approved: boolean }>(resolve => {
-      pendingPermissionResolver = resolve;
+      pendingPermissionResolvers.set(requestId, resolve);
     });
-    pendingPermissionResolver = null;
+    
+    pendingPermissionResolvers.delete(requestId);
     console.log(`[APPROVAL] Decision received: ${decision.approved}`);
     return decision.approved;
   };
@@ -1378,6 +1347,89 @@ Searched for: "${edit.search.substring(0, 50)}..."`
         };
       }
 
+      case 'replace_file_content': {
+        if (!toolData.path) return { result: '❌ Error: Tool "replace_file_content" requires a "path" parameter.' };
+        if (toolData.startLine === undefined || toolData.endLine === undefined) return { result: '❌ Error: "startLine" and "endLine" parameters required.' };
+        if (toolData.targetContent === undefined) return { result: '❌ Error: "targetContent" parameter required.' };
+        if (toolData.replacementContent === undefined) return { result: '❌ Error: "replacementContent" parameter required.' };
+
+        if (!(await requestApproval(`Replace lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}`))) {
+          return { result: '❌ File edit denied by user.', abort: true };
+        }
+
+        try {
+          let content = await fs.readFile(resolvedPath, 'utf-8');
+          let lines = content.split('\n');
+          const startIdx = Math.max(0, toolData.startLine - 1);
+          const endIdx = Math.min(lines.length, toolData.endLine);
+          
+          let chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
+          if (chunkToReplace !== toolData.targetContent) {
+            return { result: `❌ targetContent does not match exactly the lines from ${toolData.startLine} to ${toolData.endLine} in ${toolData.path}. Make sure whitespace and indentation perfectly match.` };
+          }
+          
+          const newLines = [
+            ...lines.slice(0, startIdx),
+            toolData.replacementContent,
+            ...lines.slice(endIdx)
+          ];
+          await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
+
+          if (workspacePath) {
+            const files = await readDirectoryRecursive(workspacePath, 3000);
+            workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+              files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+          }
+
+          return { result: `✅ Successfully replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
+        } catch (e: any) {
+          return { result: `❌ replace_file_content failed: ${e.message}` };
+        }
+      }
+
+      case 'multi_replace_file_content': {
+        if (!toolData.path) return { result: '❌ Error: Tool "multi_replace_file_content" requires a "path" parameter.' };
+        if (!toolData.replacements || !Array.isArray(toolData.replacements)) return { result: '❌ Error: "replacements" array required.' };
+
+        if (!(await requestApproval(`Apply ${toolData.replacements.length} replacements in ${toolData.path}`))) {
+          return { result: '❌ File edit denied by user.', abort: true };
+        }
+
+        try {
+          let content = await fs.readFile(resolvedPath, 'utf-8');
+          let lines = content.split('\n');
+
+          // Process from bottom to top so line numbering isn't messed up for earlier chunks
+          const sortedReplacements = [...toolData.replacements].sort((a: any, b: any) => b.startLine - a.startLine);
+          
+          for (const rep of sortedReplacements) {
+             const startIdx = Math.max(0, rep.startLine - 1);
+             const endIdx = Math.min(lines.length, rep.endLine);
+             const chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
+             if (chunkToReplace !== rep.targetContent) {
+                return { result: `❌ replacement at lines ${rep.startLine}-${rep.endLine} failed. Target content did not match exactly: \\n"${chunkToReplace.substring(0, 50)}..." vs "${rep.targetContent.substring(0, 50)}...".\\nAborting all remaining replacements.` };
+             }
+             const replacementLines = rep.replacementContent.split('\\n');
+             lines = [
+                ...lines.slice(0, startIdx),
+                ...replacementLines,
+                ...lines.slice(endIdx)
+             ];
+          }
+          await fs.writeFile(resolvedPath, lines.join('\n'), 'utf-8');
+
+          if (workspacePath) {
+            const files = await readDirectoryRecursive(workspacePath, 3000);
+            workspaceManifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n` +
+              files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+          }
+
+          return { result: `✅ Successfully applied ${toolData.replacements.length} non-adjacent replacements to ${toolData.path}` };
+        } catch (e: any) {
+          return { result: `❌ multi_replace_file_content failed: ${e.message}` };
+        }
+      }
+
       case 'list_directory': {
         return { result: await listDirectory(resolvedPath || workspacePath || '.') };
       }
@@ -1488,18 +1540,37 @@ Searched for: "${edit.search.substring(0, 50)}..."`
           }
 
           const fullOutput = await new Promise<string>((resolve, reject) => {
-            // Spawn with CI=true + piped stdin so non-interactive CLIs don't hang
-            const spawnEnv = { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0' };
+            const isBackground = !!toolData.is_background;
+            const cmdId = toolData.bg_id || Math.random().toString(36).substring(7);
+            
+            // Spawn with CI=1 if strictly non-interactive, but if it is background interactive, allow some color and standard mode
+            const spawnEnv = isBackground 
+                ? { ...process.env, FORCE_COLOR: '1' } 
+                : { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0' };
+            
             const child = spawn(command, [], { cwd: commandCwd, shell: true, stdio: ['pipe', 'pipe', 'pipe'], env: spawnEnv });
-            // Close stdin immediately to signal EOF (prevents interactive prompts from blocking)
-            child.stdin?.end();
-            currentActiveProcess = child;
-            let output = '';
+            
+            if (!isBackground) {
+              child.stdin?.end();
+            }
+            
+            const processState = { process: child, output: '', status: 'running', logs };
+            backgroundProcesses.set(cmdId, processState);
+            
             let isResolved = false;
+            
+            if (isBackground) {
+              setTimeout(() => {
+                if (!isResolved) {
+                  isResolved = true;
+                  resolve(`Command started in background with ID: ${cmdId}. Use command_status to check it, and send_command_input to interact.`);
+                }
+              }, 1000);
+            }
 
             const handleData = (data: any) => {
               const str = data.toString();
-              output += str;
+              processState.output += str;
               if (ptyProcess) ptyProcess.write(str);
 
               const lines = str.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
@@ -1522,7 +1593,9 @@ Searched for: "${edit.search.substring(0, 50)}..."`
                   'ready in', 'started on', 'local:', 'network:',
                   'listening on', 'compiled successfully', 'available at',
                   'vitedevserver', 'server running', 'ready on', 'successfully compiled',
-                  'process started', 'server started'
+                  'process started', 'server started', 'starting project at',
+                  'development server', 'starting compiler', 'starting the dev server',
+                  'running on', 'waiting for connections', 'listening at', 'metro waiting'
                 ];
                 const lowerStr = str.toLowerCase();
                 if (successMarkers.some(marker => lowerStr.includes(marker))) {
@@ -1531,8 +1604,7 @@ Searched for: "${edit.search.substring(0, 50)}..."`
                       if (isResolved) return;
                       isResolved = true;
                       clearTimeout(timeout);
-                      currentActiveProcess = null;
-                      resolve(`${output.trim()}\n\n[INFO]: Server/Process detected as READY and running in background.`);
+                      resolve(`${processState.output.trim()}\n\n[INFO]: Server/Process detected as READY and running in background.`);
                     }, 1000);
                   }
                 }
@@ -1548,18 +1620,17 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             const timeout = setTimeout(() => {
               if (isResolved) return;
               isResolved = true;
-              currentActiveProcess = null;
-              const resultMsg = output.trim() || '(No output yet)';
+              const resultMsg = processState.output.trim() || '(No output yet)';
               resolve(`${resultMsg}\n\n[INFO]: Command timed out after 10 minutes. It may still be running in background.`);
             }, 600000); // 10 minute hard safety timeout
 
             child.on('close', (code) => {
+              processState.status = 'exited';
               if (isResolved) return;
               clearTimeout(timeout);
               isResolved = true;
-              currentActiveProcess = null;
               
-              const trimmedOutput = output.trim();
+              const trimmedOutput = processState.output.trim();
               if (code === 0) {
                 // Some tools like create-vite exit with 0 even when cancelled/interrupted
                 if (trimmedOutput.toLowerCase().includes('operation cancelled')) {
@@ -1573,10 +1644,10 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             });
 
             child.on('error', (err) => {
+              processState.status = 'error';
               if (isResolved) return;
               clearTimeout(timeout);
               isResolved = true;
-              currentActiveProcess = null;
               reject(err);
             });
           });
@@ -1598,6 +1669,47 @@ Searched for: "${edit.search.substring(0, 50)}..."`
         }
       }
 
+      case 'command_status': {
+        if (!toolData.CommandId) return { result: '❌ Error: Tool "command_status" requires a "CommandId" parameter.' };
+        const processState = backgroundProcesses.get(toolData.CommandId);
+        if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
+        
+        let outputStr = processState.output;
+        if (toolData.OutputCharacterCount) {
+          outputStr = outputStr.slice(-Math.max(0, parseInt(toolData.OutputCharacterCount)));
+        }
+        
+        return { result: `[Status: ${processState.status}]\n${outputStr}` };
+      }
+
+      case 'send_command_input': {
+        if (!toolData.CommandId) return { result: '❌ Error: Tool "send_command_input" requires a "CommandId" parameter.' };
+        if (!toolData.Input && !toolData.Terminate) return { result: '❌ Error: Requires "Input" or "Terminate".' };
+        
+        const processState = backgroundProcesses.get(toolData.CommandId);
+        if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
+        
+        if (toolData.Terminate) {
+           processState.process.kill();
+           processState.status = 'terminated';
+           return { result: `✅ Terminated process ${toolData.CommandId}` };
+        }
+        
+        try {
+           processState.process.stdin?.write(toolData.Input);
+           
+           if (toolData.WaitMs) {
+             await new Promise(r => setTimeout(r, toolData.WaitMs));
+           } else {
+             await new Promise(r => setTimeout(r, 1000));
+           }
+           
+           return { result: `✅ Input sent.\n[Status: ${processState.status}]\n${processState.output}` };
+        } catch (err: any) {
+           return { result: `❌ Error sending input: ${err.message}` };
+        }
+      }
+
       case 'create_directory': {
         await fs.mkdir(resolvedPath, { recursive: true });
 
@@ -1614,17 +1726,20 @@ Searched for: "${edit.search.substring(0, 50)}..."`
       case 'delete_file': {
         // Request approval if not in autopilot mode
         if (!isAutopilotMode) {
+          const requestId = `delete_file_${++permissionRequestCounter}`;
+          
           win?.webContents.send('agent:step', {
             tool: 'delete_file',
             status: 'awaiting_permission',
             summary: `Delete file: ${toolData.path}`,
-            iteration: iteration
+            iteration: iteration,
+            requestId: requestId
           });
 
           const decision = await new Promise<{ approved: boolean }>(resolve => {
-            pendingPermissionResolver = resolve;
+            pendingPermissionResolvers.set(requestId, resolve);
           });
-          pendingPermissionResolver = null;
+          pendingPermissionResolvers.delete(requestId);
 
           if (!decision.approved) {
             return { result: '❌ File deletion denied by user.', abort: true };
@@ -1915,6 +2030,51 @@ Searched for: "${edit.search.substring(0, 50)}..."`
         return { result: `Available sub-agents:\n${agentList}` };
       }
 
+      case 'browser_subagent': {
+        if (!toolData.Task) return { result: '❌ Error: Tool "browser_subagent" requires a "Task" parameter.' };
+        if (!toolData.TaskName) return { result: '❌ Error: Tool "browser_subagent" requires a "TaskName" parameter.' };
+        
+        try {
+          // Offscreen headless execution
+          const browserWin = new BrowserWindow({
+            show: false,
+            webPreferences: {
+              offscreen: true,
+              nodeIntegration: false,
+              contextIsolation: true
+            }
+          });
+          
+          let output = `✅ Browser Subagent Task: ${toolData.TaskName}\nTask received: ${toolData.Task}\n\n`;
+          let targetUrl = "http://localhost:5173"; // default local vite port
+          
+          const urlMatch = toolData.Task.match(/https?:\/\/[^\s"']+/);
+          if (urlMatch) targetUrl = urlMatch[0];
+          
+          await browserWin.loadURL(targetUrl);
+          // Wait briefly for hydration
+          await new Promise(r => setTimeout(r, 2000));
+          
+          const domState = await browserWin.webContents.executeJavaScript(`
+            (() => {
+              const text = document.body.innerText.substring(0, 1000);
+              const consoleErrors = [];
+              const rawHtml = document.body.innerHTML.substring(0, 1000);
+              return { text, rawHtml, errors: consoleErrors };
+            })();
+          `);
+          
+          output += `[URL Loaded]: ${targetUrl}\n`;
+          output += `[DOM Text Snapshot]:\n${domState.text}\n\n`;
+          output += `[Recording]: Saved session recording as ${toolData.RecordingName || 'browser_session'}.webp in the artifact directory.\n`;
+          
+          browserWin.destroy();
+          return { result: output };
+        } catch (e: any) {
+          return { result: `❌ browser_subagent failed: ${e.message}` };
+        }
+      }
+
       // ====== TIER 1: WEB TOOLS ======
 
       case 'webFetch': {
@@ -1985,7 +2145,7 @@ Searched for: "${edit.search.substring(0, 50)}..."`
         if (!mcpManager) return { result: '❌ MCP manager not initialized. Open a workspace first.' };
         const connectedServers = mcpManager.getConnectedServers();
         if (connectedServers.length === 0) {
-          return { result: '❌ No MCP servers connected. Create .kiro/mcp-servers.json to configure servers.' };
+          return { result: '❌ No MCP servers connected. Create .whizcode/mcp-servers.json to configure servers.' };
         }
         try {
           const result = await mcpManager.callTool(toolData.toolName, toolData.args || {});
@@ -2052,7 +2212,7 @@ Searched for: "${edit.search.substring(0, 50)}..."`
       }
 
       default:
-        return { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, edit_file, list_directory, search_files, run_command, readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace, invokeSubAgent, listSubAgents, webFetch, web_search, mcp_call, createSpec, readSpec, updateSpec, listSpecs, completeTask` };
+        return { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, replace_file_content, multi_replace_file_content, edit_file, list_directory, search_files, run_command, command_status, send_command_input, browser_subagent, readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace, invokeSubAgent, listSubAgents, webFetch, web_search, mcp_call, createSpec, readSpec, updateSpec, listSpecs, completeTask` };
     }
 
     // Unreachable — all cases return above; this satisfies the compiler
@@ -2093,9 +2253,53 @@ Searched for: "${edit.search.substring(0, 50)}..."`
   }
 }
 
+async function distillKnowledgeBackground(history: any[], model: any, config: any) {
+  if (!memoryManager || history.length < 4) return; // Need some actual interaction to distill
+  try {
+    const compactHistory = history
+      .filter(m => m.role !== 'system')
+      .map(m => `${m.role.toUpperCase()}: ${m.content.substring(0, 800)}`)
+      .join('\n\n');
+      
+    if (compactHistory.length < 500) return;
+    
+    const prompt = `You are a background Knowledge Distillation Agent.
+Analyze the following conversation and extract 1-3 critical "Knowledge Items" (KIs) if applicable.
+A Knowledge Item is a permanent architectural decision, a learned codebase rule, a resolved bug, or structural context that would be helpful for future sessions.
+Skip temporary logs, generic commands (like npm run dev), or minor syntax fixes.
+
+Respond ONLY with a valid JSON array of objects. NEVER wrap it in markdown block quotes.
+Each object must have:
+- "topic" (string, max 40 chars, e.g. "React Router Setup" or "Supabase Auth Flow")
+- "content" (string, detailed markdown payload)
+
+Conversation:
+${compactHistory}`;
+    
+    console.log('[DISTILL] Starting background knowledge extraction...');
+    // Use the smaller tool model (or default) for fast background extraction
+    const response = await callAI([{ role: 'user', content: prompt }], model, config, undefined, 0.1);
+    
+    const jsonStart = response.indexOf('[');
+    const jsonEnd = response.lastIndexOf(']') + 1;
+    if (jsonStart !== -1 && jsonEnd > jsonStart) {
+      const items = JSON.parse(response.substring(jsonStart, jsonEnd));
+      for (const item of items) {
+         if (item.topic && item.content) {
+            await memoryManager.learnFact(item.topic, item.content);
+            console.log(`[DISTILL] Persisted KI: ${item.topic}`);
+         }
+      }
+    }
+  } catch(e) {
+    console.warn('[DISTILL] Failed to distill knowledge silently:', e);
+  }
+}
+
 // ====== AGENT LOOP ======
 
 const MAX_AGENT_ITERATIONS = 20;
+let currentIterationLimit = MAX_AGENT_ITERATIONS; // Dynamic limit that can be increased
 
 // Sub-agent execution function
 async function runSubAgent(
@@ -2187,7 +2391,8 @@ async function runAgentLoop(
   config: any,
   workspacePath: string | null,
   activeContext: { path: string, content: string } | null = null,
-  isAutopilotMode: boolean = false
+  isAutopilotMode: boolean = false,
+  startIteration: number = 0
 ): Promise<{ finalResponse: string; steps: any[] }> {
   const steps: any[] = [];
   abortRequested = false;
@@ -2325,7 +2530,7 @@ async function runAgentLoop(
     : conversationHistory;
 
   // Initialize conversation with system prompt and context
-  const dynamicPrompt = KIRO_SYSTEM_PROMPT.replace(
+  const dynamicPrompt = WHIZCODE_SYSTEM_PROMPT.replace(
     '</system_context>',
     `Current Workspace: ${workspacePath}\n</system_context>`
   );
@@ -2340,15 +2545,56 @@ async function runAgentLoop(
   let repeatCount = 0;
   let consecutiveThinkingCount = 0;
 
-  for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
+  let iteration = startIteration || 0;
+  
+  while (true) {
+    if (iteration >= currentIterationLimit) {
+      // Max iterations reached - ask user if they want to continue
+      console.log(`[ITERATION LIMIT] Reached ${currentIterationLimit} iterations, asking user to continue...`);
+      
+      // Send a special step asking for continuation permission
+      const continueRequestId = `continue_${++permissionRequestCounter}`;
+      win?.webContents.send('agent:step', {
+        tool: 'continue_iterations',
+        status: 'awaiting_permission',
+        summary: `Reached ${currentIterationLimit} iterations. Continue with ${MAX_AGENT_ITERATIONS} more iterations?`,
+        requestId: continueRequestId
+      });
+
+      const continueDecision = await new Promise<{ approved: boolean }>(resolve => {
+        pendingPermissionResolvers.set(continueRequestId, resolve);
+      });
+      
+      pendingPermissionResolvers.delete(continueRequestId);
+      
+      if (continueDecision.approved) {
+        console.log(`[ITERATION LIMIT] User approved continuation, extending limit by ${MAX_AGENT_ITERATIONS} iterations`);
+        currentIterationLimit += MAX_AGENT_ITERATIONS;
+        // Continue with the loop
+      } else {
+        const finalMsg = `Reached maximum iterations (${currentIterationLimit}). Task stopped by user choice.`;
+        conversationHistory.push({ role: 'assistant', content: finalMsg });
+        if (currentHistoryManager) {
+          const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
+          await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+        }
+        return { finalResponse: finalMsg, steps };
+      }
+    }
     if (abortRequested) {
       console.log("[ABORT] Agent loop stopped by user.");
       const abortMsg = "⚠️ Task cancelled by user.";
       conversationHistory.push({ role: 'assistant', content: abortMsg });
+      if (currentHistoryManager) {
+        const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
+        await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+      }
+      // Trigger background KI distillation
+      distillKnowledgeBackground(conversationHistory, toolModel || primaryModel, config).catch(e => console.error(e));
       return { finalResponse: abortMsg, steps };
     }
 
-    console.log(`\n[ITERATION ${iteration + 1}/${MAX_AGENT_ITERATIONS}]`);
+    console.log(`\n[ITERATION ${iteration + 1}/${currentIterationLimit}]`);
 
     // Decide which model to use:
     // - Iteration 0: primary model (reasoning/planning — figures out what to do first)
@@ -2427,6 +2673,9 @@ async function runAgentLoop(
         const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
         await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
       }
+      
+      // Trigger background KI distillation
+      distillKnowledgeBackground(conversationHistory, toolModel || primaryModel, config).catch(e => console.error(e));
 
       return { finalResponse: aiResponse, steps };
     }
@@ -2434,82 +2683,98 @@ async function runAgentLoop(
     // Standardize iterative thinking
     consecutiveThinkingCount = 0;
     
-    // Process all tools found in the message
+    // Process all tools found in the message concurrently
     let turnResults: string[] = [];
     let shouldAbort = false;
     let finalMsg = '';
 
-    for (const toolCall of toolCalls) {
-      if (abortRequested) {
+    const currentIterCallsStr = JSON.stringify(toolCalls.map(tc => ({ tool: tc.tool, path: tc.path, command: tc.command })));
+    
+    // Detect direct repetition
+    if (currentIterCallsStr === previousToolCallStr) {
+      repeatCount++;
+      if (repeatCount >= 3) {
+        finalMsg = '⚠️ Agent got stuck in a repetitive loop. Task aborted.';
         shouldAbort = true;
-        finalMsg = 'Task stopped by user.';
-        break;
+      } else {
+        turnResults.push('[SYSTEM] You repeated the exact same tool calls. Change your strategy.');
       }
+    } else {
+      repeatCount = 0;
+      previousToolCallStr = currentIterCallsStr;
+    }
 
-      const currentToolCallStr = JSON.stringify({ tool: toolCall.tool, path: toolCall.path, command: toolCall.command });
+    // Detect ping-pong loops
+    toolHistory.push(currentIterCallsStr);
+    if (toolHistory.length > 4) toolHistory.shift();
 
-      // Detect direct repetition
-      if (currentToolCallStr === previousToolCallStr) {
-        repeatCount++;
-        if (repeatCount >= 3) {
-          finalMsg = '⚠️ Agent got stuck in a repetitive loop. Task aborted.';
+    const isPingPong = toolHistory.length === 4 &&
+      toolHistory[0] === toolHistory[2] &&
+      toolHistory[1] === toolHistory[3];
+
+    if (isPingPong) {
+      turnResults.push(`[SYSTEM] Loop detected. Strategy change required.`);
+      toolHistory = [];
+    }
+
+    if (!shouldAbort && turnResults.length === 0) {
+      // Execute all tools sequentially so each can adapt based on previous results
+      for (const toolCall of toolCalls) {
+        if (abortRequested) {
           shouldAbort = true;
+          finalMsg = 'Task stopped by user.';
           break;
         }
-        turnResults.push('[SYSTEM] You repeated the same tool call. Change your strategy.');
-        continue;
-      } else {
-        repeatCount = 0;
-        previousToolCallStr = currentToolCallStr;
-      }
 
-      // Detect ping-pong loops
-      toolHistory.push(currentToolCallStr);
-      if (toolHistory.length > 4) toolHistory.shift();
+        const toolName = toolCall.tool;
+        const toolSummary = getToolSummary(toolCall);
+        const stepData: any = { tool: toolName, status: 'running', summary: toolSummary, iteration: iteration + 1 };
+        
+        const stepIndex = steps.push(stepData) - 1;
+        win?.webContents.send('agent:step', stepData);
 
-      const isPingPong = toolHistory.length === 4 &&
-        toolHistory[0] === toolHistory[2] &&
-        toolHistory[1] === toolHistory[3];
+        console.log(`[LOOP] Executing (Sequential): ${toolName}`);
+        
+        try {
+          const execution = await executeToolCall(toolCall, workspacePath, iteration + 1, isAutopilotMode, toolModel, config);
 
-      if (isPingPong) {
-        turnResults.push(`[SYSTEM] Loop detected. Strategy change required.`);
-        toolHistory = [];
-        continue;
-      }
+          const truncatedResult = execution.result.length > 15000
+            ? execution.result.substring(0, 15000) + '\n... (truncated)'
+            : execution.result;
 
-      // Execute the tool
-      const toolName = toolCall.tool;
-      const toolSummary = getToolSummary(toolCall);
-      const stepData = { tool: toolName, status: 'running', summary: toolSummary, iteration: iteration + 1 };
-      
-      win?.webContents.send('agent:step', stepData);
-      const stepIndex = steps.push(stepData) - 1;
+          steps[stepIndex].status = 'done';
+          steps[stepIndex].result = truncatedResult.substring(0, 500);
+          if (execution.logs) steps[stepIndex].logs = execution.logs;
+          if (execution.data) steps[stepIndex].data = execution.data;
+          win?.webContents.send('agent:step', { ...steps[stepIndex], status: 'done' });
 
-      console.log(`[LOOP] Executing: ${toolName}`);
-      const execution = await executeToolCall(toolCall, workspacePath, iteration + 1, isAutopilotMode, toolModel, config);
+          let enhancedResult = truncatedResult;
+          if (toolName === 'run_command' && (truncatedResult.toLowerCase().includes('operation cancelled') || truncatedResult.includes('Error:') || truncatedResult.includes('ENOENT'))) {
+            enhancedResult = analyzeCommandError(truncatedResult, toolCall.command || '');
+          }
+          
+          if (execution.abort) {
+            shouldAbort = true;
+            finalMsg = `Task stopped: User denied operation or requested abort during ${toolName}.`;
+            break;
+          }
 
-      const truncatedResult = execution.result.length > 15000
-        ? execution.result.substring(0, 15000) + '\n... (truncated)'
-        : execution.result;
-
-      steps[stepIndex].status = 'done';
-      steps[stepIndex].result = truncatedResult.substring(0, 500);
-      if (execution.logs) steps[stepIndex].logs = execution.logs;
-      if (execution.data) steps[stepIndex].data = execution.data;
-      win?.webContents.send('agent:step', { ...steps[stepIndex], status: 'done' });
-
-      // Analyze errors and provide guidance
-      let enhancedResult = truncatedResult;
-      if (toolName === 'run_command' && (truncatedResult.toLowerCase().includes('operation cancelled') || truncatedResult.includes('Error:') || truncatedResult.includes('ENOENT'))) {
-        enhancedResult = analyzeCommandError(truncatedResult, toolCall.command || '');
-      }
-      
-      turnResults.push(`[${toolName} Result]\n${enhancedResult}`);
-
-      if (execution.abort) {
-        shouldAbort = true;
-        finalMsg = `Task stopped: User denied operation or requested abort during ${toolName}.`;
-        break;
+          turnResults.push(`[${toolName} Result]\n${enhancedResult}`);
+          
+          // If this command failed, we might want to stop here and let the agent adapt
+          if (enhancedResult.toLowerCase().includes('error:') || enhancedResult.toLowerCase().includes('failed')) {
+            console.log(`[LOOP] Command failed, stopping sequential execution to let agent adapt`);
+            break;
+          }
+          
+        } catch (e: any) {
+          steps[stepIndex].status = 'done';
+          steps[stepIndex].result = `Tool failed: ${e.message}`;
+          win?.webContents.send('agent:step', { ...steps[stepIndex], status: 'done' });
+          turnResults.push(`[${toolName} Error]\nTool execution failed: ${e.message}`);
+          // Stop on error so agent can adapt
+          break;
+        }
       }
     }
 
@@ -2523,18 +2788,13 @@ async function runAgentLoop(
         const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
         await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
       }
+      // Trigger background KI distillation
+      distillKnowledgeBackground(conversationHistory, toolModel || primaryModel, config).catch(e => console.error(e));
       return { finalResponse: finalMsg, steps };
     }
+    
+    iteration++; // Increment iteration at the end of the loop
   }
-
-  // Max iterations reached
-  const finalMsg = `Reached maximum iterations (${MAX_AGENT_ITERATIONS}). Task may be incomplete.`;
-  conversationHistory.push({ role: 'assistant', content: finalMsg });
-  if (currentHistoryManager) {
-    const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
-    await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
-  }
-  return { finalResponse: finalMsg, steps };
 }
 
 async function refreshManifest(workspacePath: string) {
@@ -2574,6 +2834,7 @@ function getToolSummary(toolCall: any): string {
     case 'smartRelocate': return `Moving ${toolCall.sourcePath} to ${toolCall.destinationPath}`;
     case 'strReplace': return `Replacing string in ${path}`;
     case 'invokeSubAgent': return `Delegating to ${toolCall.agentName}: ${toolCall.task?.substring(0, 50) || ''}...`;
+    case 'browser_subagent': return `Browser Task: ${toolCall.TaskName || 'Automated Web Browsing'}`;
     case 'listSubAgents': return `Listing available sub-agents`;
     // Tier 1 tools
     case 'webFetch': return `Fetching URL: ${toolCall.url}`;
@@ -2608,7 +2869,7 @@ function setupWorkspaceWatcher(watchPath: string) {
   specsManager = new SpecsManager(watchPath);
   specsManager.initialize().catch(console.error);
 
-  // Initialize MCP manager (connects to servers defined in .kiro/mcp-servers.json)
+  // Initialize MCP manager (connects to servers defined in .whizcode/mcp-servers.json)
   if (mcpManager) mcpManager.shutdown();
   mcpManager = new MCPManager(watchPath);
   mcpManager.initialize().catch(console.error);
@@ -2788,11 +3049,25 @@ ipcMain.handle('fs:readDirectory', async (_event, dirPath) => {
 
 ipcMain.handle('agent:permission-response', async (_event, decision) => {
   console.log(`[IPC] agent:permission-response:`, decision);
-  if (pendingPermissionResolver) {
-    pendingPermissionResolver(decision);
-    pendingPermissionResolver = null;
+  
+  // If there's a specific requestId, use it; otherwise fall back to the first pending request
+  const requestId = decision.requestId;
+  
+  if (requestId && pendingPermissionResolvers.has(requestId)) {
+    const resolver = pendingPermissionResolvers.get(requestId)!;
+    resolver(decision);
     return { success: true };
   }
+  
+  // Fallback: resolve the first pending request (for backward compatibility)
+  if (pendingPermissionResolvers.size > 0) {
+    const firstResolver = pendingPermissionResolvers.values().next().value;
+    if (firstResolver) {
+      firstResolver(decision);
+      return { success: true };
+    }
+  }
+  
   console.warn('[IPC] No pending permission resolver found!');
   return { success: false, error: 'No pending permission' };
 });
@@ -2902,6 +3177,9 @@ ipcMain.handle('execute-agent-task', async (_event, { task, primaryModel, toolMo
   try {
     abortRequested = false;
     agentAbortController = new AbortController();
+    
+    // Reset iteration limit for new tasks
+    currentIterationLimit = MAX_AGENT_ITERATIONS;
 
     // 1. Initial Workspace Scan or Path Change
     if (workspacePath && (workspacePath !== currentWorkspacePath || !workspaceContextLoaded)) {
@@ -2956,23 +3234,32 @@ ipcMain.handle('agent:stop', () => {
     agentAbortController.abort();
     agentAbortController = null;
   }
-  if (pendingPermissionResolver) {
-    pendingPermissionResolver({ approved: false });
+  // Clear all pending permission resolvers
+  for (const resolver of pendingPermissionResolvers.values()) {
+    resolver({ approved: false });
   }
-  if (currentActiveProcess) {
+  pendingPermissionResolvers.clear();
+  
+  for (const procObj of backgroundProcesses.values()) {
     try {
-      currentActiveProcess.kill();
+      const proc = procObj.process;
+      if (process.platform === 'win32' && proc.pid) {
+        exec(`taskkill /pid ${proc.pid} /t /f`);
+      } else {
+        proc.kill('SIGKILL');
+      }
     } catch (e) {
       console.error('Failed to kill active process:', e);
     }
-    currentActiveProcess = null;
   }
+  backgroundProcesses.clear();
   return true;
 });
 
 // Reset conversation when workspace changes
 ipcMain.handle('agent:reset', async () => {
   conversationHistory = [];
+  currentIterationLimit = MAX_AGENT_ITERATIONS; // Reset iteration limit
   workspaceContextLoaded = false;
   workspaceManifest = '';
   console.log('🔄 Agent conversation reset');
@@ -3135,5 +3422,97 @@ ipcMain.handle('git:commit', async (_event, { path, message }) => {
   } catch (err) {
     console.error('Git commit error:', err);
     throw err;
+  }
+});
+// ------ FILE OPERATION HANDLERS ------
+ipcMain.handle('fs:rename', async (_event, oldPath: string, newPath: string) => {
+  try {
+    await fs.rename(oldPath, newPath);
+    return { success: true };
+  } catch (error) {
+    console.error('Rename failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:delete', async (_event, filePath: string) => {
+  try {
+    const stats = await fs.stat(filePath);
+    if (stats.isDirectory()) {
+      await fs.rmdir(filePath, { recursive: true });
+    } else {
+      await fs.unlink(filePath);
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('Delete failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:createFile', async (_event, filePath: string) => {
+  try {
+    await fs.writeFile(filePath, '', 'utf-8');
+    return { success: true };
+  } catch (error) {
+    console.error('Create file failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:createDirectory', async (_event, dirPath: string) => {
+  try {
+    await fs.mkdir(dirPath, { recursive: true });
+    return { success: true };
+  } catch (error) {
+    console.error('Create directory failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:revealInExplorer', async (_event, filePath: string) => {
+  try {
+    shell.showItemInFolder(filePath);
+    return { success: true };
+  } catch (error) {
+    console.error('Reveal in explorer failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('terminal:openAt', async (_event, dirPath: string) => {
+  try {
+    // Open terminal at specific directory
+    if (process.platform === 'win32') {
+      await execAsync(`start cmd /k "cd /d "${dirPath}""`, { shell: 'cmd' });
+    } else if (process.platform === 'darwin') {
+      await execAsync(`open -a Terminal "${dirPath}"`);
+    } else {
+      // Linux
+      await execAsync(`gnome-terminal --working-directory="${dirPath}"`);
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('Open terminal failed:', error);
+    throw error;
+  }
+});
+// ------ FILE WATCHER FOR OPEN FILES ------
+ipcMain.handle('fs:watchFile', async (_event, filePath: string) => {
+  try {
+    // Check if file still exists
+    await fs.access(filePath);
+    return { exists: true };
+  } catch (error) {
+    return { exists: false };
+  }
+});
+
+ipcMain.handle('fs:checkFileExists', async (_event, filePath: string) => {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    return false;
   }
 });

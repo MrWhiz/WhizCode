@@ -1,4 +1,4 @@
-# Kiro Alignment Plan for WhizCode IDE
+# WhizCode Alignment Plan for WhizCode IDE
 
 ## Current Architecture Analysis
 
@@ -10,7 +10,7 @@
 5. **Loop Detection**: Basic ping-pong and repetition detection
 6. **Multi-Model Support**: Ollama, OpenAI, Gemini (KEEP THIS - very valuable for local LLMs!)
 
-### What Kiro Has (Target State):
+### What WhizCode Has (Target State):
 1. **Unified Agent**: Single agent with rich context and decision-making
 2. **Extensive Tool Set**: 25+ tools including semantic operations, code analysis, sub-agents
 3. **Rich System Prompt**: Detailed identity, capabilities, rules, response style
@@ -21,7 +21,7 @@
 ## Key Changes Required
 
 ### 1. System Prompt Enhancement
-- Add Kiro's identity and personality
+- Add WhizCode's identity and personality
 - Include detailed response style guidelines
 - Add comprehensive rules and best practices
 - Include tool usage patterns and decision trees
@@ -53,7 +53,7 @@
 ## Implementation Strategy
 
 ### Phase 1: Core System Prompt (Priority: HIGH)
-- Create unified KIRO_SYSTEM_PROMPT with full identity, capabilities, rules, response style
+- Create unified WHIZCODE_SYSTEM_PROMPT with full identity, capabilities, rules, response style
 - KEEP multi-model support but make it flexible:
   - Primary Model: Main reasoning and decision-making
   - Tool Model: Optimized for tool calling and code generation

@@ -1,5 +1,5 @@
 // Hooks System for WhizCode
-// Event-driven automation similar to Kiro
+// Event-driven automation similar to WhizCode
 
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
@@ -37,7 +37,7 @@ export class HooksManager {
   private hooksDir: string;
 
   constructor(workspaceRoot: string) {
-    this.hooksDir = join(workspaceRoot, '.kiro', 'hooks');
+    this.hooksDir = join(workspaceRoot, '.whizcode', 'hooks');
   }
 
   async initialize() {

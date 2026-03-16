@@ -1,4 +1,4 @@
-# Implementation Status - Kiro Alignment
+# Implementation Status - WhizCode Alignment
 
 ## ✅ COMPLETED FEATURES
 
@@ -203,14 +203,14 @@
 - [x] Sub-agents can't invoke other sub-agents
 
 ### Hooks
-- [x] Hooks load from .kiro/hooks/
+- [x] Hooks load from .whizcode/hooks/
 - [x] File events detected
 - [x] Tool events detected
 - [x] Pattern matching works
 - [ ] Hooks execute (TODO)
 
 ### Steering
-- [x] Steering loads from .kiro/steering/
+- [x] Steering loads from .whizcode/steering/
 - [x] Always inclusion works
 - [x] File match inclusion works
 - [x] Front matter parsed correctly
@@ -245,7 +245,7 @@
 
 ## CONCLUSION
 
-WhizCode now has most of Kiro's core features:
+WhizCode now has most of WhizCode's core features:
 - ✅ Rich context awareness
 - ✅ User control over autonomy
 - ✅ Automatic error detection
@@ -254,4 +254,4 @@ WhizCode now has most of Kiro's core features:
 - ✅ Custom instructions (steering)
 - ⏳ Web search (pending)
 
-The system is significantly more capable and intelligent than before, with better alignment to Kiro's architecture and features.
+The system is significantly more capable and intelligent than before, with better alignment to WhizCode's architecture and features.

@@ -1,7 +1,7 @@
 # Steering Files System
 
 ## Overview
-Steering files provide custom instructions and guidelines that are automatically included in the agent's context, similar to Kiro's steering system.
+Steering files provide custom instructions and guidelines that are automatically included in the agent's context, similar to WhizCode's steering system.
 
 ## What are Steering Files?
 
@@ -82,7 +82,7 @@ Use this when working on API endpoints...
 
 ### Location
 ```
-.kiro/steering/
+.whizcode/steering/
   ├── coding-standards.md
   ├── react-guidelines.md
   ├── api-conventions.md
@@ -127,7 +127,7 @@ The system will note these references in the context.
 
 ### Example 1: General Coding Standards
 
-**File:** `.kiro/steering/coding-standards.md`
+**File:** `.whizcode/steering/coding-standards.md`
 
 ```markdown
 ---
@@ -156,7 +156,7 @@ inclusion: always
 
 ### Example 2: React Guidelines
 
-**File:** `.kiro/steering/react-guidelines.md`
+**File:** `.whizcode/steering/react-guidelines.md`
 
 ```markdown
 ---
@@ -184,7 +184,7 @@ fileMatchPattern: ".*\\.(tsx|jsx)$"
 
 ### Example 3: Testing Practices
 
-**File:** `.kiro/steering/testing-practices.md`
+**File:** `.whizcode/steering/testing-practices.md`
 
 ```markdown
 ---
@@ -285,7 +285,7 @@ await ipcRenderer.invoke('steering:reload');
 
 ### Via File System
 
-1. Create a Markdown file in `.kiro/steering/`
+1. Create a Markdown file in `.whizcode/steering/`
 2. Add front matter with inclusion type
 3. Write your guidelines in Markdown
 4. Reload steering or restart app
@@ -326,9 +326,9 @@ await ipcRenderer.invoke('steering:reload');
 - Easy to update and maintain
 - Version controlled with your code
 
-## Comparison with Kiro
+## Comparison with WhizCode
 
-| Feature | WhizCode | Kiro |
+| Feature | WhizCode | WhizCode |
 |---------|----------|------|
 | Always Inclusion | ✅ | ✅ |
 | File Match | ✅ | ✅ |

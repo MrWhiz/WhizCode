@@ -1,7 +1,7 @@
-# Changes Made - Kiro Alignment
+# Changes Made - WhizCode Alignment
 
 ## Summary
-Transformed WhizCode from a two-phase planner/executor system to a unified Kiro-style autonomous agent while preserving and enhancing multi-model support for local LLM optimization.
+Transformed WhizCode from a two-phase planner/executor system to a unified WhizCode-style autonomous agent while preserving and enhancing multi-model support for local LLM optimization.
 
 ## Files Modified
 
@@ -11,7 +11,7 @@ Transformed WhizCode from a two-phase planner/executor system to a unified Kiro-
 **Major Changes:**
 1. **System Prompt Replacement**
    - Removed: `PLANNER_SYSTEM_PROMPT` and `EXECUTOR_SYSTEM_PROMPT`
-   - Added: `KIRO_SYSTEM_PROMPT` - comprehensive unified prompt with:
+   - Added: `WHIZCODE_SYSTEM_PROMPT` - comprehensive unified prompt with:
      - Identity and personality
      - Detailed capabilities
      - Response style guidelines
@@ -97,7 +97,7 @@ Transformed WhizCode from a two-phase planner/executor system to a unified Kiro-
 
 #### New Files Created:
 
-1. **.agents/kiro-alignment-plan.md**
+1. **.agents/whizcode-alignment-plan.md**
    - Comprehensive analysis of changes
    - Implementation strategy
    - Success criteria
@@ -110,7 +110,7 @@ Transformed WhizCode from a two-phase planner/executor system to a unified Kiro-
    - Testing checklist
    - Next steps
 
-3. **KIRO-SETUP-GUIDE.md**
+3. **WHIZCODE-SETUP-GUIDE.md**
    - User-facing setup guide
    - Model recommendations
    - Configuration examples
@@ -209,4 +209,4 @@ See `.agents/implementation-summary.md` for detailed roadmap:
 - Multi-model support is a key feature, not a limitation
 - Local LLM users benefit from role-specific model selection
 - Agent behavior is more natural and autonomous
-- System is ready for future Kiro feature additions
+- System is ready for future WhizCode feature additions

@@ -1,7 +1,7 @@
 # Sub-Agent System Implementation
 
 ## Overview
-WhizCode now has a Kiro-like sub-agent system that allows the main agent to delegate specialized tasks to focused sub-agents.
+WhizCode now has a WhizCode-like sub-agent system that allows the main agent to delegate specialized tasks to focused sub-agents.
 
 ## Available Sub-Agents
 

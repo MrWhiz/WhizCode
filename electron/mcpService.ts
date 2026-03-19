@@ -13,7 +13,7 @@
 //   ]
 // }
 
-import { spawn } from 'node:child_process';
+import { spawn, ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
 

@@ -51,6 +51,7 @@ function App() {
   const [newFileDialog, setNewFileDialog] = useState<{ parentPath: string } | null>(null)
   const [newFolderDialog, setNewFolderDialog] = useState<{ parentPath: string } | null>(null)
   const [newItemName, setNewItemName] = useState('')
+  const [fileErrors, setFileErrors] = useState<Record<string, number>>({})
 
   // Model settings
   const [modelProvider, setModelProvider] = useState<AIProvider>(() => (localStorage.getItem('modelProvider') as AIProvider) || 'ollama')
@@ -386,6 +387,54 @@ function App() {
     }
   }
 
+  // Check for errors in a file
+  const checkFileErrors = async (filePath: string, content: string): Promise<number> => {
+    const ipc = (window as any).ipcRenderer
+    if (!ipc || !workspacePath) return 0
+
+    try {
+      // Add timeout to prevent hanging
+      const timeoutPromise = new Promise<any[]>((_, reject) => 
+        setTimeout(() => reject(new Error('Diagnostics timeout')), 3000)
+      );
+      
+      const diagnostics = await Promise.race([
+        ipc.invoke('diagnostics:check', filePath, workspacePath),
+        timeoutPromise
+      ]);
+      
+      const count = Array.isArray(diagnostics) ? diagnostics.length : 0;
+      console.log(`[APP] File ${filePath.split(/[/\\]/).pop()} has ${count} errors`);
+      return count;
+    } catch (error) {
+      console.error('Error checking file diagnostics:', error)
+      return 0
+    }
+  }
+
+  // Update file errors when open files change
+  useEffect(() => {
+    const updateErrors = async () => {
+      console.log(`[APP] Checking errors for ${openFiles.length} open files`);
+      const newErrors: Record<string, number> = {}
+      for (const file of openFiles) {
+        const errorCount = await checkFileErrors(file.path, file.content)
+        if (errorCount > 0) {
+          newErrors[file.path] = errorCount
+        }
+      }
+      console.log(`[APP] Updated fileErrors:`, newErrors);
+      setFileErrors(newErrors)
+    }
+
+    // Debounce to avoid too many checks
+    const timer = setTimeout(() => {
+      updateErrors()
+    }, 500)
+
+    return () => clearTimeout(timer)
+  }, [openFiles, workspacePath])
+
   const handleSend = async () => {
     if (!input.trim() || isLoading) return
     const userMsg: Message = { role: 'user', content: input }
@@ -558,6 +607,26 @@ function App() {
       alert('Failed to create file: ' + (error as Error).message)
     }
   }
+
+  const handleFixError = (error: { file: string; line: number; message: string; code?: string }) => {
+    // Create a detailed error message for the chat
+    const errorMessage = `Fix this error in ${error.file.split(/[/\\]/).pop()}:
+Line ${error.line}: ${error.message}${error.code ? ` (${error.code})` : ''}
+
+Please analyze and fix this error.`;
+    
+    // Set the input and focus on chat
+    setInput(errorMessage);
+    setIsChatOpen(true);
+    
+    // Scroll to chat panel
+    setTimeout(() => {
+      const chatInput = document.querySelector('.chat-input') as HTMLTextAreaElement;
+      if (chatInput) {
+        chatInput.focus();
+      }
+    }, 100);
+  };
 
   const handleCreateNewFolder = async () => {
     if (!newFolderDialog || !newItemName.trim()) return
@@ -766,6 +835,7 @@ function App() {
                         refreshKey={refreshKey}
                         collapseAll={collapseAll}
                         fileFilter={fileFilter}
+                        fileErrors={fileErrors}
                       />
                     ) : (
                       <div className="empty-state">No folder opened.</div>
@@ -810,6 +880,8 @@ function App() {
                 })
               } else if (action === 'new-terminal') setIsTerminalOpen(true)
             }}
+            fileErrors={fileErrors}
+            onFixError={handleFixError}
           />
 
           <MultiTerminalPane 

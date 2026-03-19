@@ -622,6 +622,7 @@ export const ChatPanel = ({
                     )}
                     <div className="chat-input-box">
                         <textarea
+                            className="chat-input"
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}

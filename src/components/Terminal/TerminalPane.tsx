@@ -89,26 +89,27 @@ export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
             }
 
             // Register link matcher for URLs with Ctrl+click support
-            const urlRegex = /(https?:\/\/[^\s]+|file:\/\/[^\s]+)/g
-            if (term.registerLinkMatcher) {
-                term.registerLinkMatcher(
-                    urlRegex,
-                    (event: MouseEvent, uri: string) => {
-                        // Only open on Ctrl+click or Cmd+click
-                        if (event.ctrlKey || event.metaKey) {
-                            console.log('[TERMINAL] Opening link:', uri)
-                            ipc.send('terminal:openLink', uri)
-                        }
-                    },
-                    {
-                        priority: 1,
-                        willLinkActivate: (event: MouseEvent, uri: string) => {
-                            // Show link is clickable on Ctrl+hover
-                            return event.ctrlKey || event.metaKey
-                        }
-                    }
-                )
-            }
+            // Note: registerLinkMatcher is not available in current xterm.js version
+            // const urlRegex = /(https?:\/\/[^\s]+|file:\/\/[^\s]+)/g
+            // if (term.registerLinkMatcher) {
+            //     term.registerLinkMatcher(
+            //         urlRegex,
+            //         (event: MouseEvent, uri: string) => {
+            //             // Only open on Ctrl+click or Cmd+click
+            //             if (event.ctrlKey || event.metaKey) {
+            //                 console.log('[TERMINAL] Opening link:', uri)
+            //                 ipc.send('terminal:openLink', uri)
+            //             }
+            //         },
+            //         {
+            //             priority: 1,
+            //             willLinkActivate: (event: MouseEvent, uri: string) => {
+            //                 // Show link is clickable on Ctrl+hover
+            //                 return event.ctrlKey || event.metaKey
+            //             }
+            //         }
+            //     )
+            // }
 
             // Initial fit
             setTimeout(() => {

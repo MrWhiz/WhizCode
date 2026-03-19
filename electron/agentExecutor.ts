@@ -3,7 +3,8 @@
  * Orchestrates the planning and execution phases
  */
 
-import { WhizCodePlanner, WhizCodePlan, PlanningContext } from './whizCodePlanner';
+import { WhizCodePlanner } from './whizCodePlanner';
+import type { WhizCodePlan, PlanningContext } from './whizCodePlanner';
 
 export interface ExecutionPhase {
   phase: 'planning' | 'execution' | 'summary';

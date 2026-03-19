@@ -18542,6 +18542,154 @@ class CircularBuffer {
     return this.buffer.length >= this.maxSize;
   }
 }
+class DiagnosticsService {
+  cache = /* @__PURE__ */ new Map();
+  CACHE_TTL = 5e3;
+  // 5 seconds
+  /**
+   * Check a file for errors using lightweight checks
+   */
+  async checkFile(filePath, workspacePath) {
+    try {
+      const cached = this.cache.get(filePath);
+      if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
+        return cached.errors;
+      }
+      const ext = filePath.split(".").pop()?.toLowerCase();
+      let diagnostics = [];
+      const content = await fs.readFile(filePath, "utf-8");
+      if (ext === "json") {
+        diagnostics = this.checkJSON(filePath, content);
+      } else if (ext === "ts" || ext === "tsx" || ext === "js" || ext === "jsx") {
+        diagnostics = this.checkJavaScript(filePath, content);
+      }
+      this.cache.set(filePath, { errors: diagnostics, timestamp: Date.now() });
+      return diagnostics;
+    } catch (error) {
+      console.error(`[DIAGNOSTICS] Error checking file ${filePath}:`, error);
+      return [];
+    }
+  }
+  /**
+   * Check JavaScript/TypeScript file for basic syntax errors
+   */
+  checkJavaScript(filePath, content) {
+    const diagnostics = [];
+    const lines = content.split("\n");
+    try {
+      let braceCount = 0;
+      let bracketCount = 0;
+      let parenCount = 0;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        for (let j = 0; j < line.length; j++) {
+          const char = line[j];
+          const prevChar = j > 0 ? line[j - 1] : "";
+          if (char === '"' || char === "'" || char === "`") {
+            const stringChar = char;
+            j++;
+            while (j < line.length && line[j] !== stringChar && line[j - 1] !== "\\") {
+              j++;
+            }
+            continue;
+          }
+          if (char === "/" && line[j + 1] === "/") {
+            break;
+          }
+          if (char === "{") braceCount++;
+          if (char === "}") braceCount--;
+          if (char === "[") bracketCount++;
+          if (char === "]") bracketCount--;
+          if (char === "(") parenCount++;
+          if (char === ")") parenCount--;
+        }
+        if (braceCount < 0 || bracketCount < 0 || parenCount < 0) {
+          diagnostics.push({
+            file: filePath,
+            line: i + 1,
+            column: 1,
+            message: "Unmatched closing bracket",
+            severity: "error",
+            code: "syntax-error"
+          });
+          braceCount = Math.max(0, braceCount);
+          bracketCount = Math.max(0, bracketCount);
+          parenCount = Math.max(0, parenCount);
+        }
+      }
+      if (braceCount > 0) {
+        diagnostics.push({
+          file: filePath,
+          line: lines.length,
+          column: 1,
+          message: `Unclosed brace (${braceCount} remaining)`,
+          severity: "error",
+          code: "syntax-error"
+        });
+      }
+      if (bracketCount > 0) {
+        diagnostics.push({
+          file: filePath,
+          line: lines.length,
+          column: 1,
+          message: `Unclosed bracket (${bracketCount} remaining)`,
+          severity: "error",
+          code: "syntax-error"
+        });
+      }
+      if (parenCount > 0) {
+        diagnostics.push({
+          file: filePath,
+          line: lines.length,
+          column: 1,
+          message: `Unclosed parenthesis (${parenCount} remaining)`,
+          severity: "error",
+          code: "syntax-error"
+        });
+      }
+    } catch (error) {
+      console.warn(`[DIAGNOSTICS] JavaScript check failed:`, error);
+    }
+    return diagnostics;
+  }
+  /**
+   * Check JSON file
+   */
+  checkJSON(filePath, content) {
+    const diagnostics = [];
+    try {
+      JSON.parse(content);
+    } catch (error) {
+      const match = error.message.match(/position (\d+)/);
+      const position = match ? parseInt(match[1]) : 0;
+      const lines = content.substring(0, position).split("\n");
+      const line = lines.length;
+      const column = lines[lines.length - 1].length + 1;
+      diagnostics.push({
+        file: filePath,
+        line,
+        column,
+        message: error.message,
+        severity: "error",
+        code: "json-error"
+      });
+    }
+    return diagnostics;
+  }
+  /**
+   * Clear cache for a file
+   */
+  clearCache(filePath) {
+    this.cache.delete(filePath);
+  }
+  /**
+   * Clear all cache
+   */
+  clearAllCache() {
+    this.cache.clear();
+  }
+}
+const diagnosticsService = new DiagnosticsService();
 const _require = createRequire(import.meta.url);
 const pty = _require("node-pty");
 const execAsync = promisify$1(exec$1);
@@ -18841,16 +18989,27 @@ app.whenReady().then(createWindow);
 const SKIP_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", "dist", "dist-electron", ".next", "__pycache__", ".venv", "venv", ".cache", "coverage", ".idea", ".vscode", "build", "out", "bin", "obj"]);
 const BINARY_EXTS = /* @__PURE__ */ new Set([".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4", ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".dylib", ".lock", ".pdf", ".bin", ".pyc", ".node"]);
 async function isBinaryFile(filePath) {
-  const fd = await fs.open(filePath, "r");
   try {
-    const buffer = Buffer.alloc(1024);
-    const { bytesRead } = await fd.read(buffer, 0, 1024, 0);
-    for (let i = 0; i < bytesRead; i++) {
-      if (buffer[i] === 0) return true;
+    const fd = await Promise.race([
+      fs.open(filePath, "r"),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("File open timed out")), 2e3))
+    ]);
+    try {
+      const buffer = Buffer.alloc(1024);
+      const { bytesRead } = await Promise.race([
+        fd.read(buffer, 0, 1024, 0),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("File read timed out")), 2e3))
+      ]);
+      for (let i = 0; i < bytesRead; i++) {
+        if (buffer[i] === 0) return true;
+      }
+      return false;
+    } finally {
+      await fd.close();
     }
+  } catch (error) {
+    console.warn(`[BINARY_CHECK] Error checking if file is binary: ${error}`);
     return false;
-  } finally {
-    await fd.close();
   }
 }
 async function readDirectoryRecursive(dirPath, maxFiles = 2e3) {
@@ -19333,12 +19492,30 @@ Your goal is to build, debug, and maintain software by DIRECTLY using the tools 
 </tool_usage_guidelines>
 
 <output_format>
-All tool calls MUST be valid JSON on a single line.
-{"tool": "tool_name", "param1": "value1"}
+⚠️ CRITICAL - YOU MUST OUTPUT TOOL CALLS IN JSON FORMAT ONLY ⚠️
 
-⚠️ CRITICAL: Output the JSON tool call as plain text ONLY.
-- Do NOT wrap it in markdown code fences.
-- Do NOT add any text before or after the JSON.
+When you need to use a tool, output ONLY valid JSON on a single line. NO OTHER FORMAT IS ACCEPTED.
+
+CORRECT FORMAT:
+{"tool": "read_file", "path": "src/main.ts"}
+{"tool": "write_file", "path": "src/app.ts", "content": "..."}
+{"tool": "run_command", "command": "npm install"}
+
+WRONG FORMATS (DO NOT USE):
+❌ <read_file, path: "src/main.ts">
+❌ read_file(path: "src/main.ts")
+❌ \`\`\`json
+{"tool": "read_file"}
+\`\`\`
+❌ "Please read src/main.ts"
+
+RULES:
+- Output ONLY the JSON tool call, nothing else
+- Do NOT wrap in markdown code fences (no \`\`\`)
+- Do NOT add explanatory text before or after
+- Do NOT use angle brackets or function syntax
+- Each tool call must be valid JSON on a single line
+- If you need multiple tools, output each on a separate line as JSON
 </output_format>
 
 
@@ -19545,6 +19722,45 @@ function tryParseAllToolCalls(response) {
   if (!response) return [];
   const trimmed = response.trim();
   const toolCalls = [];
+  console.log(`[TOOL_PARSER_START] Input: "${trimmed}"`);
+  const angleBracketRegex = /<(\w+)(?:,\s*([^>]*))?>/g;
+  let match;
+  const toolWords = ["run_command", "command_status", "send_command_input", "write_file", "read_file", "replace_file_content", "multi_replace_file_content", "edit_file", "list_directory", "search_files", "delete_file", "grepSearch", "fileSearch", "readCode", "getDiagnostics", "semanticRename", "smartRelocate", "createSpec", "readSpec", "updateSpec", "listSpecs", "completeTask", "web_search", "webFetch", "mcp_call", "learn_fact", "replace_lines", "insert_code", "browser_subagent", "invokeSubAgent"];
+  console.log(`[TOOL_PARSER] Testing regex against: "${trimmed}"`);
+  const testMatch = angleBracketRegex.exec(trimmed);
+  console.log(`[TOOL_PARSER] Regex test result:`, testMatch);
+  angleBracketRegex.lastIndex = 0;
+  while ((match = angleBracketRegex.exec(trimmed)) !== null) {
+    console.log(`[TOOL_PARSER] Found match:`, match);
+    const toolName = match[1];
+    const paramsStr = match[2] || "";
+    console.log(`[TOOL_PARSER] Tool: ${toolName}, Params: "${paramsStr}"`);
+    if (toolWords.includes(toolName)) {
+      const toolCall = { tool: toolName };
+      const paramRegex = /(\w+):\s*"([^"]*)"/g;
+      let paramMatch;
+      while ((paramMatch = paramRegex.exec(paramsStr)) !== null) {
+        const paramName = paramMatch[1];
+        const paramValue = paramMatch[2];
+        console.log(`[TOOL_PARSER] Param: ${paramName} = ${paramValue}`);
+        toolCall[paramName] = paramValue;
+      }
+      console.log(`[TOOL_PARSER] Tool call object:`, toolCall);
+      if (Object.keys(toolCall).length > 1 || toolName === "list_directory") {
+        toolCalls.push(toolCall);
+        console.log(`[TOOL_PARSER] Added tool to calls`);
+      } else {
+        console.log(`[TOOL_PARSER] Skipped tool - not enough params`);
+      }
+    } else {
+      console.log(`[TOOL_PARSER] Tool "${toolName}" not in toolWords list`);
+    }
+  }
+  if (toolCalls.length > 0) {
+    console.log(`[TOOL_PARSER] Returning ${toolCalls.length} angle bracket tools`);
+    return toolCalls;
+  }
+  console.log(`[TOOL_PARSER] No angle bracket tools found, trying JSON parsing`);
   const findJsonBlocksDetailed = (text) => {
     const blocks2 = [];
     let start = -1;
@@ -19571,7 +19787,6 @@ function tryParseAllToolCalls(response) {
     return blocks2;
   };
   const blocks = findJsonBlocksDetailed(trimmed);
-  const toolWords = ["run_command", "command_status", "send_command_input", "write_file", "read_file", "replace_file_content", "multi_replace_file_content", "edit_file", "list_directory", "search_files", "delete_file", "grepSearch", "fileSearch", "readCode", "getDiagnostics", "semanticRename", "smartRelocate", "createSpec", "readSpec", "updateSpec", "listSpecs", "completeTask", "web_search", "webFetch", "mcp_call", "learn_fact", "replace_lines", "insert_code", "browser_subagent"];
   for (const blockData of blocks) {
     const block = blockData.text;
     try {
@@ -19737,25 +19952,37 @@ async function executeToolCall(toolData, workspacePath, iteration, isAutopilotMo
   try {
     switch (toolData.tool) {
       case "read_file": {
+        console.log(`[READ_FILE] Starting read_file for: ${toolData.path}`);
         if (!toolData.path) return { result: '❌ Error: Tool "read_file" requires a "path" parameter.' };
         try {
+          console.log(`[READ_FILE] Checking file access for: ${resolvedPath}`);
           try {
-            await fs.access(resolvedPath);
-          } catch {
-            return { result: `❌ Error: File not found: ${toolData.path}
+            await Promise.race([
+              fs.access(resolvedPath),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("File access check timed out")), 2e3))
+            ]);
+            console.log(`[READ_FILE] File access check passed`);
+          } catch (error) {
+            console.log(`[READ_FILE] File access check failed: ${error}`);
+            return { result: `❌ Error: File not found or inaccessible: ${toolData.path}
 
 Resolved path: ${resolvedPath}
 
 Use 'list_directory' to check available files.` };
           }
+          console.log(`[READ_FILE] Checking if binary`);
           const isBinary = await isBinaryFile(resolvedPath);
           if (isBinary) {
+            console.log(`[READ_FILE] File is binary`);
             return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
           }
+          console.log(`[READ_FILE] Reading file content`);
           const content = await fs.readFile(resolvedPath, "utf-8");
           const lines = content.split("\n");
+          console.log(`[READ_FILE] Successfully read ${lines.length} lines`);
           return { result: lines.map((line, i) => `${i + 1}: ${line}`).join("\n") };
         } catch (error) {
+          console.log(`[READ_FILE] Error: ${error}`);
           return { result: `❌ Error reading file ${toolData.path}: ${error instanceof Error ? error.message : String(error)}` };
         }
       }
@@ -20881,10 +21108,15 @@ async function runAgentLoop(userMessage, model, config, workspacePath, activeCon
   let adaptiveBehavior = [];
   if (strategicPlanner && workspacePath) {
     try {
-      console.log("[STRATEGIC PLANNING] Creating execution plan...");
+      win?.webContents.send("agent:step", { tool: "planning", status: "running", summary: "Analyzing workspace and creating execution plan..." });
+      console.log("[STRATEGIC_PLANNING_START] Creating execution plan...");
+      const planStartTime = Date.now();
       let projectAnalysis = "";
       if (codeIntelligence) {
+        win?.webContents.send("agent:step", { tool: "planning", status: "running", summary: "Analyzing code structure..." });
+        const semanticStartTime = Date.now();
         const semanticContext = await codeIntelligence.analyzeWorkspace(workspacePath);
+        console.log(`[SEMANTIC_ANALYSIS] Took ${Date.now() - semanticStartTime}ms`);
         projectAnalysis = `Project Type: ${semanticContext.metrics ? "Analyzed" : "Unknown"}
 `;
         if (semanticContext.suggestions.length > 0) {
@@ -20893,6 +21125,7 @@ ${semanticContext.suggestions.slice(0, 3).join("\n")}
 `;
         }
       }
+      win?.webContents.send("agent:step", { tool: "planning", status: "running", summary: "Detecting project type and codebase size..." });
       const planningContext = {
         userRequest: userMessage,
         workspacePath,
@@ -20902,15 +21135,20 @@ ${semanticContext.suggestions.slice(0, 3).join("\n")}
         previousPlans: strategicPlanner.getPlanHistory().slice(-3)
         // Last 3 plans for context
       };
+      win?.webContents.send("agent:step", { tool: "planning", status: "running", summary: "Creating execution plan..." });
       executionPlan = await strategicPlanner.createExecutionPlan(planningContext);
+      console.log(`[STRATEGIC_PLANNING_END] Took ${Date.now() - planStartTime}ms`);
       console.log(`[STRATEGIC PLANNING] Created plan with ${executionPlan.tasks.length} tasks, ${executionPlan.parallelGroups.length} execution groups`);
       console.log(`[STRATEGIC PLANNING] Estimated duration: ${executionPlan.estimatedDuration}, Risk level: ${executionPlan.riskLevel}`);
       if (learningSystem) {
+        win?.webContents.send("agent:step", { tool: "planning", status: "running", summary: "Adapting behavior based on past experience..." });
+        const adaptiveStartTime = Date.now();
         adaptiveBehavior = await learningSystem.adaptBehavior({
           workspacePath,
           userMessage,
           executionPlan
         });
+        console.log(`[ADAPTIVE_BEHAVIOR] Took ${Date.now() - adaptiveStartTime}ms`);
         if (adaptiveBehavior.length > 0) {
           console.log(`[ADAPTIVE BEHAVIOR] Applied ${adaptiveBehavior.length} behavioral adaptations`);
         }
@@ -20937,8 +21175,11 @@ ${semanticContext.suggestions.slice(0, 3).join("\n")}
   let learningRecommendations = [];
   if (learningSystem && workspacePath) {
     try {
+      win?.webContents.send("agent:step", { tool: "learning", status: "running", summary: "Generating recommendations from past experience..." });
+      const learningStartTime = Date.now();
       const taskType = classifyUserRequest(userMessage);
       learningRecommendations = await learningSystem.generateRecommendations(taskType, { workspacePath, userMessage });
+      console.log(`[LEARNING_SYSTEM] Took ${Date.now() - learningStartTime}ms`);
       if (learningRecommendations.length > 0) {
         console.log(`[LEARNING SYSTEM] Generated ${learningRecommendations.length} recommendations based on past experience`);
       }
@@ -21204,9 +21445,13 @@ ${lastLines}
       agentAbortController?.signal,
       config.temperature || 0.1
     );
+    console.log(`[AI_RESPONSE] Length: ${aiResponse.length}, First 200 chars: ${aiResponse.substring(0, 200)}`);
+    console.log(`[TOOL_PARSER_CALL] About to call tryParseAllToolCalls`);
     const toolCalls = tryParseAllToolCalls(aiResponse);
+    console.log(`[TOOL_CALLS] Parsed ${toolCalls.length} tool calls`);
     if (toolCalls.length === 0) {
       if (aiResponse.includes("<THOUGHT>") && aiResponse.length < 500 && !aiResponse.includes("```")) {
+        console.log("[THINKING] Agent is thinking, not acting yet");
         consecutiveThinkingCount++;
         if (consecutiveThinkingCount >= 2) {
           console.log("[NUDGE] Agent thinking too much, pushing to action...");
@@ -21224,6 +21469,7 @@ ${lastLines}
       const isTalkingInsteadOfActing = hasCodeBlock && !aiResponse.includes('"tool"') || hasInstructionalPhrases;
       const looksLikeCompletion = aiResponse.toUpperCase().includes("TASK COMPLETE") || aiResponse.length < 300 && iteration > 1;
       const containsJsonButFailed = aiResponse.includes("{") && (aiResponse.includes('"tool"') || aiResponse.includes('"tool_calls"'));
+      console.log(`[NO_TOOLS] hasCodeBlock=${hasCodeBlock}, hasInstructionalPhrases=${hasInstructionalPhrases}, isTalkingInsteadOfActing=${isTalkingInsteadOfActing}, looksLikeCompletion=${looksLikeCompletion}, containsJsonButFailed=${containsJsonButFailed}`);
       if (containsJsonButFailed) {
         console.log("[NUDGE] AI intent was clear (found JSON keywords) but all tool call parsing attempts failed.");
         currentMessages.push({ role: "assistant", content: aiResponse });
@@ -21236,6 +21482,7 @@ ${lastLines}
         currentMessages.push({ role: "user", content: "ACTION REQUIRED: Do NOT explain or provide manual steps. You are an autonomous agent. Use your tools (write_file, edit_file, run_command) to execute the solution directly. Output a JSON tool call NOW." });
         continue;
       }
+      console.log("[FINAL_RESPONSE] No tools parsed, treating as final response");
       conversationHistory.push({ role: "assistant", content: aiResponse });
       if (currentHistoryManager) {
         const title = conversationHistory.find((m) => m.role === "user")?.content.substring(0, 40) || "Untitled Chat";
@@ -21304,7 +21551,7 @@ ${lastLines}
               try {
                 const suggestions = await Promise.race([
                   codeIntelligence.suggestRefactoring(workspacePath, toolCall.path),
-                  new Promise((resolve2) => setTimeout(() => resolve2([]), 3e3))
+                  new Promise((resolve2) => setTimeout(() => resolve2([]), 5e3))
                 ]);
                 if (suggestions.length > 0) {
                   enhancedResult += `
@@ -21327,7 +21574,7 @@ ${enhancedResult}`);
           if (learningSystem && contextMemory) {
             try {
               const toolSuccess = !enhancedResult.toLowerCase().includes("error:") && !enhancedResult.toLowerCase().includes("failed") && !execution.abort;
-              await Promise.race([
+              Promise.race([
                 recordInteractionForLearning(
                   userMessage,
                   enhancedResult,
@@ -21341,8 +21588,10 @@ ${enhancedResult}`);
                     executionPlan: executionPlan?.id
                   }
                 ),
-                new Promise((_, reject) => setTimeout(() => reject(new Error("Learning recording timed out")), 5e3))
-              ]);
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Learning recording timed out")), 1e4))
+              ]).catch((error) => {
+                console.warn("[LEARNING] Failed to record tool execution:", error);
+              });
               if (executionPlan && strategicPlanner) {
                 const currentTask = executionPlan.tasks[currentTaskIndex];
                 if (currentTask && toolSuccess) {
@@ -21355,7 +21604,7 @@ ${enhancedResult}`);
                 }
               }
             } catch (error) {
-              console.warn("[LEARNING] Failed to record tool execution:", error);
+              console.warn("[LEARNING] Failed to update strategic planning:", error);
             }
           }
           if (enhancedResult.toLowerCase().includes("error:") || enhancedResult.toLowerCase().includes("failed")) {
@@ -21614,10 +21863,32 @@ ipcMain.handle("fs:writeFile", async (_event, filePath, content) => {
   try {
     await fs.writeFile(filePath, content, "utf-8");
     win?.webContents.send("file:changed", { path: filePath, content });
+    diagnosticsService.clearCache(filePath);
     return true;
   } catch (e) {
     console.error(e);
     return false;
+  }
+});
+ipcMain.handle("diagnostics:check", async (_event, filePath, workspacePath) => {
+  try {
+    const diagnostics = await diagnosticsService.checkFile(filePath, workspacePath);
+    return diagnostics;
+  } catch (error) {
+    console.error("[DIAGNOSTICS] Error checking file:", error);
+    return [];
+  }
+});
+ipcMain.handle("diagnostics:checkMultiple", async (_event, filePaths, workspacePath) => {
+  try {
+    const results = {};
+    for (const filePath of filePaths) {
+      results[filePath] = await diagnosticsService.checkFile(filePath, workspacePath);
+    }
+    return results;
+  } catch (error) {
+    console.error("[DIAGNOSTICS] Error checking files:", error);
+    return {};
   }
 });
 ipcMain.handle("specs:list", async () => {
@@ -21802,6 +22073,7 @@ ipcMain.handle("fs:readDirectoryRecursive", async (_event, dirPath) => {
   }
 });
 ipcMain.handle("execute-agent-task", async (_event, { task, model, workspacePath, activeFile, config, isAutopilotMode }) => {
+  console.log(`[AGENT_TASK] Starting agent task: "${task.substring(0, 50)}..."`);
   if (!workspacePath) {
     return {
       response: "I'm ready to help, but I need you to open a folder first so I have a place to work. Please use the 'Open Folder' button in the Title Bar or File menu.",
@@ -21834,7 +22106,9 @@ ipcMain.handle("execute-agent-task", async (_event, { task, model, workspacePath
       refreshManifest(workspacePath).catch(() => {
       });
     }
+    console.log(`[AGENT_TASK] Running agent loop...`);
     const result = await runAgentLoop(task, model, config, workspacePath, activeFile, isAutopilotMode);
+    console.log(`[AGENT_TASK] Agent loop completed, returning result`);
     return {
       response: result.finalResponse,
       steps: result.steps

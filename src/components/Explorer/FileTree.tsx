@@ -7,14 +7,15 @@ interface ContextMenu {
     entry: FileEntry
 }
 
-const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu, collapseAll = false, fileFilter = '' }: { 
+const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu, collapseAll = false, fileFilter = '', fileErrors = {} }: { 
     entry: FileEntry, 
     level?: number, 
     onFileOpen: (path: string, name: string) => void, 
     refreshKey: number,
     onContextMenu: (e: React.MouseEvent, entry: FileEntry) => void,
     collapseAll?: boolean,
-    fileFilter?: string
+    fileFilter?: string,
+    fileErrors?: Record<string, number>
 }) => {
     const [expanded, setExpanded] = useState(false)
     const [children, setChildren] = useState<FileEntry[]>([])
@@ -98,14 +99,29 @@ const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu,
                         <polyline points="9 18 15 12 9 6"></polyline>
                     </svg>
                 )}
-                <span className="explorer-item-name">{entry.name}</span>
+                <span className="explorer-item-name" style={fileErrors[entry.path] && fileErrors[entry.path] > 0 ? { color: '#f48771' } : {}}>
+                    {entry.name}
+                </span>
+                {!entry.isDirectory && fileErrors[entry.path] && fileErrors[entry.path] > 0 && (
+                    <span style={{ 
+                        marginLeft: '6px', 
+                        padding: '2px 6px', 
+                        backgroundColor: '#f48771', 
+                        color: '#fff', 
+                        borderRadius: '3px', 
+                        fontSize: '10px',
+                        fontWeight: 'bold'
+                    }}>
+                        {fileErrors[entry.path]}
+                    </span>
+                )}
             </div>
             {expanded && entry.isDirectory && (
                 <div className="explorer-children">
                     {children
                         .filter(child => !fileFilter || child.name.toLowerCase().includes(fileFilter.toLowerCase()))
                         .map((child) => (
-                        <FileTreeItem key={child.path} entry={child} level={level + 1} onFileOpen={onFileOpen} refreshKey={refreshKey} onContextMenu={onContextMenu} collapseAll={collapseAll} fileFilter={fileFilter} />
+                        <FileTreeItem key={child.path} entry={child} level={level + 1} onFileOpen={onFileOpen} refreshKey={refreshKey} onContextMenu={onContextMenu} collapseAll={collapseAll} fileFilter={fileFilter} fileErrors={fileErrors} />
                     ))}
                 </div>
             )}
@@ -120,7 +136,8 @@ export const FileTree = ({
     onFileRenamed,
     refreshKey: externalRefreshKey = 0,
     collapseAll = false,
-    fileFilter = ''
+    fileFilter = '',
+    fileErrors = {}
 }: { 
     path: string, 
     onFileOpen: (path: string, name: string) => void,
@@ -128,7 +145,8 @@ export const FileTree = ({
     onFileRenamed?: (oldPath: string, newPath: string) => void,
     refreshKey?: number,
     collapseAll?: boolean,
-    fileFilter?: string
+    fileFilter?: string,
+    fileErrors?: Record<string, number>
 }) => {
     const [files, setFiles] = useState<FileEntry[]>([])
     const [refreshKey, setRefreshKey] = useState(0)
@@ -199,21 +217,21 @@ export const FileTree = ({
                 case 'newFile':
                     setNewItemDialog({ 
                         type: 'file', 
-                        parentPath: entry.isDirectory ? entry.path : entry.path.substring(0, entry.path.lastIndexOf(/[/\\]/))
+                        parentPath: entry.isDirectory ? entry.path : entry.path.substring(0, Math.max(entry.path.lastIndexOf('/'), entry.path.lastIndexOf('\\')))
                     })
                     break
 
                 case 'newFolder':
                     setNewItemDialog({ 
                         type: 'folder', 
-                        parentPath: entry.isDirectory ? entry.path : entry.path.substring(0, entry.path.lastIndexOf(/[/\\]/))
+                        parentPath: entry.isDirectory ? entry.path : entry.path.substring(0, Math.max(entry.path.lastIndexOf('/'), entry.path.lastIndexOf('\\')))
                     })
                     break
 
                 case 'rename':
                     const newName = prompt('Enter new name:', entry.name)
                     if (newName && newName !== entry.name && newName.trim()) {
-                        const parentPath = entry.path.substring(0, entry.path.lastIndexOf(/[/\\]/))
+                        const parentPath = entry.path.substring(0, Math.max(entry.path.lastIndexOf('/'), entry.path.lastIndexOf('\\')))
                         const newPath = parentPath + (parentPath.endsWith('/') || parentPath.endsWith('\\') ? '' : '/') + newName.trim()
                         await ipc.invoke('fs:rename', entry.path, newPath)
                         onFileRenamed?.(entry.path, newPath)
@@ -247,7 +265,7 @@ export const FileTree = ({
                     break
 
                 case 'openInTerminal':
-                    const terminalPath = entry.isDirectory ? entry.path : entry.path.substring(0, entry.path.lastIndexOf(/[/\\]/))
+                    const terminalPath = entry.isDirectory ? entry.path : entry.path.substring(0, Math.max(entry.path.lastIndexOf('/'), entry.path.lastIndexOf('\\')))
                     await ipc.invoke('terminal:openAt', terminalPath)
                     break
             }
@@ -310,6 +328,7 @@ export const FileTree = ({
                     onContextMenu={handleContextMenu}
                     collapseAll={collapseAll}
                     fileFilter={fileFilter}
+                    fileErrors={fileErrors}
                 />
             ))}
             

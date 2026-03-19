@@ -241,6 +241,7 @@ let currentConversationId: string = Date.now().toString();
 
 // Import timeout utilities
 import { CircularBuffer } from './timeoutUtils';
+import { diagnosticsService } from './diagnosticsService';
 
 // Rolling buffer of PTY terminal output — fed into agent context on each request
 // Using CircularBuffer to prevent unbounded memory growth (max 10000 lines)
@@ -417,16 +418,28 @@ const BINARY_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '
  * Checks if a file is likely binary by reading a small chunk and looking for NULL bytes
  */
 async function isBinaryFile(filePath: string): Promise<boolean> {
-  const fd = await fs.open(filePath, 'r');
   try {
-    const buffer = Buffer.alloc(1024);
-    const { bytesRead } = await fd.read(buffer, 0, 1024, 0);
-    for (let i = 0; i < bytesRead; i++) {
-      if (buffer[i] === 0) return true; // NULL byte found
+    const fd = await Promise.race([
+      fs.open(filePath, 'r'),
+      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('File open timed out')), 2000))
+    ]);
+    try {
+      const buffer = Buffer.alloc(1024);
+      const { bytesRead } = await Promise.race([
+        fd.read(buffer, 0, 1024, 0),
+        new Promise<any>((_, reject) => setTimeout(() => reject(new Error('File read timed out')), 2000))
+      ]);
+      for (let i = 0; i < bytesRead; i++) {
+        if (buffer[i] === 0) return true; // NULL byte found
+      }
+      return false;
+    } finally {
+      await fd.close();
     }
+  } catch (error) {
+    console.warn(`[BINARY_CHECK] Error checking if file is binary: ${error}`);
+    // If we can't determine, assume it's not binary to allow reading
     return false;
-  } finally {
-    await fd.close();
   }
 }
 
@@ -991,12 +1004,30 @@ Your goal is to build, debug, and maintain software by DIRECTLY using the tools 
 </tool_usage_guidelines>
 
 <output_format>
-All tool calls MUST be valid JSON on a single line.
-{"tool": "tool_name", "param1": "value1"}
+⚠️ CRITICAL - YOU MUST OUTPUT TOOL CALLS IN JSON FORMAT ONLY ⚠️
 
-⚠️ CRITICAL: Output the JSON tool call as plain text ONLY.
-- Do NOT wrap it in markdown code fences.
-- Do NOT add any text before or after the JSON.
+When you need to use a tool, output ONLY valid JSON on a single line. NO OTHER FORMAT IS ACCEPTED.
+
+CORRECT FORMAT:
+{"tool": "read_file", "path": "src/main.ts"}
+{"tool": "write_file", "path": "src/app.ts", "content": "..."}
+{"tool": "run_command", "command": "npm install"}
+
+WRONG FORMATS (DO NOT USE):
+❌ <read_file, path: "src/main.ts">
+❌ read_file(path: "src/main.ts")
+❌ \`\`\`json
+{"tool": "read_file"}
+\`\`\`
+❌ "Please read src/main.ts"
+
+RULES:
+- Output ONLY the JSON tool call, nothing else
+- Do NOT wrap in markdown code fences (no \`\`\`)
+- Do NOT add explanatory text before or after
+- Do NOT use angle brackets or function syntax
+- Each tool call must be valid JSON on a single line
+- If you need multiple tools, output each on a separate line as JSON
 </output_format>
 
 
@@ -1233,6 +1264,59 @@ function tryParseAllToolCalls(response: string): any[] {
   const trimmed = response.trim();
   const toolCalls: any[] = [];
 
+  console.log(`[TOOL_PARSER_START] Input: "${trimmed}"`);
+
+  // Parse angle bracket format: <tool_name, param: "value"> or <tool_name,param: "value">
+  const angleBracketRegex = /<(\w+)(?:,\s*([^>]*))?>/g;
+  let match;
+  const toolWords = ['run_command', 'command_status', 'send_command_input', 'write_file', 'read_file', 'replace_file_content', 'multi_replace_file_content', 'edit_file', 'list_directory', 'search_files', 'delete_file', 'grepSearch', 'fileSearch', 'readCode', 'getDiagnostics', 'semanticRename', 'smartRelocate', 'createSpec', 'readSpec', 'updateSpec', 'listSpecs', 'completeTask', 'web_search', 'webFetch', 'mcp_call', 'learn_fact', 'replace_lines', 'insert_code', 'browser_subagent', 'invokeSubAgent'];
+
+  console.log(`[TOOL_PARSER] Testing regex against: "${trimmed}"`);
+  const testMatch = angleBracketRegex.exec(trimmed);
+  console.log(`[TOOL_PARSER] Regex test result:`, testMatch);
+  
+  // Reset regex for actual parsing
+  angleBracketRegex.lastIndex = 0;
+  
+  while ((match = angleBracketRegex.exec(trimmed)) !== null) {
+    console.log(`[TOOL_PARSER] Found match:`, match);
+    const toolName = match[1];
+    const paramsStr = match[2] || '';
+    console.log(`[TOOL_PARSER] Tool: ${toolName}, Params: "${paramsStr}"`);
+
+    if (toolWords.includes(toolName)) {
+      const toolCall: any = { tool: toolName };
+
+      // Parse parameters: path: "value", command: "value", etc.
+      const paramRegex = /(\w+):\s*"([^"]*)"/g;
+      let paramMatch;
+      while ((paramMatch = paramRegex.exec(paramsStr)) !== null) {
+        const paramName = paramMatch[1];
+        const paramValue = paramMatch[2];
+        console.log(`[TOOL_PARSER] Param: ${paramName} = ${paramValue}`);
+        toolCall[paramName] = paramValue;
+      }
+
+      console.log(`[TOOL_PARSER] Tool call object:`, toolCall);
+      if (Object.keys(toolCall).length > 1 || toolName === 'list_directory') {
+        toolCalls.push(toolCall);
+        console.log(`[TOOL_PARSER] Added tool to calls`);
+      } else {
+        console.log(`[TOOL_PARSER] Skipped tool - not enough params`);
+      }
+    } else {
+      console.log(`[TOOL_PARSER] Tool "${toolName}" not in toolWords list`);
+    }
+  }
+
+  // If angle bracket format found tools, return them
+  if (toolCalls.length > 0) {
+    console.log(`[TOOL_PARSER] Returning ${toolCalls.length} angle bracket tools`);
+    return toolCalls;
+  }
+
+  console.log(`[TOOL_PARSER] No angle bracket tools found, trying JSON parsing`);
+
   const findJsonBlocksDetailed = (text: string) => {
     const blocks: { text: string; start: number; end: number }[] = [];
     let start = -1;
@@ -1261,7 +1345,6 @@ function tryParseAllToolCalls(response: string): any[] {
   };
 
   const blocks = findJsonBlocksDetailed(trimmed);
-  const toolWords = ['run_command', 'command_status', 'send_command_input', 'write_file', 'read_file', 'replace_file_content', 'multi_replace_file_content', 'edit_file', 'list_directory', 'search_files', 'delete_file', 'grepSearch', 'fileSearch', 'readCode', 'getDiagnostics', 'semanticRename', 'smartRelocate', 'createSpec', 'readSpec', 'updateSpec', 'listSpecs', 'completeTask', 'web_search', 'webFetch', 'mcp_call', 'learn_fact', 'replace_lines', 'insert_code', 'browser_subagent'];
 
   for (const blockData of blocks) {
     const block = blockData.text;
@@ -1271,7 +1354,7 @@ function tryParseAllToolCalls(response: string): any[] {
           const p = JSON.parse(text);
           // Standard JSON format single tool
           if (p.tool) return p;
-          
+
           // Format from some OpenAI proxies
           if (p.tool_calls && Array.isArray(p.tool_calls)) {
              const validTools = p.tool_calls.filter((t: any) => t.tool);
@@ -1282,10 +1365,10 @@ function tryParseAllToolCalls(response: string): any[] {
              const validTools = p.filter((t: any) => t.tool);
              if (validTools.length > 0) return validTools;
           }
-          
+
           // DeepSeek Fallback: the tool name is in the text context immediately before the block
           const contextText = response.substring(Math.max(0, blockData.start - 120), blockData.start);
-          
+
           // Pattern: < | tool_sep | > tool_name
           const dsMatch = contextText.match(/tool_sep\s*[\|>]\s*>\s*(\w+)/) || contextText.match(/<\|tool_sep\|>\s*(\w+)/);
           if (dsMatch && toolWords.includes(dsMatch[1])) {
@@ -1321,7 +1404,7 @@ function tryParseAllToolCalls(response: string): any[] {
 
       // 2. Proactive JSON Fixer (Ultimate fix for smaller models/Ollama)
       let currentTry = block;
-      
+
       // Fix unescaped quotes in known params
       currentTry = currentTry.replace(/"(content|command|search|replace|path|cwd|reasoning|template)"\s*:\s*"([\s\S]*?)"(?=\s*[,}\]])/g, (_, key, val) => {
         const escapedVal = val.replace(/(?<!\\)"/g, '\\"');
@@ -1333,7 +1416,7 @@ function tryParseAllToolCalls(response: string): any[] {
           const escapedVal = val.replace(/\\(?![\\\/bfnrtu"'])/g, '\\\\');
           return `"${key}": "${escapedVal}"`;
       });
-      
+
       // Clear out illegal control characters inside strings
       currentTry = currentTry.replace(/[\x00-\x1F\x7F-\x9F]/g, " ");
 
@@ -1370,6 +1453,7 @@ function tryParseAllToolCalls(response: string): any[] {
 
   return toolCalls;
 }
+
 
 // Deprecated — use tryParseAllToolCalls
 function tryParseToolCall(response: string): any | null {
@@ -1476,25 +1560,37 @@ async function executeToolCall(toolData: any, workspacePath: string | null, iter
   try {
     switch (toolData.tool) {
       case 'read_file': {
+        console.log(`[READ_FILE] Starting read_file for: ${toolData.path}`);
         if (!toolData.path) return { result: '❌ Error: Tool "read_file" requires a "path" parameter.' };
         
         try {
-          // Check if file exists first
+          console.log(`[READ_FILE] Checking file access for: ${resolvedPath}`);
+          // Check if file exists first (with timeout)
           try {
-            await fs.access(resolvedPath);
-          } catch {
-            return { result: `❌ Error: File not found: ${toolData.path}\n\nResolved path: ${resolvedPath}\n\nUse 'list_directory' to check available files.` };
+            await Promise.race([
+              fs.access(resolvedPath),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('File access check timed out')), 2000))
+            ]);
+            console.log(`[READ_FILE] File access check passed`);
+          } catch (error) {
+            console.log(`[READ_FILE] File access check failed: ${error}`);
+            return { result: `❌ Error: File not found or inaccessible: ${toolData.path}\n\nResolved path: ${resolvedPath}\n\nUse 'list_directory' to check available files.` };
           }
           
+          console.log(`[READ_FILE] Checking if binary`);
           const isBinary = await isBinaryFile(resolvedPath);
           if (isBinary) {
+            console.log(`[READ_FILE] File is binary`);
             return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
           }
+          console.log(`[READ_FILE] Reading file content`);
           const content = await fs.readFile(resolvedPath, 'utf-8');
           const lines = content.split('\n');
+          console.log(`[READ_FILE] Successfully read ${lines.length} lines`);
           // Add line numbers for context
           return { result: lines.map((line, i) => `${i + 1}: ${line}`).join('\n') };
         } catch (error) {
+          console.log(`[READ_FILE] Error: ${error}`);
           return { result: `❌ Error reading file ${toolData.path}: ${error instanceof Error ? error.message : String(error)}` };
         }
       }
@@ -2784,18 +2880,24 @@ async function runAgentLoop(
   
   if (strategicPlanner && workspacePath) {
     try {
-      console.log('[STRATEGIC PLANNING] Creating execution plan...');
+      win?.webContents.send('agent:step', { tool: 'planning', status: 'running', summary: 'Analyzing workspace and creating execution plan...' });
+      console.log('[STRATEGIC_PLANNING_START] Creating execution plan...');
+      const planStartTime = Date.now();
       
       // Analyze project context for better planning
       let projectAnalysis = '';
       if (codeIntelligence) {
+        win?.webContents.send('agent:step', { tool: 'planning', status: 'running', summary: 'Analyzing code structure...' });
+        const semanticStartTime = Date.now();
         const semanticContext = await codeIntelligence.analyzeWorkspace(workspacePath);
+        console.log(`[SEMANTIC_ANALYSIS] Took ${Date.now() - semanticStartTime}ms`);
         projectAnalysis = `Project Type: ${semanticContext.metrics ? 'Analyzed' : 'Unknown'}\n`;
         if (semanticContext.suggestions.length > 0) {
           projectAnalysis += `Code Intelligence Suggestions:\n${semanticContext.suggestions.slice(0, 3).join('\n')}\n`;
         }
       }
       
+      win?.webContents.send('agent:step', { tool: 'planning', status: 'running', summary: 'Detecting project type and codebase size...' });
       const planningContext: PlanningContext = {
         userRequest: userMessage,
         workspacePath,
@@ -2805,18 +2907,23 @@ async function runAgentLoop(
         previousPlans: strategicPlanner.getPlanHistory().slice(-3) // Last 3 plans for context
       };
       
+      win?.webContents.send('agent:step', { tool: 'planning', status: 'running', summary: 'Creating execution plan...' });
       executionPlan = await strategicPlanner.createExecutionPlan(planningContext);
+      console.log(`[STRATEGIC_PLANNING_END] Took ${Date.now() - planStartTime}ms`);
       
       console.log(`[STRATEGIC PLANNING] Created plan with ${executionPlan.tasks.length} tasks, ${executionPlan.parallelGroups.length} execution groups`);
       console.log(`[STRATEGIC PLANNING] Estimated duration: ${executionPlan.estimatedDuration}, Risk level: ${executionPlan.riskLevel}`);
       
       // Get adaptive behavior recommendations from learning system
       if (learningSystem) {
+        win?.webContents.send('agent:step', { tool: 'planning', status: 'running', summary: 'Adapting behavior based on past experience...' });
+        const adaptiveStartTime = Date.now();
         adaptiveBehavior = await learningSystem.adaptBehavior({ 
           workspacePath, 
           userMessage, 
           executionPlan 
         });
+        console.log(`[ADAPTIVE_BEHAVIOR] Took ${Date.now() - adaptiveStartTime}ms`);
         if (adaptiveBehavior.length > 0) {
           console.log(`[ADAPTIVE BEHAVIOR] Applied ${adaptiveBehavior.length} behavioral adaptations`);
         }
@@ -2849,8 +2956,11 @@ async function runAgentLoop(
   let learningRecommendations: string[] = [];
   if (learningSystem && workspacePath) {
     try {
+      win?.webContents.send('agent:step', { tool: 'learning', status: 'running', summary: 'Generating recommendations from past experience...' });
+      const learningStartTime = Date.now();
       const taskType = classifyUserRequest(userMessage);
       learningRecommendations = await learningSystem.generateRecommendations(taskType, { workspacePath, userMessage });
+      console.log(`[LEARNING_SYSTEM] Took ${Date.now() - learningStartTime}ms`);
       
       if (learningRecommendations.length > 0) {
         console.log(`[LEARNING SYSTEM] Generated ${learningRecommendations.length} recommendations based on past experience`);
@@ -3125,11 +3235,15 @@ async function runAgentLoop(
       agentAbortController?.signal,
       config.temperature || 0.1
     );
+    console.log(`[AI_RESPONSE] Length: ${aiResponse.length}, First 200 chars: ${aiResponse.substring(0, 200)}`);
+    console.log(`[TOOL_PARSER_CALL] About to call tryParseAllToolCalls`);
     const toolCalls = tryParseAllToolCalls(aiResponse);
+    console.log(`[TOOL_CALLS] Parsed ${toolCalls.length} tool calls`);
 
     if (toolCalls.length === 0) {
       // Check if this is just thinking/reasoning without action
       if (aiResponse.includes('<THOUGHT>') && aiResponse.length < 500 && !aiResponse.includes('```')) {
+        console.log("[THINKING] Agent is thinking, not acting yet");
         consecutiveThinkingCount++;
         if (consecutiveThinkingCount >= 2) {
           // Agent is stuck in thinking loop, push it to act
@@ -3161,6 +3275,8 @@ async function runAgentLoop(
       const looksLikeCompletion = aiResponse.toUpperCase().includes('TASK COMPLETE') || (aiResponse.length < 300 && iteration > 1);
       const containsJsonButFailed = (aiResponse.includes('{') && (aiResponse.includes('"tool"') || aiResponse.includes('"tool_calls"')));
 
+      console.log(`[NO_TOOLS] hasCodeBlock=${hasCodeBlock}, hasInstructionalPhrases=${hasInstructionalPhrases}, isTalkingInsteadOfActing=${isTalkingInsteadOfActing}, looksLikeCompletion=${looksLikeCompletion}, containsJsonButFailed=${containsJsonButFailed}`);
+
       // Nudge if talking instead of acting OR if JSON parsing failed but intent was clear
       if (containsJsonButFailed) {
         console.log("[NUDGE] AI intent was clear (found JSON keywords) but all tool call parsing attempts failed.");
@@ -3177,6 +3293,7 @@ async function runAgentLoop(
       }
 
       // This is the final response
+      console.log("[FINAL_RESPONSE] No tools parsed, treating as final response");
       conversationHistory.push({ role: 'assistant', content: aiResponse });
       
       // Save to chat history
@@ -3276,7 +3393,7 @@ async function runAgentLoop(
               try {
                 const suggestions = await Promise.race([
                   codeIntelligence.suggestRefactoring(workspacePath, toolCall.path),
-                  new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 3000))
+                  new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 5000))
                 ]);
                 if (suggestions.length > 0) {
                   enhancedResult += `\n\n[CODE INTELLIGENCE] Suggestions:\n${suggestions.slice(0, 2).join('\n')}`;
@@ -3295,15 +3412,15 @@ async function runAgentLoop(
 
           turnResults.push(`[${toolName} Result]\n${enhancedResult}`);
           
-          // Record learning from tool execution (with timeout)
+          // Record learning from tool execution (non-blocking with timeout)
           if (learningSystem && contextMemory) {
             try {
               const toolSuccess = !enhancedResult.toLowerCase().includes('error:') && 
                                 !enhancedResult.toLowerCase().includes('failed') && 
                                 !execution.abort;
               
-              // Wrap learning recording with timeout to prevent hanging
-              await Promise.race([
+              // Fire and forget with timeout - don't block agent loop
+              Promise.race([
                 recordInteractionForLearning(
                   userMessage,
                   enhancedResult,
@@ -3317,8 +3434,10 @@ async function runAgentLoop(
                     executionPlan: executionPlan?.id 
                   }
                 ),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('Learning recording timed out')), 5000))
-              ]);
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Learning recording timed out')), 10000))
+              ]).catch(error => {
+                console.warn('[LEARNING] Failed to record tool execution:', error);
+              });
               
               // Update strategic planning based on results
               if (executionPlan && strategicPlanner) {
@@ -3335,7 +3454,7 @@ async function runAgentLoop(
                 }
               }
             } catch (error) {
-              console.warn('[LEARNING] Failed to record tool execution:', error);
+              console.warn('[LEARNING] Failed to update strategic planning:', error);
             }
           }
           
@@ -3602,10 +3721,36 @@ ipcMain.handle('fs:writeFile', async (_event, filePath, content) => {
     await fs.writeFile(filePath, content, 'utf-8');
     // Notify renderer that file has changed
     win?.webContents.send('file:changed', { path: filePath, content });
+    // Clear diagnostics cache for this file
+    diagnosticsService.clearCache(filePath);
     return true;
   } catch (e: any) {
     console.error(e);
     return false;
+  }
+});
+
+// ------ DIAGNOSTICS HANDLERS ------
+ipcMain.handle('diagnostics:check', async (_event, filePath: string, workspacePath: string) => {
+  try {
+    const diagnostics = await diagnosticsService.checkFile(filePath, workspacePath);
+    return diagnostics;
+  } catch (error: any) {
+    console.error('[DIAGNOSTICS] Error checking file:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('diagnostics:checkMultiple', async (_event, filePaths: string[], workspacePath: string) => {
+  try {
+    const results: Record<string, any[]> = {};
+    for (const filePath of filePaths) {
+      results[filePath] = await diagnosticsService.checkFile(filePath, workspacePath);
+    }
+    return results;
+  } catch (error: any) {
+    console.error('[DIAGNOSTICS] Error checking files:', error);
+    return {};
   }
 });
 
@@ -3813,7 +3958,7 @@ ipcMain.handle('ollama:healthCheck', async () => {
     clearTimeout(timeoutId);
     
     if (res.ok) {
-      const data = await res.json();
+      const data = await res.json() as any;
       console.log('[OLLAMA] Health check passed, version:', data.version);
       return { healthy: true, version: data.version };
     } else {
@@ -3835,6 +3980,7 @@ ipcMain.handle('fs:readDirectoryRecursive', async (_event, dirPath: string) => {
 });
 
 ipcMain.handle('execute-agent-task', async (_event, { task, model, workspacePath, activeFile, config, isAutopilotMode }) => {
+  console.log(`[AGENT_TASK] Starting agent task: "${task.substring(0, 50)}..."`);
   if (!workspacePath) {
     return {
       response: "I'm ready to help, but I need you to open a folder first so I have a place to work. Please use the 'Open Folder' button in the Title Bar or File menu.",
@@ -3880,7 +4026,9 @@ ipcMain.handle('execute-agent-task', async (_event, { task, model, workspacePath
     }
 
     // 2. Run the agent loop
+    console.log(`[AGENT_TASK] Running agent loop...`);
     const result = await runAgentLoop(task, model, config, workspacePath, activeFile, isAutopilotMode);
+    console.log(`[AGENT_TASK] Agent loop completed, returning result`);
     return {
       response: result.finalResponse,
       steps: result.steps

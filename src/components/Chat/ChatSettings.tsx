@@ -3,14 +3,10 @@ import type { AIProvider } from '../../types'
 interface ChatSettingsProps {
     isSettingsOpen: boolean;
     setIsSettingsOpen: (open: boolean) => void;
-    primaryModelProvider: AIProvider;
-    setPrimaryModelProvider: (provider: AIProvider) => void;
-    primaryModel: string;
-    setPrimaryModel: (model: string) => void;
-    toolModelProvider: AIProvider;
-    setToolModelProvider: (provider: AIProvider) => void;
-    toolModel: string;
-    setToolModel: (model: string) => void;
+    modelProvider: AIProvider;
+    setModelProvider: (provider: AIProvider) => void;
+    model: string;
+    setModel: (model: string) => void;
     ollamaModels: string[];
     ollamaChecking: boolean;
     ollamaError: string | null;
@@ -19,6 +15,12 @@ interface ChatSettingsProps {
     setOpenaiKey: (key: string) => void;
     geminiKey: string;
     setGeminiKey: (key: string) => void;
+    bedrockRegion: string;
+    setBedrockRegion: (region: string) => void;
+    bedrockAccessKey: string;
+    setBedrockAccessKey: (key: string) => void;
+    bedrockSecretKey: string;
+    setBedrockSecretKey: (key: string) => void;
     isAutopilotMode: boolean;
     setIsAutopilotMode: (mode: boolean) => void;
 }
@@ -26,14 +28,10 @@ interface ChatSettingsProps {
 export const ChatSettings = ({
     isSettingsOpen,
     setIsSettingsOpen,
-    primaryModelProvider,
-    setPrimaryModelProvider,
-    primaryModel,
-    setPrimaryModel,
-    toolModelProvider,
-    setToolModelProvider,
-    toolModel,
-    setToolModel,
+    modelProvider,
+    setModelProvider,
+    model,
+    setModel,
     ollamaModels,
     ollamaChecking,
     ollamaError,
@@ -42,54 +40,100 @@ export const ChatSettings = ({
     setOpenaiKey,
     geminiKey,
     setGeminiKey,
+    bedrockRegion,
+    setBedrockRegion,
+    bedrockAccessKey,
+    setBedrockAccessKey,
+    bedrockSecretKey,
+    setBedrockSecretKey,
     isAutopilotMode,
     setIsAutopilotMode
 }: ChatSettingsProps) => {
 
     const providers = [
-        { id: 'ollama' as const, name: 'Ollama', icon: '🦙' },
-        { id: 'openai' as const, name: 'OpenAI', icon: '🤖' },
-        { id: 'gemini' as const, name: 'Gemini', icon: '✨' }
+        { id: 'ollama' as const, name: 'Ollama', icon: '🦙', description: 'Local models' },
+        { id: 'openai' as const, name: 'OpenAI', icon: '🤖', description: 'GPT models' },
+        { id: 'gemini' as const, name: 'Gemini', icon: '✨', description: 'Google AI' },
+        { id: 'bedrock' as const, name: 'AWS Bedrock', icon: '☁️', description: 'AWS managed models' }
     ];
 
-    const renderModelSelector = (
-        type: 'Primary' | 'Tool',
-        provider: AIProvider,
-        setProvider: (p: AIProvider) => void,
-        model: string,
-        setModel: (m: string) => void,
-        description: string
-    ) => (
-        <div className="settings-model-group">
-            <div className="settings-group-title">{type} Model</div>
-            <div className="settings-group-description">{description}</div>
-            <div className="provider-selector-compact">
-                {providers.map(p => (
-                    <button
-                        key={p.id}
-                        className={`provider-btn ${provider === p.id ? 'active' : ''}`}
-                        onClick={() => setProvider(p.id)}
-                    >
-                        <span>{p.icon}</span> {p.name}
-                    </button>
-                ))}
-            </div>
+    const openaiModels = [
+        'gpt-4o',
+        'gpt-4o-mini',
+        'gpt-4-turbo',
+        'gpt-4-turbo-preview',
+        'gpt-4',
+        'gpt-3.5-turbo',
+        'gpt-3.5-turbo-16k'
+    ];
 
-            {provider === 'ollama' && ollamaModels.length > 0 && (
-                <div className="model-list mini">
-                    {ollamaModels.map(m => (
-                        <div
-                            key={m}
-                            className={`model-item ${model === m ? 'active' : ''}`}
-                            onClick={() => setModel(m)}
-                        >
-                            <span className="model-name">{m}</span>
-                        </div>
-                    ))}
-                </div>
-            )}
-        </div>
-    );
+    const geminiModels = [
+        'gemini-1.5-pro',
+        'gemini-1.5-pro-002',
+        'gemini-1.5-flash',
+        'gemini-1.5-flash-002',
+        'gemini-1.0-pro',
+        'gemini-1.0-pro-001'
+    ];
+
+    const bedrockModels = [
+        'anthropic.claude-3-5-sonnet-20241022-v2:0',
+        'anthropic.claude-3-5-haiku-20241022-v1:0',
+        'anthropic.claude-3-opus-20240229-v1:0',
+        'anthropic.claude-3-sonnet-20240229-v1:0',
+        'anthropic.claude-3-haiku-20240307-v1:0',
+        'meta.llama3-2-90b-instruct-v1:0',
+        'meta.llama3-2-11b-instruct-v1:0',
+        'meta.llama3-2-3b-instruct-v1:0',
+        'meta.llama3-2-1b-instruct-v1:0'
+    ];
+
+    const bedrockRegions = [
+        'us-east-1',
+        'us-west-2',
+        'eu-west-1',
+        'eu-central-1',
+        'ap-southeast-1',
+        'ap-northeast-1'
+    ];
+
+    const getAvailableModels = () => {
+        switch (modelProvider) {
+            case 'ollama':
+                return ollamaModels;
+            case 'openai':
+                return openaiModels;
+            case 'gemini':
+                return geminiModels;
+            case 'bedrock':
+                return bedrockModels;
+            default:
+                return [];
+        }
+    };
+
+    const handleProviderChange = (newProvider: AIProvider) => {
+        setModelProvider(newProvider);
+        // Set default model for the provider if current model is not compatible
+        const availableModels = newProvider === 'ollama' ? ollamaModels : 
+                               newProvider === 'openai' ? openaiModels :
+                               newProvider === 'gemini' ? geminiModels :
+                               bedrockModels;
+        
+        // Only change model if current model is not in the new provider's list
+        // This allows users to keep custom models when switching providers
+        if (newProvider === 'ollama') {
+            // For Ollama, always use a model from the available list
+            if (availableModels.length > 0) {
+                setModel(availableModels[0]);
+            }
+        } else {
+            // For other providers, only change if current model is not in common list
+            if (availableModels.length > 0 && !model) {
+                setModel(availableModels[0]);
+            }
+        }
+    };
 
     return (
         <div className="chat-settings-section">
@@ -105,33 +149,300 @@ export const ChatSettings = ({
                     <span>Agent Configuration</span>
                 </div>
                 {!isSettingsOpen && (
-                    <span className="settings-badge">Multi-Model Active</span>
+                    <span className="settings-badge">Single Model</span>
                 )}
             </div>
 
             {isSettingsOpen && (
                 <div className="chat-settings-body">
-                    {renderModelSelector(
-                        'Primary', 
-                        primaryModelProvider, 
-                        setPrimaryModelProvider, 
-                        primaryModel, 
-                        setPrimaryModel,
-                        'For reasoning, planning, and decision-making'
-                    )}
+                    {/* Provider Selection */}
+                    <div className="settings-model-group">
+                        <div className="settings-group-title">AI Provider</div>
+                        <div className="settings-group-description">Choose your AI model provider</div>
+                        
+                        <div className="settings-field">
+                            <select 
+                                className="settings-select"
+                                value={modelProvider}
+                                onChange={(e) => handleProviderChange(e.target.value as AIProvider)}
+                            >
+                                {providers.map(p => (
+                                    <option key={p.id} value={p.id}>
+                                        {p.icon} {p.name} - {p.description}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                    </div>
 
                     <div className="settings-separator" />
 
-                    {renderModelSelector(
-                        'Tool', 
-                        toolModelProvider, 
-                        setToolModelProvider, 
-                        toolModel, 
-                        setToolModel,
-                        'For code generation and tool execution'
-                    )}
+                    {/* Model Selection */}
+                    <div className="settings-model-group">
+                        <div className="settings-group-title">Model</div>
+                        <div className="settings-group-description">
+                            {modelProvider === 'ollama' && 'Select from locally available models'}
+                            {modelProvider === 'openai' && 'Choose from common OpenAI models or enter a custom model name'}
+                            {modelProvider === 'gemini' && 'Choose from common Gemini models or enter a custom model name'}
+                            {modelProvider === 'bedrock' && 'Choose from common Bedrock models or enter a custom model ARN/ID'}
+                        </div>
+                        
+                        {modelProvider === 'ollama' && (
+                            <div className="settings-field">
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                                    <div className="ollama-status-mini">
+                                        {ollamaChecking ? (
+                                            <div className="spinner" style={{ width: 12, height: 12 }}></div>
+                                        ) : ollamaError ? (
+                                            <span style={{ color: '#f14c4c' }}>📴 Offline</span>
+                                        ) : (
+                                            <span style={{ color: '#89d185' }}>✅ Online ({ollamaModels.length} models)</span>
+                                        )}
+                                    </div>
+                                    <button 
+                                        className="refresh-btn-mini" 
+                                        onClick={refreshOllamaModels}
+                                        disabled={ollamaChecking}
+                                        title="Refresh Ollama models"
+                                    >
+                                        {ollamaChecking ? '⏳' : '↻'}
+                                    </button>
+                                </div>
+                                
+                                {ollamaModels.length > 0 ? (
+                                    <select 
+                                        className="settings-select"
+                                        value={model}
+                                        onChange={(e) => setModel(e.target.value)}
+                                    >
+                                        {ollamaModels.map(m => (
+                                            <option key={m} value={m}>{m}</option>
+                                        ))}
+                                    </select>
+                                ) : (
+                                    <div className="settings-field-description" style={{ color: '#f14c4c', padding: '8px', background: 'var(--bg-secondary)', borderRadius: '4px', border: '1px solid #f14c4c' }}>
+                                        {ollamaError ? (
+                                            <>
+                                                <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>❌ {ollamaError}</div>
+                                                <div style={{ fontSize: '10px', opacity: 0.8 }}>
+                                                    To fix this:
+                                                    <br />1. Install Ollama from <a href="https://ollama.ai" target="_blank" rel="noopener noreferrer">ollama.ai</a>
+                                                    <br />2. Run: <code>ollama serve</code>
+                                                    <br />3. Install a model: <code>ollama pull qwen2.5-coder:latest</code>
+                                                </div>
+                                            </>
+                                        ) : (
+                                            'No models found. Install models with: ollama pull <model-name>'
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {modelProvider === 'openai' && (
+                            <div className="settings-field">
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                                    <select 
+                                        className="settings-select"
+                                        value={openaiModels.includes(model) ? model : 'custom'}
+                                        onChange={(e) => {
+                                            if (e.target.value !== 'custom') {
+                                                setModel(e.target.value);
+                                            } else {
+                                                setModel(''); // Clear the model to show custom input
+                                            }
+                                        }}
+                                        style={{ flex: 1 }}
+                                    >
+                                        {openaiModels.map(m => (
+                                            <option key={m} value={m}>{m}</option>
+                                        ))}
+                                        <option value="custom">Custom model...</option>
+                                    </select>
+                                </div>
+                                {!openaiModels.includes(model) && (
+                                    <>
+                                        <input
+                                            type="text"
+                                            className="settings-input"
+                                            value={model}
+                                            onChange={(e) => setModel(e.target.value)}
+                                            placeholder="Enter custom model name (e.g., gpt-4o-mini)"
+                                            style={{ marginTop: 8 }}
+                                        />
+                                        <div className="settings-field-description" style={{ marginTop: 4 }}>
+                                            Enter any OpenAI model name. See <a href="https://platform.openai.com/docs/models" target="_blank" rel="noopener noreferrer">OpenAI docs</a> for available models.
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
+
+                        {modelProvider === 'gemini' && (
+                            <div className="settings-field">
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                                    <select 
+                                        className="settings-select"
+                                        value={geminiModels.includes(model) ? model : 'custom'}
+                                        onChange={(e) => {
+                                            if (e.target.value !== 'custom') {
+                                                setModel(e.target.value);
+                                            } else {
+                                                setModel(''); // Clear the model to show custom input
+                                            }
+                                        }}
+                                        style={{ flex: 1 }}
+                                    >
+                                        {geminiModels.map(m => (
+                                            <option key={m} value={m}>{m}</option>
+                                        ))}
+                                        <option value="custom">Custom model...</option>
+                                    </select>
+                                </div>
+                                {!geminiModels.includes(model) && (
+                                    <>
+                                        <input
+                                            type="text"
+                                            className="settings-input"
+                                            value={model}
+                                            onChange={(e) => setModel(e.target.value)}
+                                            placeholder="Enter custom model name (e.g., gemini-1.5-pro-002)"
+                                            style={{ marginTop: 8 }}
+                                        />
+                                        <div className="settings-field-description" style={{ marginTop: 4 }}>
+                                            Enter any Gemini model name. See <a href="https://ai.google.dev/gemini-api/docs/models/gemini" target="_blank" rel="noopener noreferrer">Gemini docs</a> for available models.
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
+
+                        {modelProvider === 'bedrock' && (
+                            <div className="settings-field">
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                                    <select 
+                                        className="settings-select"
+                                        value={bedrockModels.includes(model) ? model : 'custom'}
+                                        onChange={(e) => {
+                                            if (e.target.value !== 'custom') {
+                                                setModel(e.target.value);
+                                            } else {
+                                                setModel(''); // Clear the model to show custom input
+                                            }
+                                        }}
+                                        style={{ flex: 1 }}
+                                    >
+                                        {bedrockModels.map(m => (
+                                            <option key={m} value={m}>{m}</option>
+                                        ))}
+                                        <option value="custom">Custom model...</option>
+                                    </select>
+                                </div>
+                                {!bedrockModels.includes(model) && (
+                                    <>
+                                        <input
+                                            type="text"
+                                            className="settings-input"
+                                            value={model}
+                                            onChange={(e) => setModel(e.target.value)}
+                                            placeholder="Enter custom model ARN or ID (e.g., anthropic.claude-3-5-sonnet-20241022-v2:0)"
+                                            style={{ marginTop: 8 }}
+                                        />
+                                        <div className="settings-field-description" style={{ marginTop: 4 }}>
+                                            Enter any Bedrock model ID or ARN. See <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html" target="_blank" rel="noopener noreferrer">AWS docs</a> for available models.
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
+                    </div>
 
                     <div className="settings-separator" />
+
+                    {/* Provider-specific Configuration */}
+                    {modelProvider === 'openai' && (
+                        <>
+                            <div className="settings-section-title">OpenAI Configuration</div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">API Key</label>
+                                <input
+                                    type="password"
+                                    className="settings-input"
+                                    value={openaiKey}
+                                    onChange={e => setOpenaiKey(e.target.value)}
+                                    placeholder="sk-..."
+                                />
+                                <div className="settings-field-description">
+                                    Get your API key from <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">OpenAI Platform</a>
+                                </div>
+                            </div>
+                            <div className="settings-separator" />
+                        </>
+                    )}
+
+                    {modelProvider === 'gemini' && (
+                        <>
+                            <div className="settings-section-title">Gemini Configuration</div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">API Key</label>
+                                <input
+                                    type="password"
+                                    className="settings-input"
+                                    value={geminiKey}
+                                    onChange={e => setGeminiKey(e.target.value)}
+                                    placeholder="AIzaSy..."
+                                />
+                                <div className="settings-field-description">
+                                    Get your API key from <a href="https://makersuite.google.com/app/apikey" target="_blank" rel="noopener noreferrer">Google AI Studio</a>
+                                </div>
+                            </div>
+                            <div className="settings-separator" />
+                        </>
+                    )}
+
+                    {modelProvider === 'bedrock' && (
+                        <>
+                            <div className="settings-section-title">AWS Bedrock Configuration</div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Region</label>
+                                <select 
+                                    className="settings-select"
+                                    value={bedrockRegion}
+                                    onChange={(e) => setBedrockRegion(e.target.value)}
+                                >
+                                    {bedrockRegions.map(region => (
+                                        <option key={region} value={region}>{region}</option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Access Key ID</label>
+                                <input
+                                    type="password"
+                                    className="settings-input"
+                                    value={bedrockAccessKey}
+                                    onChange={e => setBedrockAccessKey(e.target.value)}
+                                    placeholder="AKIA..."
+                                />
+                            </div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Secret Access Key</label>
+                                <input
+                                    type="password"
+                                    className="settings-input"
+                                    value={bedrockSecretKey}
+                                    onChange={e => setBedrockSecretKey(e.target.value)}
+                                    placeholder="..."
+                                />
+                            </div>
+                            <div className="settings-field-description">
+                                Configure AWS credentials with Bedrock access. See <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_service-with-iam.html" target="_blank" rel="noopener noreferrer">AWS documentation</a>
+                            </div>
+                            <div className="settings-separator" />
+                        </>
+                    )}
+
+                    {/* Agent Mode */}
 
                     <div className="settings-section-title">Agent Mode</div>
                     <div className="settings-field">
@@ -149,41 +460,6 @@ export const ChatSettings = ({
                                 ? '🚀 Agent can modify files autonomously without approval'
                                 : '🛡️ Agent will ask for approval before modifying files'}
                         </div>
-                    </div>
-
-                    <div className="settings-separator" />
-
-                    <div className="settings-section-title">Credentials</div>
-                    <div className="settings-field">
-                        <label className="settings-field-label">OpenAI Key</label>
-                        <input
-                            type="password"
-                            className="settings-input"
-                            value={openaiKey}
-                            onChange={e => setOpenaiKey(e.target.value)}
-                            placeholder="sk-..."
-                        />
-                    </div>
-                    <div className="settings-field">
-                        <label className="settings-field-label">Gemini Key</label>
-                        <input
-                            type="password"
-                            className="settings-input"
-                            value={geminiKey}
-                            onChange={e => setGeminiKey(e.target.value)}
-                            placeholder="AIzaSy..."
-                        />
-                    </div>
-
-                    <div className="ollama-status-mini">
-                        {ollamaChecking ? (
-                            <div className="spinner" style={{ width: 8, height: 8 }}></div>
-                        ) : ollamaError ? (
-                            <span style={{ color: '#f14c4c' }}>📴 Ollama Offline</span>
-                        ) : (
-                            <span style={{ color: '#89d185' }}>✅ Ollama Online</span>
-                        )}
-                        <button className="refresh-btn-mini" onClick={refreshOllamaModels}>↻</button>
                     </div>
                 </div>
             )}

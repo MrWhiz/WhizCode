@@ -1,9 +1,9 @@
-import { app, BrowserWindow, ipcMain, dialog, shell } from "electron";
+import { app, ipcMain, BrowserWindow, dialog, shell } from "electron";
 import * as sp from "node:path";
 import { resolve, join, relative, sep, dirname, extname, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, exec } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn, exec as exec$1 } from "node:child_process";
+import { promisify as promisify$1 } from "node:util";
 import * as fs from "node:fs/promises";
 import { lstat, stat, readdir, realpath, open } from "node:fs/promises";
 import * as os from "node:os";
@@ -12,14 +12,21 @@ import { createRequire } from "node:module";
 import { EventEmitter } from "node:events";
 import { unwatchFile, watchFile, watch as watch$1, stat as stat$1 } from "node:fs";
 import { Readable as Readable$1 } from "node:stream";
-import require$$0 from "util";
+import require$$0, { promisify } from "util";
 import Stream from "stream";
 import http from "http";
 import Url from "url";
 import require$$0$1 from "punycode";
 import https from "https";
 import zlib from "zlib";
-import crypto from "node:crypto";
+import crypto$1 from "node:crypto";
+import * as fs$1 from "fs";
+import * as path from "path";
+import { spawn as spawn$1, exec } from "child_process";
+import * as crypto from "crypto";
+import { platform } from "os";
+import { EventEmitter as EventEmitter$1 } from "events";
+import * as pty$1 from "node-pty";
 const EntryTypes = {
   FILE_TYPE: "files",
   DIR_TYPE: "directories",
@@ -100,7 +107,7 @@ class ReaddirpStream extends Readable$1 {
     this._directoryFilter = normalizeFilter(opts.directoryFilter);
     const statMethod = opts.lstat ? lstat : stat;
     if (wantBigintFsStats) {
-      this._stat = (path) => statMethod(path, { bigint: true });
+      this._stat = (path2) => statMethod(path2, { bigint: true });
     } else {
       this._stat = statMethod;
     }
@@ -125,8 +132,8 @@ class ReaddirpStream extends Readable$1 {
         const par = this.parent;
         const fil = par && par.files;
         if (fil && fil.length > 0) {
-          const { path, depth } = par;
-          const slice = fil.splice(0, batch).map((dirent) => this._formatEntry(dirent, path));
+          const { path: path2, depth } = par;
+          const slice = fil.splice(0, batch).map((dirent) => this._formatEntry(dirent, path2));
           const awaited = await Promise.all(slice);
           for (const entry of awaited) {
             if (!entry)
@@ -166,20 +173,20 @@ class ReaddirpStream extends Readable$1 {
       this.reading = false;
     }
   }
-  async _exploreDir(path, depth) {
+  async _exploreDir(path2, depth) {
     let files;
     try {
-      files = await readdir(path, this._rdOptions);
+      files = await readdir(path2, this._rdOptions);
     } catch (error) {
       this._onError(error);
     }
-    return { files, depth, path };
+    return { files, depth, path: path2 };
   }
-  async _formatEntry(dirent, path) {
+  async _formatEntry(dirent, path2) {
     let entry;
     const basename = this._isDirent ? dirent.name : dirent;
     try {
-      const fullPath = resolve(join(path, basename));
+      const fullPath = resolve(join(path2, basename));
       entry = { path: relative(this._root, fullPath), fullPath, basename };
       entry[this._statsProp] = this._isDirent ? dirent : await this._stat(fullPath);
     } catch (err) {
@@ -573,16 +580,16 @@ const delFromSet = (main, prop, item) => {
 };
 const isEmptySet = (val) => val instanceof Set ? val.size === 0 : !val;
 const FsWatchInstances = /* @__PURE__ */ new Map();
-function createFsWatchInstance(path, options, listener, errHandler, emitRaw) {
+function createFsWatchInstance(path2, options, listener, errHandler, emitRaw) {
   const handleEvent = (rawEvent, evPath) => {
-    listener(path);
-    emitRaw(rawEvent, evPath, { watchedPath: path });
-    if (evPath && path !== evPath) {
-      fsWatchBroadcast(sp.resolve(path, evPath), KEY_LISTENERS, sp.join(path, evPath));
+    listener(path2);
+    emitRaw(rawEvent, evPath, { watchedPath: path2 });
+    if (evPath && path2 !== evPath) {
+      fsWatchBroadcast(sp.resolve(path2, evPath), KEY_LISTENERS, sp.join(path2, evPath));
     }
   };
   try {
-    return watch$1(path, {
+    return watch$1(path2, {
       persistent: options.persistent
     }, handleEvent);
   } catch (error) {
@@ -598,12 +605,12 @@ const fsWatchBroadcast = (fullPath, listenerType, val1, val2, val3) => {
     listener(val1, val2, val3);
   });
 };
-const setFsWatchListener = (path, fullPath, options, handlers) => {
+const setFsWatchListener = (path2, fullPath, options, handlers) => {
   const { listener, errHandler, rawEmitter } = handlers;
   let cont = FsWatchInstances.get(fullPath);
   let watcher;
   if (!options.persistent) {
-    watcher = createFsWatchInstance(path, options, listener, errHandler, rawEmitter);
+    watcher = createFsWatchInstance(path2, options, listener, errHandler, rawEmitter);
     if (!watcher)
       return;
     return watcher.close.bind(watcher);
@@ -614,7 +621,7 @@ const setFsWatchListener = (path, fullPath, options, handlers) => {
     addAndConvert(cont, KEY_RAW, rawEmitter);
   } else {
     watcher = createFsWatchInstance(
-      path,
+      path2,
       options,
       fsWatchBroadcast.bind(null, fullPath, KEY_LISTENERS),
       errHandler,
@@ -629,7 +636,7 @@ const setFsWatchListener = (path, fullPath, options, handlers) => {
         cont.watcherUnusable = true;
       if (isWindows && error.code === "EPERM") {
         try {
-          const fd = await open(path, "r");
+          const fd = await open(path2, "r");
           await fd.close();
           broadcastErr(error);
         } catch (err) {
@@ -660,7 +667,7 @@ const setFsWatchListener = (path, fullPath, options, handlers) => {
   };
 };
 const FsWatchFileInstances = /* @__PURE__ */ new Map();
-const setFsWatchFileListener = (path, fullPath, options, handlers) => {
+const setFsWatchFileListener = (path2, fullPath, options, handlers) => {
   const { listener, rawEmitter } = handlers;
   let cont = FsWatchFileInstances.get(fullPath);
   const copts = cont && cont.options;
@@ -682,7 +689,7 @@ const setFsWatchFileListener = (path, fullPath, options, handlers) => {
         });
         const currmtime = curr.mtimeMs;
         if (curr.size !== prev.size || currmtime > prev.mtimeMs || currmtime === 0) {
-          foreach(cont.listeners, (listener2) => listener2(path, curr));
+          foreach(cont.listeners, (listener2) => listener2(path2, curr));
         }
       })
     };
@@ -712,13 +719,13 @@ class NodeFsHandler {
    * @param listener on fs change
    * @returns closer for the watcher instance
    */
-  _watchWithNodeFs(path, listener) {
+  _watchWithNodeFs(path2, listener) {
     const opts = this.fsw.options;
-    const directory = sp.dirname(path);
-    const basename = sp.basename(path);
+    const directory = sp.dirname(path2);
+    const basename = sp.basename(path2);
     const parent = this.fsw._getWatchedDir(directory);
     parent.add(basename);
-    const absolutePath = sp.resolve(path);
+    const absolutePath = sp.resolve(path2);
     const options = {
       persistent: opts.persistent
     };
@@ -728,12 +735,12 @@ class NodeFsHandler {
     if (opts.usePolling) {
       const enableBin = opts.interval !== opts.binaryInterval;
       options.interval = enableBin && isBinaryPath(basename) ? opts.binaryInterval : opts.interval;
-      closer = setFsWatchFileListener(path, absolutePath, options, {
+      closer = setFsWatchFileListener(path2, absolutePath, options, {
         listener,
         rawEmitter: this.fsw._emitRaw
       });
     } else {
-      closer = setFsWatchListener(path, absolutePath, options, {
+      closer = setFsWatchListener(path2, absolutePath, options, {
         listener,
         errHandler: this._boundHandleError,
         rawEmitter: this.fsw._emitRaw
@@ -755,7 +762,7 @@ class NodeFsHandler {
     let prevStats = stats;
     if (parent.has(basename))
       return;
-    const listener = async (path, newStats) => {
+    const listener = async (path2, newStats) => {
       if (!this.fsw._throttle(THROTTLE_MODE_WATCH, file, 5))
         return;
       if (!newStats || newStats.mtimeMs === 0) {
@@ -769,11 +776,11 @@ class NodeFsHandler {
             this.fsw._emit(EV.CHANGE, file, newStats2);
           }
           if ((isMacos || isLinux || isFreeBSD) && prevStats.ino !== newStats2.ino) {
-            this.fsw._closeFile(path);
+            this.fsw._closeFile(path2);
             prevStats = newStats2;
             const closer2 = this._watchWithNodeFs(file, listener);
             if (closer2)
-              this.fsw._addPathCloser(path, closer2);
+              this.fsw._addPathCloser(path2, closer2);
           } else {
             prevStats = newStats2;
           }
@@ -805,7 +812,7 @@ class NodeFsHandler {
    * @param item basename of this item
    * @returns true if no more processing is needed for this entry.
    */
-  async _handleSymlink(entry, directory, path, item) {
+  async _handleSymlink(entry, directory, path2, item) {
     if (this.fsw.closed) {
       return;
     }
@@ -815,7 +822,7 @@ class NodeFsHandler {
       this.fsw._incrReadyCount();
       let linkPath;
       try {
-        linkPath = await realpath(path);
+        linkPath = await realpath(path2);
       } catch (e) {
         this.fsw._emitReady();
         return true;
@@ -825,12 +832,12 @@ class NodeFsHandler {
       if (dir.has(item)) {
         if (this.fsw._symlinkPaths.get(full) !== linkPath) {
           this.fsw._symlinkPaths.set(full, linkPath);
-          this.fsw._emit(EV.CHANGE, path, entry.stats);
+          this.fsw._emit(EV.CHANGE, path2, entry.stats);
         }
       } else {
         dir.add(item);
         this.fsw._symlinkPaths.set(full, linkPath);
-        this.fsw._emit(EV.ADD, path, entry.stats);
+        this.fsw._emit(EV.ADD, path2, entry.stats);
       }
       this.fsw._emitReady();
       return true;
@@ -860,9 +867,9 @@ class NodeFsHandler {
         return;
       }
       const item = entry.path;
-      let path = sp.join(directory, item);
+      let path2 = sp.join(directory, item);
       current.add(item);
-      if (entry.stats.isSymbolicLink() && await this._handleSymlink(entry, directory, path, item)) {
+      if (entry.stats.isSymbolicLink() && await this._handleSymlink(entry, directory, path2, item)) {
         return;
       }
       if (this.fsw.closed) {
@@ -871,8 +878,8 @@ class NodeFsHandler {
       }
       if (item === target || !target && !previous.has(item)) {
         this.fsw._incrReadyCount();
-        path = sp.join(dir, sp.relative(dir, path));
-        this._addToNodeFs(path, initialAdd, wh, depth + 1);
+        path2 = sp.join(dir, sp.relative(dir, path2));
+        this._addToNodeFs(path2, initialAdd, wh, depth + 1);
       }
     }).on(EV.ERROR, this._boundHandleError);
     return new Promise((resolve2, reject) => {
@@ -941,13 +948,13 @@ class NodeFsHandler {
    * @param depth Child path actually targeted for watch
    * @param target Child path actually targeted for watch
    */
-  async _addToNodeFs(path, initialAdd, priorWh, depth, target) {
+  async _addToNodeFs(path2, initialAdd, priorWh, depth, target) {
     const ready = this.fsw._emitReady;
-    if (this.fsw._isIgnored(path) || this.fsw.closed) {
+    if (this.fsw._isIgnored(path2) || this.fsw.closed) {
       ready();
       return false;
     }
-    const wh = this.fsw._getWatchHelpers(path);
+    const wh = this.fsw._getWatchHelpers(path2);
     if (priorWh) {
       wh.filterPath = (entry) => priorWh.filterPath(entry);
       wh.filterDir = (entry) => priorWh.filterDir(entry);
@@ -963,8 +970,8 @@ class NodeFsHandler {
       const follow = this.fsw.options.followSymlinks;
       let closer;
       if (stats.isDirectory()) {
-        const absPath = sp.resolve(path);
-        const targetPath = follow ? await realpath(path) : path;
+        const absPath = sp.resolve(path2);
+        const targetPath = follow ? await realpath(path2) : path2;
         if (this.fsw.closed)
           return;
         closer = await this._handleDir(wh.watchPath, stats, initialAdd, depth, target, wh, targetPath);
@@ -974,29 +981,29 @@ class NodeFsHandler {
           this.fsw._symlinkPaths.set(absPath, targetPath);
         }
       } else if (stats.isSymbolicLink()) {
-        const targetPath = follow ? await realpath(path) : path;
+        const targetPath = follow ? await realpath(path2) : path2;
         if (this.fsw.closed)
           return;
         const parent = sp.dirname(wh.watchPath);
         this.fsw._getWatchedDir(parent).add(wh.watchPath);
         this.fsw._emit(EV.ADD, wh.watchPath, stats);
-        closer = await this._handleDir(parent, stats, initialAdd, depth, path, wh, targetPath);
+        closer = await this._handleDir(parent, stats, initialAdd, depth, path2, wh, targetPath);
         if (this.fsw.closed)
           return;
         if (targetPath !== void 0) {
-          this.fsw._symlinkPaths.set(sp.resolve(path), targetPath);
+          this.fsw._symlinkPaths.set(sp.resolve(path2), targetPath);
         }
       } else {
         closer = this._handleFile(wh.watchPath, stats, initialAdd);
       }
       ready();
       if (closer)
-        this.fsw._addPathCloser(path, closer);
+        this.fsw._addPathCloser(path2, closer);
       return false;
     } catch (error) {
       if (this.fsw._handleError(error)) {
         ready();
-        return path;
+        return path2;
       }
     }
   }
@@ -1037,24 +1044,24 @@ function createPattern(matcher) {
   }
   return () => false;
 }
-function normalizePath(path) {
-  if (typeof path !== "string")
+function normalizePath(path2) {
+  if (typeof path2 !== "string")
     throw new Error("string expected");
-  path = sp.normalize(path);
-  path = path.replace(/\\/g, "/");
+  path2 = sp.normalize(path2);
+  path2 = path2.replace(/\\/g, "/");
   let prepend = false;
-  if (path.startsWith("//"))
+  if (path2.startsWith("//"))
     prepend = true;
-  path = path.replace(DOUBLE_SLASH_RE, "/");
+  path2 = path2.replace(DOUBLE_SLASH_RE, "/");
   if (prepend)
-    path = "/" + path;
-  return path;
+    path2 = "/" + path2;
+  return path2;
 }
 function matchPatterns(patterns, testString, stats) {
-  const path = normalizePath(testString);
+  const path2 = normalizePath(testString);
   for (let index = 0; index < patterns.length; index++) {
     const pattern = patterns[index];
-    if (pattern(path, stats)) {
+    if (pattern(path2, stats)) {
       return true;
     }
   }
@@ -1091,19 +1098,19 @@ const toUnix = (string2) => {
   }
   return str;
 };
-const normalizePathToUnix = (path) => toUnix(sp.normalize(toUnix(path)));
-const normalizeIgnored = (cwd = "") => (path) => {
-  if (typeof path === "string") {
-    return normalizePathToUnix(sp.isAbsolute(path) ? path : sp.join(cwd, path));
+const normalizePathToUnix = (path2) => toUnix(sp.normalize(toUnix(path2)));
+const normalizeIgnored = (cwd = "") => (path2) => {
+  if (typeof path2 === "string") {
+    return normalizePathToUnix(sp.isAbsolute(path2) ? path2 : sp.join(cwd, path2));
   } else {
-    return path;
+    return path2;
   }
 };
-const getAbsolutePath = (path, cwd) => {
-  if (sp.isAbsolute(path)) {
-    return path;
+const getAbsolutePath = (path2, cwd) => {
+  if (sp.isAbsolute(path2)) {
+    return path2;
   }
-  return sp.join(cwd, path);
+  return sp.join(cwd, path2);
 };
 const EMPTY_SET = Object.freeze(/* @__PURE__ */ new Set());
 class DirEntry {
@@ -1168,10 +1175,10 @@ class WatchHelper {
   dirParts;
   followSymlinks;
   statMethod;
-  constructor(path, follow, fsw) {
+  constructor(path2, follow, fsw) {
     this.fsw = fsw;
-    const watchPath = path;
-    this.path = path = path.replace(REPLACER_RE, "");
+    const watchPath = path2;
+    this.path = path2 = path2.replace(REPLACER_RE, "");
     this.watchPath = watchPath;
     this.fullWatchPath = sp.resolve(watchPath);
     this.dirParts = [];
@@ -1311,20 +1318,20 @@ class FSWatcher extends EventEmitter {
     this._closePromise = void 0;
     let paths = unifyPaths(paths_);
     if (cwd) {
-      paths = paths.map((path) => {
-        const absPath = getAbsolutePath(path, cwd);
+      paths = paths.map((path2) => {
+        const absPath = getAbsolutePath(path2, cwd);
         return absPath;
       });
     }
-    paths.forEach((path) => {
-      this._removeIgnoredPath(path);
+    paths.forEach((path2) => {
+      this._removeIgnoredPath(path2);
     });
     this._userIgnored = void 0;
     if (!this._readyCount)
       this._readyCount = 0;
     this._readyCount += paths.length;
-    Promise.all(paths.map(async (path) => {
-      const res = await this._nodeFsHandler._addToNodeFs(path, !_internal, void 0, 0, _origAdd);
+    Promise.all(paths.map(async (path2) => {
+      const res = await this._nodeFsHandler._addToNodeFs(path2, !_internal, void 0, 0, _origAdd);
       if (res)
         this._emitReady();
       return res;
@@ -1346,17 +1353,17 @@ class FSWatcher extends EventEmitter {
       return this;
     const paths = unifyPaths(paths_);
     const { cwd } = this.options;
-    paths.forEach((path) => {
-      if (!sp.isAbsolute(path) && !this._closers.has(path)) {
+    paths.forEach((path2) => {
+      if (!sp.isAbsolute(path2) && !this._closers.has(path2)) {
         if (cwd)
-          path = sp.join(cwd, path);
-        path = sp.resolve(path);
+          path2 = sp.join(cwd, path2);
+        path2 = sp.resolve(path2);
       }
-      this._closePath(path);
-      this._addIgnoredPath(path);
-      if (this._watched.has(path)) {
+      this._closePath(path2);
+      this._addIgnoredPath(path2);
+      if (this._watched.has(path2)) {
         this._addIgnoredPath({
-          path,
+          path: path2,
           recursive: true
         });
       }
@@ -1420,38 +1427,38 @@ class FSWatcher extends EventEmitter {
    * @param stats arguments to be passed with event
    * @returns the error if defined, otherwise the value of the FSWatcher instance's `closed` flag
    */
-  async _emit(event, path, stats) {
+  async _emit(event, path2, stats) {
     if (this.closed)
       return;
     const opts = this.options;
     if (isWindows)
-      path = sp.normalize(path);
+      path2 = sp.normalize(path2);
     if (opts.cwd)
-      path = sp.relative(opts.cwd, path);
-    const args = [path];
+      path2 = sp.relative(opts.cwd, path2);
+    const args = [path2];
     if (stats != null)
       args.push(stats);
     const awf = opts.awaitWriteFinish;
     let pw;
-    if (awf && (pw = this._pendingWrites.get(path))) {
+    if (awf && (pw = this._pendingWrites.get(path2))) {
       pw.lastChange = /* @__PURE__ */ new Date();
       return this;
     }
     if (opts.atomic) {
       if (event === EVENTS.UNLINK) {
-        this._pendingUnlinks.set(path, [event, ...args]);
+        this._pendingUnlinks.set(path2, [event, ...args]);
         setTimeout(() => {
-          this._pendingUnlinks.forEach((entry, path2) => {
+          this._pendingUnlinks.forEach((entry, path22) => {
             this.emit(...entry);
             this.emit(EVENTS.ALL, ...entry);
-            this._pendingUnlinks.delete(path2);
+            this._pendingUnlinks.delete(path22);
           });
         }, typeof opts.atomic === "number" ? opts.atomic : 100);
         return this;
       }
-      if (event === EVENTS.ADD && this._pendingUnlinks.has(path)) {
+      if (event === EVENTS.ADD && this._pendingUnlinks.has(path2)) {
         event = EVENTS.CHANGE;
-        this._pendingUnlinks.delete(path);
+        this._pendingUnlinks.delete(path2);
       }
     }
     if (awf && (event === EVENTS.ADD || event === EVENTS.CHANGE) && this._readyEmitted) {
@@ -1469,16 +1476,16 @@ class FSWatcher extends EventEmitter {
           this.emitWithAll(event, args);
         }
       };
-      this._awaitWriteFinish(path, awf.stabilityThreshold, event, awfEmit);
+      this._awaitWriteFinish(path2, awf.stabilityThreshold, event, awfEmit);
       return this;
     }
     if (event === EVENTS.CHANGE) {
-      const isThrottled = !this._throttle(EVENTS.CHANGE, path, 50);
+      const isThrottled = !this._throttle(EVENTS.CHANGE, path2, 50);
       if (isThrottled)
         return this;
     }
     if (opts.alwaysStat && stats === void 0 && (event === EVENTS.ADD || event === EVENTS.ADD_DIR || event === EVENTS.CHANGE)) {
-      const fullPath = opts.cwd ? sp.join(opts.cwd, path) : path;
+      const fullPath = opts.cwd ? sp.join(opts.cwd, path2) : path2;
       let stats2;
       try {
         stats2 = await stat(fullPath);
@@ -1509,23 +1516,23 @@ class FSWatcher extends EventEmitter {
    * @param timeout duration of time to suppress duplicate actions
    * @returns tracking object or false if action should be suppressed
    */
-  _throttle(actionType, path, timeout) {
+  _throttle(actionType, path2, timeout) {
     if (!this._throttled.has(actionType)) {
       this._throttled.set(actionType, /* @__PURE__ */ new Map());
     }
     const action = this._throttled.get(actionType);
     if (!action)
       throw new Error("invalid throttle");
-    const actionPath = action.get(path);
+    const actionPath = action.get(path2);
     if (actionPath) {
       actionPath.count++;
       return false;
     }
     let timeoutObject;
     const clear = () => {
-      const item = action.get(path);
+      const item = action.get(path2);
       const count = item ? item.count : 0;
-      action.delete(path);
+      action.delete(path2);
       clearTimeout(timeoutObject);
       if (item)
         clearTimeout(item.timeoutObject);
@@ -1533,7 +1540,7 @@ class FSWatcher extends EventEmitter {
     };
     timeoutObject = setTimeout(clear, timeout);
     const thr = { timeoutObject, clear, count: 0 };
-    action.set(path, thr);
+    action.set(path2, thr);
     return thr;
   }
   _incrReadyCount() {
@@ -1547,44 +1554,44 @@ class FSWatcher extends EventEmitter {
    * @param event
    * @param awfEmit Callback to be called when ready for event to be emitted.
    */
-  _awaitWriteFinish(path, threshold, event, awfEmit) {
+  _awaitWriteFinish(path2, threshold, event, awfEmit) {
     const awf = this.options.awaitWriteFinish;
     if (typeof awf !== "object")
       return;
     const pollInterval = awf.pollInterval;
     let timeoutHandler;
-    let fullPath = path;
-    if (this.options.cwd && !sp.isAbsolute(path)) {
-      fullPath = sp.join(this.options.cwd, path);
+    let fullPath = path2;
+    if (this.options.cwd && !sp.isAbsolute(path2)) {
+      fullPath = sp.join(this.options.cwd, path2);
     }
     const now = /* @__PURE__ */ new Date();
     const writes = this._pendingWrites;
     function awaitWriteFinishFn(prevStat) {
       stat$1(fullPath, (err, curStat) => {
-        if (err || !writes.has(path)) {
+        if (err || !writes.has(path2)) {
           if (err && err.code !== "ENOENT")
             awfEmit(err);
           return;
         }
         const now2 = Number(/* @__PURE__ */ new Date());
         if (prevStat && curStat.size !== prevStat.size) {
-          writes.get(path).lastChange = now2;
+          writes.get(path2).lastChange = now2;
         }
-        const pw = writes.get(path);
+        const pw = writes.get(path2);
         const df = now2 - pw.lastChange;
         if (df >= threshold) {
-          writes.delete(path);
+          writes.delete(path2);
           awfEmit(void 0, curStat);
         } else {
           timeoutHandler = setTimeout(awaitWriteFinishFn, pollInterval, curStat);
         }
       });
     }
-    if (!writes.has(path)) {
-      writes.set(path, {
+    if (!writes.has(path2)) {
+      writes.set(path2, {
         lastChange: now,
         cancelWait: () => {
-          writes.delete(path);
+          writes.delete(path2);
           clearTimeout(timeoutHandler);
           return event;
         }
@@ -1595,8 +1602,8 @@ class FSWatcher extends EventEmitter {
   /**
    * Determines whether user has asked to ignore this path.
    */
-  _isIgnored(path, stats) {
-    if (this.options.atomic && DOT_RE.test(path))
+  _isIgnored(path2, stats) {
+    if (this.options.atomic && DOT_RE.test(path2))
       return true;
     if (!this._userIgnored) {
       const { cwd } = this.options;
@@ -1606,17 +1613,17 @@ class FSWatcher extends EventEmitter {
       const list2 = [...ignoredPaths.map(normalizeIgnored(cwd)), ...ignored];
       this._userIgnored = anymatch(list2);
     }
-    return this._userIgnored(path, stats);
+    return this._userIgnored(path2, stats);
   }
-  _isntIgnored(path, stat2) {
-    return !this._isIgnored(path, stat2);
+  _isntIgnored(path2, stat2) {
+    return !this._isIgnored(path2, stat2);
   }
   /**
    * Provides a set of common helpers and properties relating to symlink handling.
    * @param path file or directory pattern being watched
    */
-  _getWatchHelpers(path) {
-    return new WatchHelper(path, this.options.followSymlinks, this);
+  _getWatchHelpers(path2) {
+    return new WatchHelper(path2, this.options.followSymlinks, this);
   }
   // Directory helpers
   // -----------------
@@ -1648,63 +1655,63 @@ class FSWatcher extends EventEmitter {
    * @param item      base path of item/directory
    */
   _remove(directory, item, isDirectory) {
-    const path = sp.join(directory, item);
-    const fullPath = sp.resolve(path);
-    isDirectory = isDirectory != null ? isDirectory : this._watched.has(path) || this._watched.has(fullPath);
-    if (!this._throttle("remove", path, 100))
+    const path2 = sp.join(directory, item);
+    const fullPath = sp.resolve(path2);
+    isDirectory = isDirectory != null ? isDirectory : this._watched.has(path2) || this._watched.has(fullPath);
+    if (!this._throttle("remove", path2, 100))
       return;
     if (!isDirectory && this._watched.size === 1) {
       this.add(directory, item, true);
     }
-    const wp = this._getWatchedDir(path);
+    const wp = this._getWatchedDir(path2);
     const nestedDirectoryChildren = wp.getChildren();
-    nestedDirectoryChildren.forEach((nested) => this._remove(path, nested));
+    nestedDirectoryChildren.forEach((nested) => this._remove(path2, nested));
     const parent = this._getWatchedDir(directory);
     const wasTracked = parent.has(item);
     parent.remove(item);
     if (this._symlinkPaths.has(fullPath)) {
       this._symlinkPaths.delete(fullPath);
     }
-    let relPath = path;
+    let relPath = path2;
     if (this.options.cwd)
-      relPath = sp.relative(this.options.cwd, path);
+      relPath = sp.relative(this.options.cwd, path2);
     if (this.options.awaitWriteFinish && this._pendingWrites.has(relPath)) {
       const event = this._pendingWrites.get(relPath).cancelWait();
       if (event === EVENTS.ADD)
         return;
     }
-    this._watched.delete(path);
+    this._watched.delete(path2);
     this._watched.delete(fullPath);
     const eventName = isDirectory ? EVENTS.UNLINK_DIR : EVENTS.UNLINK;
-    if (wasTracked && !this._isIgnored(path))
-      this._emit(eventName, path);
-    this._closePath(path);
+    if (wasTracked && !this._isIgnored(path2))
+      this._emit(eventName, path2);
+    this._closePath(path2);
   }
   /**
    * Closes all watchers for a path
    */
-  _closePath(path) {
-    this._closeFile(path);
-    const dir = sp.dirname(path);
-    this._getWatchedDir(dir).remove(sp.basename(path));
+  _closePath(path2) {
+    this._closeFile(path2);
+    const dir = sp.dirname(path2);
+    this._getWatchedDir(dir).remove(sp.basename(path2));
   }
   /**
    * Closes only file-specific watchers
    */
-  _closeFile(path) {
-    const closers = this._closers.get(path);
+  _closeFile(path2) {
+    const closers = this._closers.get(path2);
     if (!closers)
       return;
     closers.forEach((closer) => closer());
-    this._closers.delete(path);
+    this._closers.delete(path2);
   }
-  _addPathCloser(path, closer) {
+  _addPathCloser(path2, closer) {
     if (!closer)
       return;
-    let list2 = this._closers.get(path);
+    let list2 = this._closers.get(path2);
     if (!list2) {
       list2 = [];
-      this._closers.set(path, list2);
+      this._closers.set(path2, list2);
     }
     list2.push(closer);
   }
@@ -5247,14 +5254,14 @@ function requireUrlStateMachine() {
       return url.replace(/\u0009|\u000A|\u000D/g, "");
     }
     function shortenPath(url) {
-      const path = url.path;
-      if (path.length === 0) {
+      const path2 = url.path;
+      if (path2.length === 0) {
         return;
       }
-      if (url.scheme === "file" && path.length === 1 && isNormalizedWindowsDriveLetter(path[0])) {
+      if (url.scheme === "file" && path2.length === 1 && isNormalizedWindowsDriveLetter(path2[0])) {
         return;
       }
-      path.pop();
+      path2.pop();
     }
     function includesCredentials(url) {
       return url.username !== "" || url.password !== "";
@@ -12634,10 +12641,10 @@ class IndexingService {
       persistent: true,
       ignoreInitial: true
     });
-    this.watcher.on("change", async (path) => {
-      console.log(`File changed: ${path}`);
-      await this.indexFile(path);
-      if (this.onChange) this.onChange(path);
+    this.watcher.on("change", async (path2) => {
+      console.log(`File changed: ${path2}`);
+      await this.indexFile(path2);
+      if (this.onChange) this.onChange(path2);
     });
   }
   async indexWorkspace() {
@@ -12674,7 +12681,7 @@ class IndexingService {
   async indexFile(filePath) {
     try {
       const content = await fs.readFile(filePath, "utf-8");
-      const fileHash = crypto.createHash("sha256").update(content).digest("hex");
+      const fileHash = crypto$1.createHash("sha256").update(content).digest("hex");
       if (this.fileHashes.get(filePath) === fileHash) {
         return;
       }
@@ -12744,7 +12751,7 @@ class IndexingService {
           content: node.text,
           startLine: node.startPosition.row + 1,
           endLine: node.endPosition.row + 1,
-          hash: crypto.createHash("sha256").update(node.text).digest("hex")
+          hash: crypto$1.createHash("sha256").update(node.text).digest("hex")
         };
         chunks.push(chunk);
       }
@@ -12898,9 +12905,9 @@ class CodeGraphService {
     const affected = /* @__PURE__ */ new Set();
     const queue = [{ path: filePath, currentDepth: 0 }];
     while (queue.length > 0) {
-      const { path, currentDepth } = queue.shift();
+      const { path: path2, currentDepth } = queue.shift();
       if (currentDepth >= depth) continue;
-      const node = this.graph.get(path);
+      const node = this.graph.get(path2);
       if (node) {
         for (const dependent of node.dependents) {
           if (!affected.has(dependent)) {
@@ -12914,8 +12921,8 @@ class CodeGraphService {
   }
   getGraphSummary() {
     const summary = {};
-    for (const [path, node] of this.graph.entries()) {
-      const relPath = this.workspacePath ? path.replace(this.workspacePath.replace(/\\/g, "/"), "").replace(/^[\\/]/, "") : path;
+    for (const [path2, node] of this.graph.entries()) {
+      const relPath = this.workspacePath ? path2.replace(this.workspacePath.replace(/\\/g, "/"), "").replace(/^[\\/]/, "") : path2;
       summary[relPath] = {
         imports: node.imports.map((i) => this.workspacePath ? i.replace(this.workspacePath.replace(/\\/g, "/"), "").replace(/^[\\/]/, "") : i),
         dependents: node.dependents.map((d) => this.workspacePath ? d.replace(this.workspacePath.replace(/\\/g, "/"), "").replace(/^[\\/]/, "") : d)
@@ -12978,18 +12985,18 @@ class DiffService {
       return { success: true, appliedCount: appliedFiles.length };
     } catch (error) {
       console.error("Diff transaction failed, rolling back...", error);
-      for (const [path, originalContent] of backups.entries()) {
+      for (const [path2, originalContent] of backups.entries()) {
         try {
           if (originalContent === "") {
-            if (appliedFiles.includes(path)) {
-              await fs.unlink(path).catch(() => {
+            if (appliedFiles.includes(path2)) {
+              await fs.unlink(path2).catch(() => {
               });
             }
           } else {
-            await fs.writeFile(path, originalContent, "utf-8");
+            await fs.writeFile(path2, originalContent, "utf-8");
           }
         } catch (rollbackError) {
-          console.error(`Rollback failed for ${path}:`, rollbackError);
+          console.error(`Rollback failed for ${path2}:`, rollbackError);
         }
       }
       return { success: false, error: error.message, appliedCount: 0 };
@@ -13955,9 +13962,4589 @@ class HistoryManager {
     }
   }
 }
+class StrategicPlanner {
+  planHistory = /* @__PURE__ */ new Map();
+  taskTemplates = /* @__PURE__ */ new Map();
+  constructor() {
+    this.initializeTaskTemplates();
+  }
+  initializeTaskTemplates() {
+    this.taskTemplates.set("file-analysis", {
+      type: "analysis",
+      tools: ["read_file", "readCode", "getDiagnostics"],
+      parallelizable: true,
+      estimatedComplexity: 2
+    });
+    this.taskTemplates.set("code-search", {
+      type: "analysis",
+      tools: ["grepSearch", "fuzzy_find_file", "search_files"],
+      parallelizable: true,
+      estimatedComplexity: 1
+    });
+    this.taskTemplates.set("file-modification", {
+      type: "implementation",
+      tools: ["write_file", "edit_code", "strReplace"],
+      parallelizable: false,
+      estimatedComplexity: 3
+    });
+    this.taskTemplates.set("validation", {
+      type: "validation",
+      tools: ["getDiagnostics", "run_command"],
+      parallelizable: true,
+      estimatedComplexity: 2
+    });
+  }
+  async createExecutionPlan(context) {
+    const objective = this.extractObjective(context.userRequest);
+    const taskType = this.classifyRequest(context.userRequest);
+    let tasks = [];
+    switch (taskType) {
+      case "bug-fix":
+        tasks = await this.planBugFix(context);
+        break;
+      case "feature-implementation":
+        tasks = await this.planFeatureImplementation(context);
+        break;
+      case "refactoring":
+        tasks = await this.planRefactoring(context);
+        break;
+      case "analysis":
+        tasks = await this.planAnalysis(context);
+        break;
+      default:
+        tasks = await this.planGenericTask(context);
+    }
+    const parallelGroups = this.optimizeParallelExecution(tasks);
+    const plan = {
+      id: `plan_${Date.now()}`,
+      objective,
+      tasks,
+      parallelGroups,
+      estimatedDuration: this.estimateDuration(tasks),
+      riskLevel: this.assessRisk(tasks),
+      fallbackStrategies: this.generateFallbackStrategies(tasks)
+    };
+    this.planHistory.set(plan.id, plan);
+    return plan;
+  }
+  extractObjective(request) {
+    const patterns = [
+      /(?:fix|solve|resolve)\s+(.+)/i,
+      /(?:implement|create|add)\s+(.+)/i,
+      /(?:refactor|improve|optimize)\s+(.+)/i,
+      /(?:analyze|understand|explain)\s+(.+)/i
+    ];
+    for (const pattern of patterns) {
+      const match = request.match(pattern);
+      if (match) return match[1].trim();
+    }
+    return request.slice(0, 100) + (request.length > 100 ? "..." : "");
+  }
+  classifyRequest(request) {
+    const bugKeywords = ["fix", "error", "bug", "issue", "problem", "broken"];
+    const featureKeywords = ["add", "create", "implement", "new", "feature"];
+    const refactorKeywords = ["refactor", "improve", "optimize", "clean", "restructure"];
+    const analysisKeywords = ["analyze", "understand", "explain", "show", "find"];
+    const lowerRequest = request.toLowerCase();
+    if (bugKeywords.some((keyword) => lowerRequest.includes(keyword))) return "bug-fix";
+    if (featureKeywords.some((keyword) => lowerRequest.includes(keyword))) return "feature-implementation";
+    if (refactorKeywords.some((keyword) => lowerRequest.includes(keyword))) return "refactoring";
+    if (analysisKeywords.some((keyword) => lowerRequest.includes(keyword))) return "analysis";
+    return "generic";
+  }
+  async planBugFix(context) {
+    return [
+      {
+        id: "analyze-error",
+        type: "analysis",
+        description: "Analyze error patterns and symptoms",
+        tools: ["getDiagnostics", "grepSearch", "read_file"],
+        dependencies: [],
+        priority: 1,
+        estimatedComplexity: 2,
+        parallelizable: true
+      },
+      {
+        id: "locate-source",
+        type: "analysis",
+        description: "Locate source of the issue",
+        tools: ["fuzzy_find_file", "readCode", "grepSearch"],
+        dependencies: ["analyze-error"],
+        priority: 2,
+        estimatedComplexity: 3,
+        parallelizable: false
+      },
+      {
+        id: "implement-fix",
+        type: "implementation",
+        description: "Implement the bug fix",
+        tools: ["edit_code", "strReplace", "write_file"],
+        dependencies: ["locate-source"],
+        priority: 3,
+        estimatedComplexity: 4,
+        parallelizable: false
+      },
+      {
+        id: "validate-fix",
+        type: "validation",
+        description: "Validate the fix works",
+        tools: ["getDiagnostics", "run_command"],
+        dependencies: ["implement-fix"],
+        priority: 4,
+        estimatedComplexity: 2,
+        parallelizable: true
+      }
+    ];
+  }
+  async planFeatureImplementation(context) {
+    return [
+      {
+        id: "understand-requirements",
+        type: "analysis",
+        description: "Understand feature requirements and context",
+        tools: ["read_file", "readCode", "list_directory"],
+        dependencies: [],
+        priority: 1,
+        estimatedComplexity: 2,
+        parallelizable: true
+      },
+      {
+        id: "design-architecture",
+        type: "analysis",
+        description: "Design feature architecture and integration points",
+        tools: ["grepSearch", "readCode", "fuzzy_find_file"],
+        dependencies: ["understand-requirements"],
+        priority: 2,
+        estimatedComplexity: 3,
+        parallelizable: false
+      },
+      {
+        id: "implement-core",
+        type: "implementation",
+        description: "Implement core feature functionality",
+        tools: ["write_file", "edit_code"],
+        dependencies: ["design-architecture"],
+        priority: 3,
+        estimatedComplexity: 5,
+        parallelizable: false
+      },
+      {
+        id: "integrate-feature",
+        type: "implementation",
+        description: "Integrate feature with existing codebase",
+        tools: ["edit_code", "strReplace", "semantic_rename"],
+        dependencies: ["implement-core"],
+        priority: 4,
+        estimatedComplexity: 4,
+        parallelizable: false
+      },
+      {
+        id: "validate-integration",
+        type: "validation",
+        description: "Validate feature integration and functionality",
+        tools: ["getDiagnostics", "run_command"],
+        dependencies: ["integrate-feature"],
+        priority: 5,
+        estimatedComplexity: 3,
+        parallelizable: true
+      }
+    ];
+  }
+  async planRefactoring(context) {
+    return [
+      {
+        id: "analyze-current-code",
+        type: "analysis",
+        description: "Analyze current code structure and patterns",
+        tools: ["readCode", "grepSearch", "getDiagnostics"],
+        dependencies: [],
+        priority: 1,
+        estimatedComplexity: 3,
+        parallelizable: true
+      },
+      {
+        id: "identify-improvements",
+        type: "analysis",
+        description: "Identify improvement opportunities",
+        tools: ["read_file", "grepSearch"],
+        dependencies: ["analyze-current-code"],
+        priority: 2,
+        estimatedComplexity: 2,
+        parallelizable: false
+      },
+      {
+        id: "plan-refactoring",
+        type: "analysis",
+        description: "Plan refactoring steps and dependencies",
+        tools: ["readCode", "fuzzy_find_file"],
+        dependencies: ["identify-improvements"],
+        priority: 3,
+        estimatedComplexity: 2,
+        parallelizable: false
+      },
+      {
+        id: "execute-refactoring",
+        type: "refactoring",
+        description: "Execute refactoring changes",
+        tools: ["edit_code", "semantic_rename", "smart_relocate"],
+        dependencies: ["plan-refactoring"],
+        priority: 4,
+        estimatedComplexity: 4,
+        parallelizable: false
+      },
+      {
+        id: "validate-refactoring",
+        type: "validation",
+        description: "Validate refactoring maintains functionality",
+        tools: ["getDiagnostics", "run_command"],
+        dependencies: ["execute-refactoring"],
+        priority: 5,
+        estimatedComplexity: 2,
+        parallelizable: true
+      }
+    ];
+  }
+  async planAnalysis(context) {
+    return [
+      {
+        id: "explore-structure",
+        type: "analysis",
+        description: "Explore project structure and organization",
+        tools: ["list_directory", "read_file"],
+        dependencies: [],
+        priority: 1,
+        estimatedComplexity: 1,
+        parallelizable: true
+      },
+      {
+        id: "analyze-components",
+        type: "analysis",
+        description: "Analyze key components and their relationships",
+        tools: ["readCode", "grepSearch", "fuzzy_find_file"],
+        dependencies: ["explore-structure"],
+        priority: 2,
+        estimatedComplexity: 3,
+        parallelizable: true
+      },
+      {
+        id: "generate-insights",
+        type: "analysis",
+        description: "Generate insights and recommendations",
+        tools: ["getDiagnostics", "read_file"],
+        dependencies: ["analyze-components"],
+        priority: 3,
+        estimatedComplexity: 2,
+        parallelizable: false
+      }
+    ];
+  }
+  async planGenericTask(context) {
+    return [
+      {
+        id: "understand-request",
+        type: "analysis",
+        description: "Understand the user request and context",
+        tools: ["read_file", "list_directory"],
+        dependencies: [],
+        priority: 1,
+        estimatedComplexity: 1,
+        parallelizable: true
+      },
+      {
+        id: "execute-task",
+        type: "implementation",
+        description: "Execute the requested task",
+        tools: ["write_file", "edit_code", "run_command"],
+        dependencies: ["understand-request"],
+        priority: 2,
+        estimatedComplexity: 3,
+        parallelizable: false
+      }
+    ];
+  }
+  optimizeParallelExecution(tasks) {
+    const groups = [];
+    const processed = /* @__PURE__ */ new Set();
+    while (processed.size < tasks.length) {
+      const currentGroup = [];
+      for (const task of tasks) {
+        if (processed.has(task.id)) continue;
+        const dependenciesSatisfied = task.dependencies.every((dep) => processed.has(dep));
+        if (dependenciesSatisfied && task.parallelizable) {
+          currentGroup.push(task);
+          processed.add(task.id);
+        } else if (dependenciesSatisfied && currentGroup.length === 0) {
+          currentGroup.push(task);
+          processed.add(task.id);
+          break;
+        }
+      }
+      if (currentGroup.length > 0) {
+        groups.push(currentGroup);
+      } else {
+        const remaining = tasks.filter((t) => !processed.has(t.id));
+        if (remaining.length > 0) {
+          groups.push([remaining[0]]);
+          processed.add(remaining[0].id);
+        }
+      }
+    }
+    return groups;
+  }
+  estimateDuration(tasks) {
+    return tasks.reduce((total, task) => total + task.estimatedComplexity, 0);
+  }
+  assessRisk(tasks) {
+    const totalComplexity = tasks.reduce((sum, task) => sum + task.estimatedComplexity, 0);
+    const hasHighRiskTools = tasks.some(
+      (task) => task.tools.some((tool) => ["run_command", "delete_file", "smart_relocate"].includes(tool))
+    );
+    if (totalComplexity > 15 || hasHighRiskTools) return "high";
+    if (totalComplexity > 8) return "medium";
+    return "low";
+  }
+  generateFallbackStrategies(tasks) {
+    const strategies = [];
+    if (tasks.some((t) => t.type === "implementation")) {
+      strategies.push("Break down complex implementations into smaller steps");
+      strategies.push("Use alternative tools if primary tools fail");
+    }
+    if (tasks.some((t) => t.tools.includes("run_command"))) {
+      strategies.push("Provide manual command instructions if execution fails");
+    }
+    if (tasks.some((t) => t.type === "validation")) {
+      strategies.push("Skip validation if tools are unavailable");
+    }
+    strategies.push("Request user guidance if automated approaches fail");
+    return strategies;
+  }
+  getPlanHistory() {
+    return Array.from(this.planHistory.values());
+  }
+  getPlan(planId) {
+    return this.planHistory.get(planId);
+  }
+}
+class ContextMemory {
+  memoryPath;
+  codePatterns = /* @__PURE__ */ new Map();
+  userPreferences = /* @__PURE__ */ new Map();
+  errorPatterns = /* @__PURE__ */ new Map();
+  successfulStrategies = /* @__PURE__ */ new Map();
+  projectContexts = /* @__PURE__ */ new Map();
+  sessionHistory = [];
+  currentSession;
+  constructor() {
+    this.memoryPath = path.join(app.getPath("userData"), "context-memory");
+    this.ensureMemoryDirectory();
+    this.loadMemory();
+  }
+  ensureMemoryDirectory() {
+    if (!fs$1.existsSync(this.memoryPath)) {
+      fs$1.mkdirSync(this.memoryPath, { recursive: true });
+    }
+  }
+  async loadMemory() {
+    try {
+      await Promise.all([
+        this.loadCodePatterns(),
+        this.loadUserPreferences(),
+        this.loadErrorPatterns(),
+        this.loadSuccessfulStrategies(),
+        this.loadProjectContexts(),
+        this.loadSessionHistory()
+      ]);
+    } catch (error) {
+      console.warn("Failed to load some memory components:", error);
+    }
+  }
+  async loadCodePatterns() {
+    const filePath = path.join(this.memoryPath, "code-patterns.json");
+    if (fs$1.existsSync(filePath)) {
+      const data = JSON.parse(fs$1.readFileSync(filePath, "utf8"));
+      data.forEach((pattern) => {
+        pattern.lastSeen = new Date(pattern.lastSeen);
+        this.codePatterns.set(pattern.id, pattern);
+      });
+    }
+  }
+  async loadUserPreferences() {
+    const filePath = path.join(this.memoryPath, "user-preferences.json");
+    if (fs$1.existsSync(filePath)) {
+      const data = JSON.parse(fs$1.readFileSync(filePath, "utf8"));
+      data.forEach((pref) => {
+        pref.lastUpdated = new Date(pref.lastUpdated);
+        this.userPreferences.set(pref.key, pref);
+      });
+    }
+  }
+  async loadErrorPatterns() {
+    const filePath = path.join(this.memoryPath, "error-patterns.json");
+    if (fs$1.existsSync(filePath)) {
+      const data = JSON.parse(fs$1.readFileSync(filePath, "utf8"));
+      data.forEach((error) => {
+        error.lastOccurrence = new Date(error.lastOccurrence);
+        this.errorPatterns.set(error.id, error);
+      });
+    }
+  }
+  async loadSuccessfulStrategies() {
+    const filePath = path.join(this.memoryPath, "successful-strategies.json");
+    if (fs$1.existsSync(filePath)) {
+      const data = JSON.parse(fs$1.readFileSync(filePath, "utf8"));
+      data.forEach((strategy) => {
+        strategy.lastUsed = new Date(strategy.lastUsed);
+        this.successfulStrategies.set(strategy.id, strategy);
+      });
+    }
+  }
+  async loadProjectContexts() {
+    const filePath = path.join(this.memoryPath, "project-contexts.json");
+    if (fs$1.existsSync(filePath)) {
+      const data = JSON.parse(fs$1.readFileSync(filePath, "utf8"));
+      data.forEach((context) => {
+        context.lastAnalyzed = new Date(context.lastAnalyzed);
+        context.patterns.forEach((p) => p.lastSeen = new Date(p.lastSeen));
+        this.projectContexts.set(context.workspacePath, context);
+      });
+    }
+  }
+  async loadSessionHistory() {
+    const filePath = path.join(this.memoryPath, "session-history.json");
+    if (fs$1.existsSync(filePath)) {
+      const data = JSON.parse(fs$1.readFileSync(filePath, "utf8"));
+      this.sessionHistory = data.map((session) => ({
+        ...session,
+        startTime: new Date(session.startTime),
+        endTime: session.endTime ? new Date(session.endTime) : void 0,
+        interactions: session.interactions.map((i) => ({
+          ...i,
+          timestamp: new Date(i.timestamp)
+        }))
+      }));
+    }
+  }
+  async saveMemory() {
+    try {
+      await Promise.all([
+        this.saveCodePatterns(),
+        this.saveUserPreferences(),
+        this.saveErrorPatterns(),
+        this.saveSuccessfulStrategies(),
+        this.saveProjectContexts(),
+        this.saveSessionHistory()
+      ]);
+    } catch (error) {
+      console.error("Failed to save memory:", error);
+    }
+  }
+  async saveCodePatterns() {
+    const filePath = path.join(this.memoryPath, "code-patterns.json");
+    const data = Array.from(this.codePatterns.values());
+    fs$1.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  }
+  async saveUserPreferences() {
+    const filePath = path.join(this.memoryPath, "user-preferences.json");
+    const data = Array.from(this.userPreferences.values());
+    fs$1.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  }
+  async saveErrorPatterns() {
+    const filePath = path.join(this.memoryPath, "error-patterns.json");
+    const data = Array.from(this.errorPatterns.values());
+    fs$1.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  }
+  async saveSuccessfulStrategies() {
+    const filePath = path.join(this.memoryPath, "successful-strategies.json");
+    const data = Array.from(this.successfulStrategies.values());
+    fs$1.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  }
+  async saveProjectContexts() {
+    const filePath = path.join(this.memoryPath, "project-contexts.json");
+    const data = Array.from(this.projectContexts.values());
+    fs$1.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  }
+  async saveSessionHistory() {
+    const filePath = path.join(this.memoryPath, "session-history.json");
+    const recentSessions = this.sessionHistory.slice(-100);
+    fs$1.writeFileSync(filePath, JSON.stringify(recentSessions, null, 2));
+  }
+  // Code Pattern Management
+  recordCodePattern(pattern, context, projectType, language) {
+    const id = this.generatePatternId(pattern, context);
+    const existing = this.codePatterns.get(id);
+    if (existing) {
+      existing.frequency++;
+      existing.lastSeen = /* @__PURE__ */ new Date();
+    } else {
+      this.codePatterns.set(id, {
+        id,
+        pattern,
+        context,
+        frequency: 1,
+        lastSeen: /* @__PURE__ */ new Date(),
+        projectType,
+        language
+      });
+    }
+  }
+  getRelevantCodePatterns(context, projectType, language) {
+    return Array.from(this.codePatterns.values()).filter((p) => {
+      const contextMatch = p.context.toLowerCase().includes(context.toLowerCase()) || context.toLowerCase().includes(p.context.toLowerCase());
+      const projectMatch = !projectType || !p.projectType || p.projectType === projectType;
+      const languageMatch = !language || !p.language || p.language === language;
+      return contextMatch && projectMatch && languageMatch;
+    }).sort((a, b) => b.frequency - a.frequency).slice(0, 10);
+  }
+  // User Preference Management
+  recordUserPreference(key, value, confidence = 1) {
+    const existing = this.userPreferences.get(key);
+    if (existing) {
+      const totalWeight = existing.confidence + confidence;
+      existing.value = this.mergePreferenceValues(existing.value, value, existing.confidence / totalWeight);
+      existing.confidence = Math.min(totalWeight, 10);
+      existing.lastUpdated = /* @__PURE__ */ new Date();
+    } else {
+      this.userPreferences.set(key, {
+        key,
+        value,
+        confidence,
+        lastUpdated: /* @__PURE__ */ new Date()
+      });
+    }
+  }
+  getUserPreference(key) {
+    const pref = this.userPreferences.get(key);
+    return pref?.value;
+  }
+  // Error Pattern Management
+  recordErrorPattern(errorType, context, solution, success) {
+    const id = this.generateErrorId(errorType, context);
+    const existing = this.errorPatterns.get(id);
+    if (existing) {
+      existing.occurrences++;
+      existing.lastOccurrence = /* @__PURE__ */ new Date();
+      if (success) {
+        existing.successRate = (existing.successRate * (existing.occurrences - 1) + 1) / existing.occurrences;
+        existing.solution = solution;
+      } else {
+        existing.successRate = existing.successRate * (existing.occurrences - 1) / existing.occurrences;
+      }
+    } else {
+      this.errorPatterns.set(id, {
+        id,
+        errorType,
+        context,
+        solution,
+        successRate: success ? 1 : 0,
+        occurrences: 1,
+        lastOccurrence: /* @__PURE__ */ new Date()
+      });
+    }
+  }
+  getSimilarErrorPatterns(errorType, context) {
+    return Array.from(this.errorPatterns.values()).filter((p) => {
+      const typeMatch = p.errorType.toLowerCase().includes(errorType.toLowerCase()) || errorType.toLowerCase().includes(p.errorType.toLowerCase());
+      const contextMatch = p.context.toLowerCase().includes(context.toLowerCase()) || context.toLowerCase().includes(p.context.toLowerCase());
+      return typeMatch || contextMatch;
+    }).sort((a, b) => b.successRate - a.successRate).slice(0, 5);
+  }
+  // Strategy Management
+  recordSuccessfulStrategy(taskType, strategy, tools, duration, success) {
+    const id = this.generateStrategyId(taskType, strategy);
+    const existing = this.successfulStrategies.get(id);
+    if (existing) {
+      existing.usageCount++;
+      existing.lastUsed = /* @__PURE__ */ new Date();
+      existing.averageDuration = (existing.averageDuration * (existing.usageCount - 1) + duration) / existing.usageCount;
+      if (success) {
+        existing.successRate = (existing.successRate * (existing.usageCount - 1) + 1) / existing.usageCount;
+      } else {
+        existing.successRate = existing.successRate * (existing.usageCount - 1) / existing.usageCount;
+      }
+    } else {
+      this.successfulStrategies.set(id, {
+        id,
+        taskType,
+        strategy,
+        tools,
+        successRate: success ? 1 : 0,
+        averageDuration: duration,
+        usageCount: 1,
+        lastUsed: /* @__PURE__ */ new Date()
+      });
+    }
+  }
+  getBestStrategies(taskType) {
+    return Array.from(this.successfulStrategies.values()).filter((s) => s.taskType.toLowerCase().includes(taskType.toLowerCase()) || taskType.toLowerCase().includes(s.taskType.toLowerCase())).sort((a, b) => b.successRate - a.successRate).slice(0, 3);
+  }
+  // Project Context Management
+  async analyzeProjectContext(workspacePath) {
+    const existing = this.projectContexts.get(workspacePath);
+    const now = /* @__PURE__ */ new Date();
+    if (existing && now.getTime() - existing.lastAnalyzed.getTime() < 60 * 60 * 1e3) {
+      return existing;
+    }
+    const context = {
+      workspacePath,
+      projectType: await this.detectProjectType(workspacePath),
+      languages: await this.detectLanguages(workspacePath),
+      frameworks: await this.detectFrameworks(workspacePath),
+      patterns: existing?.patterns || [],
+      commonFiles: await this.findCommonFiles(workspacePath),
+      lastAnalyzed: now
+    };
+    await this.checkPackageStatus(context);
+    this.projectContexts.set(workspacePath, context);
+    await this.saveProjectContexts();
+    return context;
+  }
+  // Session Management
+  startSession() {
+    const sessionId = `session_${Date.now()}`;
+    this.currentSession = {
+      sessionId,
+      startTime: /* @__PURE__ */ new Date(),
+      interactions: [],
+      outcomes: []
+    };
+    return sessionId;
+  }
+  recordInteraction(userRequest, agentResponse, toolsUsed, success, duration, context) {
+    if (!this.currentSession) return;
+    this.currentSession.interactions.push({
+      timestamp: /* @__PURE__ */ new Date(),
+      userRequest,
+      agentResponse,
+      toolsUsed,
+      success,
+      duration,
+      context
+    });
+  }
+  endSession(userSatisfaction) {
+    if (!this.currentSession) return;
+    this.currentSession.endTime = /* @__PURE__ */ new Date();
+    this.currentSession.userSatisfaction = userSatisfaction;
+    this.sessionHistory.push(this.currentSession);
+    this.currentSession = void 0;
+  }
+  // Helper methods
+  generatePatternId(pattern, context) {
+    return `pattern_${this.hashString(pattern + context)}`;
+  }
+  generateErrorId(errorType, context) {
+    return `error_${this.hashString(errorType + context)}`;
+  }
+  generateStrategyId(taskType, strategy) {
+    return `strategy_${this.hashString(taskType + strategy)}`;
+  }
+  hashString(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash;
+    }
+    return Math.abs(hash).toString(36);
+  }
+  mergePreferenceValues(existing, newValue, existingWeight) {
+    if (typeof existing === "number" && typeof newValue === "number") {
+      return existing * existingWeight + newValue * (1 - existingWeight);
+    }
+    return newValue;
+  }
+  async detectProjectType(workspacePath) {
+    try {
+      const files = fs$1.readdirSync(workspacePath);
+      if (files.includes("package.json")) {
+        const packageJson = JSON.parse(fs$1.readFileSync(path.join(workspacePath, "package.json"), "utf8"));
+        if (packageJson.dependencies?.react) return "react";
+        if (packageJson.dependencies?.vue) return "vue";
+        if (packageJson.dependencies?.angular) return "angular";
+        if (packageJson.dependencies?.electron) return "electron";
+        return "nodejs";
+      }
+      if (files.includes("requirements.txt") || files.includes("setup.py")) return "python";
+      if (files.includes("Cargo.toml")) return "rust";
+      if (files.includes("go.mod")) return "go";
+      if (files.includes("pom.xml") || files.includes("build.gradle")) return "java";
+      return "unknown";
+    } catch {
+      return "unknown";
+    }
+  }
+  async detectLanguages(workspacePath) {
+    const languages = /* @__PURE__ */ new Set();
+    try {
+      const walkDir = (dir, depth = 0) => {
+        if (depth > 3) return;
+        const files = fs$1.readdirSync(dir);
+        for (const file of files) {
+          const filePath = path.join(dir, file);
+          const stat2 = fs$1.statSync(filePath);
+          if (stat2.isDirectory() && !file.startsWith(".") && file !== "node_modules") {
+            walkDir(filePath, depth + 1);
+          } else if (stat2.isFile()) {
+            const ext = path.extname(file).toLowerCase();
+            const langMap = {
+              ".js": "javascript",
+              ".ts": "typescript",
+              ".jsx": "javascript",
+              ".tsx": "typescript",
+              ".py": "python",
+              ".rs": "rust",
+              ".go": "go",
+              ".java": "java",
+              ".cpp": "cpp",
+              ".c": "c",
+              ".cs": "csharp",
+              ".php": "php",
+              ".rb": "ruby"
+            };
+            if (langMap[ext]) {
+              languages.add(langMap[ext]);
+            }
+          }
+        }
+      };
+      walkDir(workspacePath);
+    } catch {
+    }
+    return Array.from(languages);
+  }
+  async detectFrameworks(workspacePath) {
+    const frameworks = [];
+    try {
+      const packageJsonPath = path.join(workspacePath, "package.json");
+      if (fs$1.existsSync(packageJsonPath)) {
+        const packageJson = JSON.parse(fs$1.readFileSync(packageJsonPath, "utf8"));
+        const deps = { ...packageJson.dependencies, ...packageJson.devDependencies };
+        const frameworkMap = {
+          "react": "React",
+          "vue": "Vue.js",
+          "@angular/core": "Angular",
+          "electron": "Electron",
+          "express": "Express.js",
+          "next": "Next.js",
+          "nuxt": "Nuxt.js",
+          "svelte": "Svelte",
+          "vite": "Vite",
+          "webpack": "Webpack"
+        };
+        for (const [dep, framework] of Object.entries(frameworkMap)) {
+          if (deps[dep]) {
+            frameworks.push(framework);
+          }
+        }
+      }
+    } catch {
+    }
+    return frameworks;
+  }
+  async findCommonFiles(workspacePath) {
+    const commonFiles = [];
+    try {
+      const files = fs$1.readdirSync(workspacePath);
+      const importantFiles = [
+        "package.json",
+        "README.md",
+        "tsconfig.json",
+        "vite.config.ts",
+        "webpack.config.js",
+        ".gitignore",
+        "Dockerfile",
+        "docker-compose.yml"
+      ];
+      for (const file of importantFiles) {
+        if (files.includes(file)) {
+          commonFiles.push(file);
+        }
+      }
+    } catch {
+    }
+    return commonFiles;
+  }
+  // Public getters for memory data
+  getCodePatterns() {
+    return Array.from(this.codePatterns.values());
+  }
+  getUserPreferences() {
+    return Array.from(this.userPreferences.values());
+  }
+  getErrorPatterns() {
+    return Array.from(this.errorPatterns.values());
+  }
+  getSuccessfulStrategies() {
+    return Array.from(this.successfulStrategies.values());
+  }
+  getProjectContexts() {
+    return Array.from(this.projectContexts.values());
+  }
+  getSessionHistory() {
+    return this.sessionHistory;
+  }
+  async checkPackageStatus(context) {
+    const packageJsonPath = path.join(context.workspacePath, "package.json");
+    const nodeModulesPath = path.join(context.workspacePath, "node_modules");
+    const packageStatus = {
+      hasPackageJson: fs$1.existsSync(packageJsonPath),
+      hasNodeModules: fs$1.existsSync(nodeModulesPath),
+      installedPackages: [],
+      missingPackages: [],
+      lastChecked: /* @__PURE__ */ new Date()
+    };
+    if (packageStatus.hasPackageJson) {
+      try {
+        const packageJson = JSON.parse(fs$1.readFileSync(packageJsonPath, "utf8"));
+        const allDeps = {
+          ...packageJson.dependencies || {},
+          ...packageJson.devDependencies || {}
+        };
+        for (const [packageName] of Object.entries(allDeps)) {
+          const packagePath = path.join(nodeModulesPath, packageName);
+          if (fs$1.existsSync(packagePath)) {
+            packageStatus.installedPackages.push(packageName);
+          } else {
+            packageStatus.missingPackages.push(packageName);
+          }
+        }
+      } catch (error) {
+      }
+    }
+    context.packageStatus = packageStatus;
+  }
+  getCurrentWorkspaceContext(workspacePath) {
+    return this.projectContexts.get(workspacePath) || null;
+  }
+  async refreshPackageStatus(workspacePath) {
+    const context = this.projectContexts.get(workspacePath);
+    if (context) {
+      await this.checkPackageStatus(context);
+      await this.saveProjectContexts();
+    }
+  }
+}
+class LearningSystem {
+  contextMemory;
+  adaptationRules = /* @__PURE__ */ new Map();
+  learningInsights = [];
+  constructor(contextMemory2) {
+    this.contextMemory = contextMemory2;
+    this.initializeAdaptationRules();
+  }
+  initializeAdaptationRules() {
+    const basicRules = [
+      {
+        id: "prefer_successful_tools",
+        condition: "tool_success_rate > 0.8",
+        action: "prioritize_tool",
+        priority: 1,
+        successRate: 1,
+        usageCount: 0
+      },
+      {
+        id: "avoid_failed_patterns",
+        condition: "pattern_failure_rate > 0.6",
+        action: "suggest_alternative",
+        priority: 2,
+        successRate: 0.9,
+        usageCount: 0
+      },
+      {
+        id: "adapt_to_user_style",
+        condition: "user_preference_confidence > 0.7",
+        action: "adjust_approach",
+        priority: 3,
+        successRate: 0.85,
+        usageCount: 0
+      }
+    ];
+    basicRules.forEach((rule) => {
+      this.adaptationRules.set(rule.id, rule);
+    });
+  }
+  async analyzeInteractionPatterns() {
+    const insights = [];
+    const sessions = this.contextMemory.getSessionHistory();
+    if (sessions.length === 0) return insights;
+    const toolInsights = this.analyzeToolUsagePatterns(sessions);
+    insights.push(...toolInsights);
+    const errorInsights = this.analyzeErrorPatterns();
+    insights.push(...errorInsights);
+    const preferenceInsights = this.analyzeUserPreferences();
+    insights.push(...preferenceInsights);
+    const strategyInsights = this.analyzeSuccessfulStrategies();
+    insights.push(...strategyInsights);
+    this.learningInsights = insights;
+    return insights;
+  }
+  analyzeToolUsagePatterns(sessions) {
+    const insights = [];
+    const toolStats = /* @__PURE__ */ new Map();
+    sessions.forEach((session) => {
+      session.interactions.forEach((interaction) => {
+        interaction.toolsUsed.forEach((tool) => {
+          const stats = toolStats.get(tool) || { success: 0, total: 0, avgDuration: 0 };
+          stats.total++;
+          if (interaction.success) stats.success++;
+          stats.avgDuration = (stats.avgDuration * (stats.total - 1) + interaction.duration) / stats.total;
+          toolStats.set(tool, stats);
+        });
+      });
+    });
+    toolStats.forEach((stats, tool) => {
+      const successRate = stats.success / stats.total;
+      if (successRate > 0.9 && stats.total > 5) {
+        insights.push({
+          type: "pattern",
+          confidence: Math.min(successRate, 0.95),
+          description: `Tool "${tool}" has high success rate (${(successRate * 100).toFixed(1)}%)`,
+          recommendation: `Prioritize using "${tool}" for similar tasks`,
+          evidence: [`${stats.success}/${stats.total} successful uses`, `Average duration: ${stats.avgDuration.toFixed(1)}s`]
+        });
+      } else if (successRate < 0.5 && stats.total > 3) {
+        insights.push({
+          type: "pattern",
+          confidence: 1 - successRate,
+          description: `Tool "${tool}" has low success rate (${(successRate * 100).toFixed(1)}%)`,
+          recommendation: `Consider alternative tools or improve "${tool}" usage strategy`,
+          evidence: [`${stats.success}/${stats.total} successful uses`, `High failure rate detected`]
+        });
+      }
+    });
+    return insights;
+  }
+  analyzeErrorPatterns() {
+    const insights = [];
+    const errorPatterns = this.contextMemory.getErrorPatterns();
+    errorPatterns.forEach((pattern) => {
+      if (pattern.successRate > 0.8 && pattern.occurrences > 2) {
+        insights.push({
+          type: "error",
+          confidence: pattern.successRate,
+          description: `Reliable solution found for "${pattern.errorType}" errors`,
+          recommendation: `Apply solution: ${pattern.solution}`,
+          evidence: [
+            `Success rate: ${(pattern.successRate * 100).toFixed(1)}%`,
+            `Occurrences: ${pattern.occurrences}`,
+            `Last seen: ${pattern.lastOccurrence.toLocaleDateString()}`
+          ]
+        });
+      } else if (pattern.successRate < 0.3 && pattern.occurrences > 3) {
+        insights.push({
+          type: "error",
+          confidence: 1 - pattern.successRate,
+          description: `Persistent problem with "${pattern.errorType}" errors`,
+          recommendation: `Research alternative solutions or escalate to user`,
+          evidence: [
+            `Low success rate: ${(pattern.successRate * 100).toFixed(1)}%`,
+            `Frequent occurrences: ${pattern.occurrences}`,
+            `Current solution may be inadequate`
+          ]
+        });
+      }
+    });
+    return insights;
+  }
+  analyzeUserPreferences() {
+    const insights = [];
+    const preferences = this.contextMemory.getUserPreferences();
+    preferences.forEach((pref) => {
+      if (pref.confidence > 0.7) {
+        insights.push({
+          type: "preference",
+          confidence: pref.confidence / 10,
+          // Normalize to 0-1
+          description: `Strong user preference detected for "${pref.key}"`,
+          recommendation: `Adapt behavior to match preference: ${JSON.stringify(pref.value)}`,
+          evidence: [
+            `Confidence: ${pref.confidence.toFixed(1)}/10`,
+            `Last updated: ${pref.lastUpdated.toLocaleDateString()}`
+          ]
+        });
+      }
+    });
+    return insights;
+  }
+  analyzeSuccessfulStrategies() {
+    const insights = [];
+    const strategies = this.contextMemory.getSuccessfulStrategies();
+    strategies.forEach((strategy) => {
+      if (strategy.successRate > 0.85 && strategy.usageCount > 3) {
+        insights.push({
+          type: "strategy",
+          confidence: strategy.successRate,
+          description: `Highly effective strategy for "${strategy.taskType}" tasks`,
+          recommendation: `Prioritize strategy: ${strategy.strategy}`,
+          evidence: [
+            `Success rate: ${(strategy.successRate * 100).toFixed(1)}%`,
+            `Usage count: ${strategy.usageCount}`,
+            `Average duration: ${strategy.averageDuration.toFixed(1)}s`,
+            `Tools used: ${strategy.tools.join(", ")}`
+          ]
+        });
+      }
+    });
+    return insights;
+  }
+  async adaptBehavior(context) {
+    const adaptations = [];
+    const insights = await this.analyzeInteractionPatterns();
+    for (const insight of insights) {
+      const applicableRules = this.findApplicableRules(insight, context);
+      for (const rule of applicableRules) {
+        const adaptation = this.applyAdaptationRule(rule, insight, context);
+        if (adaptation) {
+          adaptations.push(adaptation);
+          rule.usageCount++;
+        }
+      }
+    }
+    return adaptations;
+  }
+  findApplicableRules(insight, context) {
+    const applicableRules = [];
+    this.adaptationRules.forEach((rule) => {
+      if (this.evaluateRuleCondition(rule.condition, insight, context)) {
+        applicableRules.push(rule);
+      }
+    });
+    return applicableRules.sort((a, b) => b.priority - a.priority);
+  }
+  evaluateRuleCondition(condition, insight, context) {
+    if (condition.includes("tool_success_rate") && insight.type === "pattern") {
+      return insight.confidence > 0.8;
+    }
+    if (condition.includes("pattern_failure_rate") && insight.type === "pattern") {
+      return insight.confidence > 0.6 && insight.description.includes("low success rate");
+    }
+    if (condition.includes("user_preference_confidence") && insight.type === "preference") {
+      return insight.confidence > 0.7;
+    }
+    return false;
+  }
+  applyAdaptationRule(rule, insight, context) {
+    switch (rule.action) {
+      case "prioritize_tool":
+        if (insight.type === "pattern" && insight.description.includes("high success rate")) {
+          return `Prioritizing successful tools based on learned patterns`;
+        }
+        break;
+      case "suggest_alternative":
+        if (insight.type === "pattern" && insight.description.includes("low success rate")) {
+          return `Suggesting alternative approaches due to poor performance patterns`;
+        }
+        break;
+      case "adjust_approach":
+        if (insight.type === "preference") {
+          return `Adjusting approach based on learned user preferences`;
+        }
+        break;
+    }
+    return null;
+  }
+  async generateRecommendations(taskType, context) {
+    const recommendations = [];
+    const strategies = this.contextMemory.getBestStrategies(taskType);
+    strategies.forEach((strategy) => {
+      if (strategy.successRate > 0.8) {
+        recommendations.push(`Use proven strategy: ${strategy.strategy} (${(strategy.successRate * 100).toFixed(1)}% success rate)`);
+      }
+    });
+    const errorPatterns = this.contextMemory.getSimilarErrorPatterns(taskType, JSON.stringify(context));
+    errorPatterns.forEach((pattern) => {
+      if (pattern.successRate < 0.5) {
+        recommendations.push(`Avoid common pitfall: ${pattern.errorType} - ${pattern.solution}`);
+      }
+    });
+    const codePatterns = this.contextMemory.getRelevantCodePatterns(taskType);
+    codePatterns.slice(0, 3).forEach((pattern) => {
+      recommendations.push(`Consider using pattern: ${pattern.pattern} (used ${pattern.frequency} times)`);
+    });
+    return recommendations;
+  }
+  async updateLearning(interaction) {
+    this.contextMemory.recordInteraction(
+      interaction.userRequest,
+      interaction.agentResponse,
+      interaction.toolsUsed,
+      interaction.success,
+      interaction.duration,
+      interaction.context
+    );
+    await this.extractAndRecordPatterns(interaction);
+    await this.updateStrategyMetrics(interaction);
+    if (!interaction.success) {
+      await this.learnFromError(interaction);
+    }
+  }
+  async extractAndRecordPatterns(interaction) {
+    if (interaction.success && interaction.toolsUsed.includes("write_file")) {
+      this.contextMemory.recordCodePattern(
+        interaction.toolsUsed.join(" -> "),
+        interaction.userRequest,
+        interaction.context?.projectType,
+        interaction.context?.language
+      );
+    }
+  }
+  async updateStrategyMetrics(interaction) {
+    const strategy = interaction.toolsUsed.join(" -> ");
+    const taskType = this.classifyTaskType(interaction.userRequest);
+    this.contextMemory.recordSuccessfulStrategy(
+      taskType,
+      strategy,
+      interaction.toolsUsed,
+      interaction.duration,
+      interaction.success
+    );
+  }
+  async learnFromError(interaction) {
+    const errorType = this.extractErrorType(interaction.agentResponse);
+    const context = interaction.userRequest;
+    const attemptedSolution = interaction.toolsUsed.join(" -> ");
+    this.contextMemory.recordErrorPattern(
+      errorType,
+      context,
+      attemptedSolution,
+      false
+    );
+  }
+  classifyTaskType(userRequest) {
+    const lowerRequest = userRequest.toLowerCase();
+    if (lowerRequest.includes("fix") || lowerRequest.includes("error") || lowerRequest.includes("bug")) {
+      return "bug-fix";
+    }
+    if (lowerRequest.includes("add") || lowerRequest.includes("create") || lowerRequest.includes("implement")) {
+      return "feature-implementation";
+    }
+    if (lowerRequest.includes("refactor") || lowerRequest.includes("improve") || lowerRequest.includes("optimize")) {
+      return "refactoring";
+    }
+    if (lowerRequest.includes("analyze") || lowerRequest.includes("understand") || lowerRequest.includes("explain")) {
+      return "analysis";
+    }
+    return "general";
+  }
+  extractErrorType(agentResponse) {
+    if (agentResponse.includes("syntax error")) return "syntax-error";
+    if (agentResponse.includes("file not found")) return "file-not-found";
+    if (agentResponse.includes("permission denied")) return "permission-error";
+    if (agentResponse.includes("timeout")) return "timeout-error";
+    return "unknown-error";
+  }
+  async generateLearningMetrics() {
+    const sessions = this.contextMemory.getSessionHistory();
+    const allInteractions = sessions.flatMap((s) => s.interactions);
+    if (allInteractions.length === 0) {
+      return {
+        totalInteractions: 0,
+        successRate: 0,
+        averageResponseTime: 0,
+        userSatisfactionScore: 0,
+        improvementTrends: []
+      };
+    }
+    const successfulInteractions = allInteractions.filter((i) => i.success);
+    const successRate = successfulInteractions.length / allInteractions.length;
+    const averageResponseTime = allInteractions.reduce((sum, i) => sum + i.duration, 0) / allInteractions.length;
+    const satisfactionScores = sessions.filter((s) => s.userSatisfaction !== void 0).map((s) => s.userSatisfaction);
+    const userSatisfactionScore = satisfactionScores.length > 0 ? satisfactionScores.reduce((sum, score) => sum + score, 0) / satisfactionScores.length : 0;
+    const improvementTrends = this.calculateImprovementTrends(sessions);
+    return {
+      totalInteractions: allInteractions.length,
+      successRate,
+      averageResponseTime,
+      userSatisfactionScore,
+      improvementTrends
+    };
+  }
+  calculateImprovementTrends(sessions) {
+    if (sessions.length < 2) return [];
+    const trends = [];
+    const recentSessions = sessions.slice(-10);
+    const olderSessions = sessions.slice(-20, -10);
+    if (olderSessions.length > 0) {
+      const recentSuccessRate = this.calculateSuccessRate(recentSessions);
+      const olderSuccessRate = this.calculateSuccessRate(olderSessions);
+      trends.push({
+        period: "recent",
+        metric: "success_rate",
+        change: recentSuccessRate - olderSuccessRate
+      });
+      const recentAvgTime = this.calculateAverageTime(recentSessions);
+      const olderAvgTime = this.calculateAverageTime(olderSessions);
+      trends.push({
+        period: "recent",
+        metric: "response_time",
+        change: recentAvgTime - olderAvgTime
+      });
+    }
+    return trends;
+  }
+  calculateSuccessRate(sessions) {
+    const allInteractions = sessions.flatMap((s) => s.interactions);
+    if (allInteractions.length === 0) return 0;
+    const successful = allInteractions.filter((i) => i.success).length;
+    return successful / allInteractions.length;
+  }
+  calculateAverageTime(sessions) {
+    const allInteractions = sessions.flatMap((s) => s.interactions);
+    if (allInteractions.length === 0) return 0;
+    return allInteractions.reduce((sum, i) => sum + i.duration, 0) / allInteractions.length;
+  }
+  getLearningInsights() {
+    return this.learningInsights;
+  }
+  getAdaptationRules() {
+    return Array.from(this.adaptationRules.values());
+  }
+}
+class CodeIntelligence {
+  symbolIndex = /* @__PURE__ */ new Map();
+  relationshipGraph = /* @__PURE__ */ new Map();
+  patternLibrary = [];
+  workspaceContext = /* @__PURE__ */ new Map();
+  constructor() {
+    this.initializePatternLibrary();
+  }
+  initializePatternLibrary() {
+    this.patternLibrary = [
+      {
+        id: "singleton-pattern",
+        name: "Singleton Pattern",
+        pattern: /class\s+\w+\s*{[\s\S]*?private\s+static\s+\w+[\s\S]*?getInstance\(\)/,
+        description: "Singleton design pattern detected",
+        category: "design-pattern",
+        severity: "info",
+        suggestion: "Consider dependency injection for better testability"
+      },
+      {
+        id: "long-method",
+        name: "Long Method",
+        pattern: /function\s+\w+\([^)]*\)\s*{([\s\S]*?)}/,
+        description: "Method is too long and complex",
+        category: "code-smell",
+        severity: "warning",
+        suggestion: "Break down into smaller, focused methods"
+      },
+      {
+        id: "magic-numbers",
+        name: "Magic Numbers",
+        pattern: new RegExp("(?<![a-zA-Z_$])\\d{2,}(?![a-zA-Z_$])"),
+        description: "Magic numbers should be replaced with named constants",
+        category: "code-smell",
+        severity: "warning",
+        suggestion: "Extract magic numbers into named constants"
+      },
+      {
+        id: "unused-imports",
+        name: "Unused Imports",
+        pattern: /import\s+.*?from\s+['"][^'"]+['"]/,
+        description: "Potentially unused import detected",
+        category: "code-smell",
+        severity: "info",
+        suggestion: "Remove unused imports to reduce bundle size"
+      }
+    ];
+  }
+  async analyzeWorkspace(workspacePath) {
+    const context = {
+      currentFile: "",
+      symbols: /* @__PURE__ */ new Map(),
+      relationships: [],
+      patterns: [],
+      metrics: this.initializeMetrics(),
+      suggestions: []
+    };
+    try {
+      await this.indexWorkspaceSymbols(workspacePath, context);
+      await this.analyzeRelationships(workspacePath, context);
+      await this.detectPatterns(workspacePath, context);
+      context.metrics = await this.calculateMetrics(workspacePath, context);
+      context.suggestions = await this.generateSuggestions(context);
+    } catch (error) {
+      console.error("Error analyzing workspace:", error);
+    }
+    this.workspaceContext.set(workspacePath, context);
+    return context;
+  }
+  async indexWorkspaceSymbols(workspacePath, context) {
+    const files = await this.findCodeFiles(workspacePath);
+    for (const file of files) {
+      try {
+        const content = fs$1.readFileSync(file, "utf8");
+        const symbols = await this.extractSymbols(file, content);
+        symbols.forEach((symbol) => {
+          context.symbols.set(`${file}:${symbol.name}`, symbol);
+          this.symbolIndex.set(`${file}:${symbol.name}`, symbol);
+        });
+      } catch (error) {
+        console.warn(`Failed to index symbols in ${file}:`, error);
+      }
+    }
+  }
+  async findCodeFiles(workspacePath) {
+    const codeFiles = [];
+    const codeExtensions = [".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".cpp", ".c", ".cs", ".go", ".rs"];
+    const walkDir = (dir, depth = 0) => {
+      if (depth > 5) return;
+      try {
+        const files = fs$1.readdirSync(dir);
+        for (const file of files) {
+          const filePath = path.join(dir, file);
+          const stat2 = fs$1.statSync(filePath);
+          if (stat2.isDirectory()) {
+            if (!file.startsWith(".") && file !== "node_modules" && file !== "dist") {
+              walkDir(filePath, depth + 1);
+            }
+          } else if (stat2.isFile()) {
+            const ext = path.extname(file).toLowerCase();
+            if (codeExtensions.includes(ext)) {
+              codeFiles.push(filePath);
+            }
+          }
+        }
+      } catch (error) {
+        console.warn(`Failed to read directory ${dir}:`, error);
+      }
+    };
+    walkDir(workspacePath);
+    return codeFiles;
+  }
+  async extractSymbols(filePath, content) {
+    const symbols = [];
+    content.split("\n");
+    const functionRegex = /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\([^)]*\)/g;
+    let match;
+    while ((match = functionRegex.exec(content)) !== null) {
+      const lineNumber = content.substring(0, match.index).split("\n").length;
+      symbols.push({
+        name: match[1],
+        type: "function",
+        location: { file: filePath, line: lineNumber, column: match.index },
+        scope: this.determineScope(content, match.index),
+        signature: match[0],
+        dependencies: this.extractDependencies(content, match.index),
+        usages: []
+      });
+    }
+    const classRegex = /(?:export\s+)?class\s+(\w+)(?:\s+extends\s+\w+)?(?:\s+implements\s+[\w,\s]+)?\s*{/g;
+    while ((match = classRegex.exec(content)) !== null) {
+      const lineNumber = content.substring(0, match.index).split("\n").length;
+      symbols.push({
+        name: match[1],
+        type: "class",
+        location: { file: filePath, line: lineNumber, column: match.index },
+        scope: "global",
+        signature: match[0],
+        dependencies: this.extractDependencies(content, match.index),
+        usages: []
+      });
+    }
+    const interfaceRegex = /(?:export\s+)?interface\s+(\w+)(?:\s+extends\s+[\w,\s]+)?\s*{/g;
+    while ((match = interfaceRegex.exec(content)) !== null) {
+      const lineNumber = content.substring(0, match.index).split("\n").length;
+      symbols.push({
+        name: match[1],
+        type: "interface",
+        location: { file: filePath, line: lineNumber, column: match.index },
+        scope: "global",
+        signature: match[0],
+        dependencies: [],
+        usages: []
+      });
+    }
+    const variableRegex = /(?:export\s+)?(?:const|let|var)\s+(\w+)(?:\s*:\s*\w+)?\s*=/g;
+    while ((match = variableRegex.exec(content)) !== null) {
+      const lineNumber = content.substring(0, match.index).split("\n").length;
+      symbols.push({
+        name: match[1],
+        type: "variable",
+        location: { file: filePath, line: lineNumber, column: match.index },
+        scope: this.determineScope(content, match.index),
+        signature: match[0],
+        dependencies: [],
+        usages: []
+      });
+    }
+    return symbols;
+  }
+  determineScope(content, position) {
+    const beforePosition = content.substring(0, position);
+    const functionMatches = beforePosition.match(/function\s+\w+/g) || [];
+    const classMatches = beforePosition.match(/class\s+\w+/g) || [];
+    if (functionMatches.length > classMatches.length) {
+      return "function";
+    } else if (classMatches.length > 0) {
+      return "class";
+    }
+    return "global";
+  }
+  extractDependencies(content, position) {
+    const dependencies = [];
+    const importRegex = /import\s+.*?from\s+['"]([^'"]+)['"]/g;
+    let match;
+    while ((match = importRegex.exec(content)) !== null) {
+      if (match.index < position) {
+        dependencies.push(match[1]);
+      }
+    }
+    return dependencies;
+  }
+  async analyzeRelationships(workspacePath, context) {
+    const relationships = [];
+    context.symbols.forEach((symbol, key) => {
+      symbol.dependencies.forEach((dep) => {
+        relationships.push({
+          from: symbol.location.file,
+          to: dep,
+          type: "imports",
+          strength: 1
+        });
+      });
+      this.findSymbolUsages(symbol, context).forEach((usage) => {
+        relationships.push({
+          from: usage.file,
+          to: symbol.location.file,
+          type: "references",
+          strength: 0.5
+        });
+      });
+    });
+    context.relationships = relationships;
+    this.relationshipGraph.set(workspacePath, relationships);
+  }
+  findSymbolUsages(symbol, context) {
+    const usages = [];
+    context.symbols.forEach((otherSymbol, key) => {
+      if (otherSymbol.location.file !== symbol.location.file) {
+        try {
+          const content = fs$1.readFileSync(otherSymbol.location.file, "utf8");
+          const escapedSymbolName = symbol.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const regex = new RegExp(`\\b${escapedSymbolName}\\b`, "g");
+          let match;
+          while ((match = regex.exec(content)) !== null) {
+            const lineNumber = content.substring(0, match.index).split("\n").length;
+            usages.push({
+              file: otherSymbol.location.file,
+              line: lineNumber,
+              column: match.index,
+              context: this.getLineContext(content, lineNumber),
+              type: "usage"
+            });
+          }
+        } catch (error) {
+        }
+      }
+    });
+    return usages;
+  }
+  getLineContext(content, lineNumber) {
+    const lines = content.split("\n");
+    return lines[lineNumber - 1] || "";
+  }
+  async detectPatterns(workspacePath, context) {
+    const detectedPatterns = [];
+    const files = await this.findCodeFiles(workspacePath);
+    for (const file of files) {
+      try {
+        const content = fs$1.readFileSync(file, "utf8");
+        for (const pattern of this.patternLibrary) {
+          const matches = content.match(pattern.pattern);
+          if (matches) {
+            detectedPatterns.push({
+              ...pattern,
+              id: `${pattern.id}_${file}_${Date.now()}`
+            });
+          }
+        }
+      } catch (error) {
+        console.warn(`Failed to analyze patterns in ${file}:`, error);
+      }
+    }
+    context.patterns = detectedPatterns;
+  }
+  initializeMetrics() {
+    return {
+      complexity: 0,
+      maintainability: 0,
+      testability: 0,
+      coupling: 0,
+      cohesion: 0,
+      linesOfCode: 0,
+      technicalDebt: 0
+    };
+  }
+  async calculateMetrics(workspacePath, context) {
+    const files = await this.findCodeFiles(workspacePath);
+    let totalLines = 0;
+    let totalComplexity = 0;
+    let totalCoupling = 0;
+    for (const file of files) {
+      try {
+        const content = fs$1.readFileSync(file, "utf8");
+        const lines = content.split("\n").length;
+        totalLines += lines;
+        const complexity = this.calculateCyclomaticComplexity(content);
+        totalComplexity += complexity;
+        const imports = (content.match(/import\s+.*?from/g) || []).length;
+        totalCoupling += imports;
+      } catch (error) {
+        console.warn(`Failed to calculate metrics for ${file}:`, error);
+      }
+    }
+    const fileCount = files.length;
+    const avgComplexity = fileCount > 0 ? totalComplexity / fileCount : 0;
+    const avgCoupling = fileCount > 0 ? totalCoupling / fileCount : 0;
+    return {
+      complexity: avgComplexity,
+      maintainability: Math.max(0, 100 - avgComplexity * 2 - avgCoupling),
+      testability: Math.max(0, 100 - avgComplexity - avgCoupling * 2),
+      coupling: avgCoupling,
+      cohesion: this.calculateCohesion(context),
+      linesOfCode: totalLines,
+      technicalDebt: this.calculateTechnicalDebt(context)
+    };
+  }
+  calculateCyclomaticComplexity(content) {
+    const wordKeywords = ["if", "else", "while", "for", "switch", "case", "catch"];
+    const operatorKeywords = ["&&", "||", "?"];
+    let complexity = 1;
+    for (const keyword of wordKeywords) {
+      const regex = new RegExp(`\\b${keyword}\\b`, "g");
+      const matches = content.match(regex);
+      if (matches) {
+        complexity += matches.length;
+      }
+    }
+    for (const operator of operatorKeywords) {
+      const escapedOperator = operator.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const regex = new RegExp(escapedOperator, "g");
+      const matches = content.match(regex);
+      if (matches) {
+        complexity += matches.length;
+      }
+    }
+    return complexity;
+  }
+  calculateCohesion(context) {
+    const totalSymbols = context.symbols.size;
+    const totalRelationships = context.relationships.length;
+    if (totalSymbols === 0) return 0;
+    return Math.min(100, totalRelationships / totalSymbols * 20);
+  }
+  calculateTechnicalDebt(context) {
+    let debtScore = 0;
+    context.patterns.forEach((pattern) => {
+      switch (pattern.severity) {
+        case "error":
+          debtScore += 10;
+          break;
+        case "warning":
+          debtScore += 5;
+          break;
+        case "info":
+          debtScore += 1;
+          break;
+      }
+    });
+    return debtScore;
+  }
+  async generateSuggestions(context) {
+    const suggestions = [];
+    if (context.metrics.complexity > 10) {
+      suggestions.push("Consider breaking down complex functions into smaller, more focused units");
+    }
+    if (context.metrics.coupling > 15) {
+      suggestions.push("High coupling detected - consider dependency injection or facade patterns");
+    }
+    if (context.metrics.cohesion < 30) {
+      suggestions.push("Low cohesion detected - group related functionality together");
+    }
+    const codeSmells = context.patterns.filter((p) => p.category === "code-smell");
+    if (codeSmells.length > 5) {
+      suggestions.push("Multiple code smells detected - consider refactoring for better maintainability");
+    }
+    const antiPatterns = context.patterns.filter((p) => p.category === "anti-pattern");
+    if (antiPatterns.length > 0) {
+      suggestions.push("Anti-patterns detected - review and refactor problematic code");
+    }
+    const unusedSymbols = this.findUnusedSymbols(context);
+    if (unusedSymbols.length > 0) {
+      suggestions.push(`${unusedSymbols.length} potentially unused symbols found - consider cleanup`);
+    }
+    return suggestions;
+  }
+  findUnusedSymbols(context) {
+    const unusedSymbols = [];
+    context.symbols.forEach((symbol) => {
+      if (symbol.usages.length === 0 && !symbol.name.startsWith("_")) {
+        unusedSymbols.push(symbol);
+      }
+    });
+    return unusedSymbols;
+  }
+  // Public API methods
+  async getSymbolInfo(workspacePath, symbolName) {
+    const context = this.workspaceContext.get(workspacePath);
+    if (!context) return null;
+    for (const [key, symbol] of context.symbols) {
+      if (symbol.name === symbolName) {
+        return symbol;
+      }
+    }
+    return null;
+  }
+  async findRelatedSymbols(workspacePath, symbolName) {
+    const context = this.workspaceContext.get(workspacePath);
+    if (!context) return [];
+    const relatedSymbols = [];
+    const targetSymbol = await this.getSymbolInfo(workspacePath, symbolName);
+    if (!targetSymbol) return [];
+    context.symbols.forEach((symbol) => {
+      if (symbol.location.file === targetSymbol.location.file && symbol.name !== symbolName) {
+        relatedSymbols.push(symbol);
+      }
+    });
+    context.relationships.forEach((rel) => {
+      if (rel.to === targetSymbol.location.file) {
+        context.symbols.forEach((symbol) => {
+          if (symbol.location.file === rel.from && !relatedSymbols.includes(symbol)) {
+            relatedSymbols.push(symbol);
+          }
+        });
+      }
+    });
+    return relatedSymbols;
+  }
+  async suggestRefactoring(workspacePath, filePath) {
+    const context = this.workspaceContext.get(workspacePath);
+    if (!context) return [];
+    const suggestions = [];
+    const fileSymbols = Array.from(context.symbols.values()).filter((symbol) => symbol.location.file === filePath);
+    for (const symbol of fileSymbols) {
+      if (symbol.type === "function") {
+        try {
+          const content = fs$1.readFileSync(filePath, "utf8");
+          const complexity = this.calculateCyclomaticComplexity(content);
+          if (complexity > 10) {
+            suggestions.push(`Function '${symbol.name}' has high complexity (${complexity}) - consider breaking it down`);
+          }
+        } catch (error) {
+        }
+      }
+      if (symbol.usages.length === 0) {
+        suggestions.push(`Symbol '${symbol.name}' appears to be unused - consider removing it`);
+      }
+    }
+    return suggestions;
+  }
+  getWorkspaceContext(workspacePath) {
+    return this.workspaceContext.get(workspacePath);
+  }
+  getAllSymbols(workspacePath) {
+    const context = this.workspaceContext.get(workspacePath);
+    return context ? Array.from(context.symbols.values()) : [];
+  }
+  getCodeMetrics(workspacePath) {
+    const context = this.workspaceContext.get(workspacePath);
+    return context ? context.metrics : null;
+  }
+}
+class EnhancedMCPSystem {
+  configPath;
+  marketplacePath;
+  installedPowers = /* @__PURE__ */ new Map();
+  runningServers = /* @__PURE__ */ new Map();
+  marketplace = null;
+  toolCache = /* @__PURE__ */ new Map();
+  constructor(workspacePath) {
+    const baseDir = workspacePath ? path.join(workspacePath, ".whizcode") : path.join(app.getPath("userData"), "mcp");
+    this.configPath = path.join(baseDir, "mcp-config.json");
+    this.marketplacePath = path.join(baseDir, "marketplace.json");
+    this.ensureDirectories();
+    this.loadConfiguration();
+    this.loadMarketplace();
+  }
+  ensureDirectories() {
+    const dirs = [
+      path.dirname(this.configPath),
+      path.dirname(this.marketplacePath)
+    ];
+    dirs.forEach((dir) => {
+      if (!fs$1.existsSync(dir)) {
+        fs$1.mkdirSync(dir, { recursive: true });
+      }
+    });
+  }
+  loadConfiguration() {
+    try {
+      if (fs$1.existsSync(this.configPath)) {
+        const config = JSON.parse(fs$1.readFileSync(this.configPath, "utf8"));
+        if (config.powers) {
+          config.powers.forEach((power) => {
+            power.lastUpdated = new Date(power.lastUpdated);
+            this.installedPowers.set(power.id, power);
+          });
+        }
+        if (config.servers) {
+          config.servers.forEach((server) => {
+            this.runningServers.set(server.id, {
+              ...server,
+              status: "stopped",
+              // Reset status on startup
+              process: void 0
+            });
+          });
+        }
+      }
+    } catch (error) {
+      console.warn("[MCP] Failed to load configuration:", error);
+    }
+  }
+  loadMarketplace() {
+    try {
+      if (fs$1.existsSync(this.marketplacePath)) {
+        const marketplace = JSON.parse(fs$1.readFileSync(this.marketplacePath, "utf8"));
+        marketplace.lastUpdated = new Date(marketplace.lastUpdated);
+        this.marketplace = marketplace;
+      } else {
+        this.marketplace = this.getDefaultMarketplace();
+        this.saveMarketplace();
+      }
+    } catch (error) {
+      console.warn("[MCP] Failed to load marketplace:", error);
+      this.marketplace = this.getDefaultMarketplace();
+    }
+  }
+  getDefaultMarketplace() {
+    return {
+      powers: [
+        {
+          id: "filesystem-power",
+          name: "File System Power",
+          description: "Advanced file system operations and monitoring",
+          version: "1.0.0",
+          author: "WhizCode Team",
+          category: "development",
+          keywords: ["files", "filesystem", "monitoring"],
+          installCommand: "uvx filesystem-mcp-server@latest",
+          tools: [
+            {
+              name: "watch_directory",
+              description: "Watch directory for changes",
+              inputSchema: { type: "object", properties: { path: { type: "string" } } },
+              category: "filesystem"
+            },
+            {
+              name: "bulk_operations",
+              description: "Perform bulk file operations",
+              inputSchema: { type: "object", properties: { operation: { type: "string" }, files: { type: "array" } } },
+              category: "filesystem"
+            }
+          ],
+          installed: false,
+          enabled: false,
+          lastUpdated: /* @__PURE__ */ new Date()
+        },
+        {
+          id: "database-power",
+          name: "Database Power",
+          description: "Connect and query various databases",
+          version: "1.2.0",
+          author: "Database Team",
+          category: "database",
+          keywords: ["sql", "database", "query", "mysql", "postgres"],
+          installCommand: "uvx database-mcp-server@latest",
+          tools: [
+            {
+              name: "execute_query",
+              description: "Execute SQL queries",
+              inputSchema: { type: "object", properties: { query: { type: "string" }, database: { type: "string" } } },
+              category: "database"
+            },
+            {
+              name: "describe_schema",
+              description: "Describe database schema",
+              inputSchema: { type: "object", properties: { database: { type: "string" } } },
+              category: "database"
+            }
+          ],
+          installed: false,
+          enabled: false,
+          lastUpdated: /* @__PURE__ */ new Date()
+        },
+        {
+          id: "web-scraper-power",
+          name: "Web Scraper Power",
+          description: "Extract data from websites and APIs",
+          version: "2.1.0",
+          author: "Web Team",
+          category: "api",
+          keywords: ["web", "scraping", "api", "http", "data"],
+          installCommand: "uvx web-scraper-mcp@latest",
+          tools: [
+            {
+              name: "scrape_page",
+              description: "Scrape content from web pages",
+              inputSchema: { type: "object", properties: { url: { type: "string" }, selector: { type: "string" } } },
+              category: "web"
+            },
+            {
+              name: "api_request",
+              description: "Make HTTP API requests",
+              inputSchema: { type: "object", properties: { url: { type: "string" }, method: { type: "string" }, headers: { type: "object" } } },
+              category: "api"
+            }
+          ],
+          installed: false,
+          enabled: false,
+          lastUpdated: /* @__PURE__ */ new Date()
+        },
+        {
+          id: "aws-power",
+          name: "AWS Cloud Power",
+          description: "Manage AWS resources and services",
+          version: "1.5.0",
+          author: "Cloud Team",
+          category: "cloud",
+          keywords: ["aws", "cloud", "ec2", "s3", "lambda"],
+          installCommand: "uvx aws-mcp-server@latest",
+          configSchema: {
+            type: "object",
+            properties: {
+              accessKeyId: { type: "string", description: "AWS Access Key ID" },
+              secretAccessKey: { type: "string", description: "AWS Secret Access Key" },
+              region: { type: "string", description: "AWS Region", default: "us-east-1" }
+            },
+            required: ["accessKeyId", "secretAccessKey"]
+          },
+          tools: [
+            {
+              name: "list_ec2_instances",
+              description: "List EC2 instances",
+              inputSchema: { type: "object", properties: { region: { type: "string" } } },
+              category: "cloud"
+            },
+            {
+              name: "upload_to_s3",
+              description: "Upload files to S3",
+              inputSchema: { type: "object", properties: { bucket: { type: "string" }, key: { type: "string" }, file: { type: "string" } } },
+              category: "cloud"
+            }
+          ],
+          installed: false,
+          enabled: false,
+          lastUpdated: /* @__PURE__ */ new Date()
+        },
+        {
+          id: "code-analysis-power",
+          name: "Code Analysis Power",
+          description: "Advanced code analysis and metrics",
+          version: "1.3.0",
+          author: "Analysis Team",
+          category: "analysis",
+          keywords: ["code", "analysis", "metrics", "quality", "security"],
+          installCommand: "uvx code-analysis-mcp@latest",
+          tools: [
+            {
+              name: "analyze_security",
+              description: "Analyze code for security vulnerabilities",
+              inputSchema: { type: "object", properties: { path: { type: "string" }, language: { type: "string" } } },
+              category: "security"
+            },
+            {
+              name: "calculate_metrics",
+              description: "Calculate advanced code metrics",
+              inputSchema: { type: "object", properties: { path: { type: "string" } } },
+              category: "metrics"
+            }
+          ],
+          installed: false,
+          enabled: false,
+          lastUpdated: /* @__PURE__ */ new Date()
+        }
+      ],
+      categories: ["database", "cloud", "api", "development", "productivity", "analysis"],
+      featured: ["database-power", "aws-power"],
+      trending: ["web-scraper-power", "code-analysis-power"],
+      lastUpdated: /* @__PURE__ */ new Date()
+    };
+  }
+  saveConfiguration() {
+    try {
+      const config = {
+        powers: Array.from(this.installedPowers.values()),
+        servers: Array.from(this.runningServers.values()).map((server) => ({
+          ...server,
+          process: void 0
+          // Don't serialize process
+        }))
+      };
+      fs$1.writeFileSync(this.configPath, JSON.stringify(config, null, 2));
+    } catch (error) {
+      console.error("[MCP] Failed to save configuration:", error);
+    }
+  }
+  saveMarketplace() {
+    try {
+      if (this.marketplace) {
+        fs$1.writeFileSync(this.marketplacePath, JSON.stringify(this.marketplace, null, 2));
+      }
+    } catch (error) {
+      console.error("[MCP] Failed to save marketplace:", error);
+    }
+  }
+  // Public API Methods
+  async refreshMarketplace() {
+    try {
+      if (this.marketplace) {
+        this.marketplace.lastUpdated = /* @__PURE__ */ new Date();
+        this.saveMarketplace();
+      }
+      console.log("[MCP] Marketplace refreshed");
+    } catch (error) {
+      console.error("[MCP] Failed to refresh marketplace:", error);
+      throw error;
+    }
+  }
+  getMarketplace() {
+    return this.marketplace;
+  }
+  getInstalledPowers() {
+    return Array.from(this.installedPowers.values());
+  }
+  getAvailablePowers() {
+    return this.marketplace?.powers || [];
+  }
+  getPowersByCategory(category) {
+    return this.getAvailablePowers().filter((power) => power.category === category);
+  }
+  searchPowers(query) {
+    const lowerQuery = query.toLowerCase();
+    return this.getAvailablePowers().filter(
+      (power) => power.name.toLowerCase().includes(lowerQuery) || power.description.toLowerCase().includes(lowerQuery) || power.keywords.some((keyword) => keyword.toLowerCase().includes(lowerQuery))
+    );
+  }
+  async installPower(powerId) {
+    const power = this.marketplace?.powers.find((p) => p.id === powerId);
+    if (!power) {
+      throw new Error(`Power ${powerId} not found in marketplace`);
+    }
+    if (power.installed) {
+      throw new Error(`Power ${powerId} is already installed`);
+    }
+    try {
+      console.log(`[MCP] Installing power: ${power.name}`);
+      await this.executeCommand(power.installCommand);
+      power.installed = true;
+      power.lastUpdated = /* @__PURE__ */ new Date();
+      this.installedPowers.set(powerId, power);
+      this.saveConfiguration();
+      console.log(`[MCP] Successfully installed power: ${power.name}`);
+    } catch (error) {
+      console.error(`[MCP] Failed to install power ${powerId}:`, error);
+      throw error;
+    }
+  }
+  async uninstallPower(powerId) {
+    const power = this.installedPowers.get(powerId);
+    if (!power) {
+      throw new Error(`Power ${powerId} is not installed`);
+    }
+    try {
+      await this.stopPowerServer(powerId);
+      this.installedPowers.delete(powerId);
+      if (this.marketplace) {
+        const marketplacePower = this.marketplace.powers.find((p) => p.id === powerId);
+        if (marketplacePower) {
+          marketplacePower.installed = false;
+          marketplacePower.enabled = false;
+        }
+      }
+      this.saveConfiguration();
+      console.log(`[MCP] Successfully uninstalled power: ${power.name}`);
+    } catch (error) {
+      console.error(`[MCP] Failed to uninstall power ${powerId}:`, error);
+      throw error;
+    }
+  }
+  async enablePower(powerId, config) {
+    const power = this.installedPowers.get(powerId);
+    if (!power) {
+      throw new Error(`Power ${powerId} is not installed`);
+    }
+    try {
+      if (power.configSchema && config) {
+        this.validateConfig(config, power.configSchema);
+      }
+      const server = {
+        id: `${powerId}-server`,
+        powerId,
+        name: power.name,
+        command: "uvx",
+        args: power.installCommand.split(" ").slice(1),
+        // Remove 'uvx' from command
+        env: config ? this.configToEnv(config) : void 0,
+        status: "stopped",
+        tools: power.tools,
+        autoRestart: true
+      };
+      await this.startServer(server);
+      power.enabled = true;
+      this.saveConfiguration();
+      console.log(`[MCP] Successfully enabled power: ${power.name}`);
+    } catch (error) {
+      console.error(`[MCP] Failed to enable power ${powerId}:`, error);
+      throw error;
+    }
+  }
+  async disablePower(powerId) {
+    const power = this.installedPowers.get(powerId);
+    if (!power) {
+      throw new Error(`Power ${powerId} is not installed`);
+    }
+    try {
+      await this.stopPowerServer(powerId);
+      power.enabled = false;
+      this.saveConfiguration();
+      console.log(`[MCP] Successfully disabled power: ${power.name}`);
+    } catch (error) {
+      console.error(`[MCP] Failed to disable power ${powerId}:`, error);
+      throw error;
+    }
+  }
+  async executePowerTool(powerId, toolName, args) {
+    const server = Array.from(this.runningServers.values()).find((s) => s.powerId === powerId);
+    if (!server || server.status !== "running") {
+      throw new Error(`Power ${powerId} is not running`);
+    }
+    const tool = server.tools.find((t) => t.name === toolName);
+    if (!tool) {
+      throw new Error(`Tool ${toolName} not found in power ${powerId}`);
+    }
+    try {
+      this.validateToolInput(args, tool.inputSchema);
+      const cacheKey = `${powerId}:${toolName}:${JSON.stringify(args)}`;
+      if (this.toolCache.has(cacheKey)) {
+        console.log(`[MCP] Using cached result for ${toolName}`);
+        return this.toolCache.get(cacheKey);
+      }
+      const result = await this.executeToolOnServer(server, toolName, args);
+      this.toolCache.set(cacheKey, result);
+      return result;
+    } catch (error) {
+      console.error(`[MCP] Failed to execute tool ${toolName} on power ${powerId}:`, error);
+      throw error;
+    }
+  }
+  getAvailableTools() {
+    const tools = [];
+    for (const server of this.runningServers.values()) {
+      if (server.status === "running") {
+        tools.push(...server.tools);
+      }
+    }
+    return tools;
+  }
+  getToolsByCategory(category) {
+    return this.getAvailableTools().filter((tool) => tool.category === category);
+  }
+  clearToolCache() {
+    this.toolCache.clear();
+    console.log("[MCP] Tool cache cleared");
+  }
+  // Private helper methods
+  async executeCommand(command) {
+    return new Promise((resolve2, reject) => {
+      const [cmd, ...args] = command.split(" ");
+      const process2 = spawn$1(cmd, args, { stdio: "pipe" });
+      let output = "";
+      let error = "";
+      process2.stdout?.on("data", (data) => {
+        output += data.toString();
+      });
+      process2.stderr?.on("data", (data) => {
+        error += data.toString();
+      });
+      process2.on("close", (code) => {
+        if (code === 0) {
+          resolve2();
+        } else {
+          reject(new Error(`Command failed with code ${code}: ${error}`));
+        }
+      });
+      process2.on("error", (err) => {
+        reject(err);
+      });
+    });
+  }
+  async startServer(server) {
+    try {
+      server.status = "starting";
+      this.runningServers.set(server.id, server);
+      const childProcess = spawn$1(server.command, server.args, {
+        env: { ...process.env, ...server.env },
+        stdio: "pipe"
+      });
+      server.process = childProcess;
+      childProcess.on("spawn", () => {
+        server.status = "running";
+        server.lastError = void 0;
+        console.log(`[MCP] Server ${server.name} started successfully`);
+      });
+      childProcess.on("error", (error) => {
+        server.status = "error";
+        server.lastError = error.message;
+        console.error(`[MCP] Server ${server.name} error:`, error);
+        if (server.autoRestart) {
+          setTimeout(() => this.startServer(server), 5e3);
+        }
+      });
+      childProcess.on("exit", (code) => {
+        server.status = "stopped";
+        server.process = void 0;
+        console.log(`[MCP] Server ${server.name} exited with code ${code}`);
+        if (server.autoRestart && code !== 0) {
+          setTimeout(() => this.startServer(server), 5e3);
+        }
+      });
+    } catch (error) {
+      server.status = "error";
+      server.lastError = error instanceof Error ? error.message : "Unknown error";
+      throw error;
+    }
+  }
+  async stopPowerServer(powerId) {
+    const server = Array.from(this.runningServers.values()).find((s) => s.powerId === powerId);
+    if (server) {
+      await this.stopServer(server.id);
+    }
+  }
+  async stopServer(serverId) {
+    const server = this.runningServers.get(serverId);
+    if (!server) return;
+    if (server.process) {
+      server.process.kill();
+      server.process = void 0;
+    }
+    server.status = "stopped";
+    console.log(`[MCP] Server ${server.name} stopped`);
+  }
+  validateConfig(config, schema) {
+    if (schema.required) {
+      for (const field of schema.required) {
+        if (!(field in config)) {
+          throw new Error(`Required field ${field} is missing`);
+        }
+      }
+    }
+  }
+  configToEnv(config) {
+    const env = {};
+    for (const [key, value] of Object.entries(config)) {
+      env[key.toUpperCase()] = String(value);
+    }
+    return env;
+  }
+  validateToolInput(input, schema) {
+    if (schema.required) {
+      for (const field of schema.required) {
+        if (!(field in input)) {
+          throw new Error(`Required field ${field} is missing`);
+        }
+      }
+    }
+  }
+  async executeToolOnServer(_server, toolName, args) {
+    await new Promise((resolve2) => setTimeout(resolve2, 100));
+    switch (toolName) {
+      case "execute_query":
+        return { rows: [], rowCount: 0, executionTime: "0.1ms" };
+      case "scrape_page":
+        return { content: "Mock scraped content", elements: [] };
+      case "list_ec2_instances":
+        return { instances: [], region: args.region || "us-east-1" };
+      case "analyze_security":
+        return { vulnerabilities: [], score: 95, recommendations: [] };
+      default:
+        return { success: true, data: args };
+    }
+  }
+  async shutdown() {
+    console.log("[MCP] Shutting down MCP system...");
+    const stopPromises = Array.from(this.runningServers.keys()).map(
+      (serverId) => this.stopServer(serverId)
+    );
+    await Promise.all(stopPromises);
+    this.toolCache.clear();
+    console.log("[MCP] MCP system shutdown complete");
+  }
+}
+class VectorSearchSystem {
+  indexPath;
+  chunks = /* @__PURE__ */ new Map();
+  embeddings = /* @__PURE__ */ new Map();
+  fileIndex = /* @__PURE__ */ new Map();
+  // file -> chunk IDs
+  symbolIndex = /* @__PURE__ */ new Map();
+  // symbol -> chunk IDs
+  isIndexing = false;
+  lastIndexTime = null;
+  constructor(workspacePath) {
+    const baseDir = workspacePath ? path.join(workspacePath, ".whizcode", "vector-index") : path.join(app.getPath("userData"), "vector-index");
+    this.indexPath = baseDir;
+    this.ensureDirectories();
+    this.loadIndex();
+  }
+  ensureDirectories() {
+    if (!fs$1.existsSync(this.indexPath)) {
+      fs$1.mkdirSync(this.indexPath, { recursive: true });
+    }
+  }
+  loadIndex() {
+    try {
+      const chunksPath = path.join(this.indexPath, "chunks.json");
+      const embeddingsPath = path.join(this.indexPath, "embeddings.json");
+      const metadataPath = path.join(this.indexPath, "metadata.json");
+      if (fs$1.existsSync(chunksPath)) {
+        const chunksData = JSON.parse(fs$1.readFileSync(chunksPath, "utf8"));
+        chunksData.forEach((chunk) => {
+          chunk.metadata.lastModified = new Date(chunk.metadata.lastModified);
+          this.chunks.set(chunk.id, chunk);
+        });
+      }
+      if (fs$1.existsSync(embeddingsPath)) {
+        const embeddingsData = JSON.parse(fs$1.readFileSync(embeddingsPath, "utf8"));
+        Object.entries(embeddingsData).forEach(([id, embedding]) => {
+          this.embeddings.set(id, embedding);
+        });
+      }
+      if (fs$1.existsSync(metadataPath)) {
+        const metadata = JSON.parse(fs$1.readFileSync(metadataPath, "utf8"));
+        this.lastIndexTime = metadata.lastIndexTime ? new Date(metadata.lastIndexTime) : null;
+        if (metadata.fileIndex) {
+          Object.entries(metadata.fileIndex).forEach(([file, chunkIds]) => {
+            this.fileIndex.set(file, chunkIds);
+          });
+        }
+        if (metadata.symbolIndex) {
+          Object.entries(metadata.symbolIndex).forEach(([symbol, chunkIds]) => {
+            this.symbolIndex.set(symbol, chunkIds);
+          });
+        }
+      }
+      console.log(`[VECTOR] Loaded ${this.chunks.size} chunks from index`);
+    } catch (error) {
+      console.warn("[VECTOR] Failed to load index:", error);
+    }
+  }
+  saveIndex() {
+    try {
+      const chunksPath = path.join(this.indexPath, "chunks.json");
+      const embeddingsPath = path.join(this.indexPath, "embeddings.json");
+      const metadataPath = path.join(this.indexPath, "metadata.json");
+      const chunksData = Array.from(this.chunks.values());
+      fs$1.writeFileSync(chunksPath, JSON.stringify(chunksData, null, 2));
+      const embeddingsData = Object.fromEntries(this.embeddings);
+      fs$1.writeFileSync(embeddingsPath, JSON.stringify(embeddingsData, null, 2));
+      const metadata = {
+        lastIndexTime: this.lastIndexTime,
+        fileIndex: Object.fromEntries(this.fileIndex),
+        symbolIndex: Object.fromEntries(this.symbolIndex)
+      };
+      fs$1.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+      console.log(`[VECTOR] Saved ${this.chunks.size} chunks to index`);
+    } catch (error) {
+      console.error("[VECTOR] Failed to save index:", error);
+    }
+  }
+  async indexWorkspace(workspacePath, options) {
+    if (this.isIndexing) {
+      console.log("[VECTOR] Indexing already in progress");
+      return;
+    }
+    this.isIndexing = true;
+    console.log("[VECTOR] Starting workspace indexing...");
+    try {
+      const files = await this.findCodeFiles(workspacePath, options);
+      const totalFiles = files.length;
+      let processedFiles = 0;
+      if (options?.forceReindex) {
+        this.chunks.clear();
+        this.embeddings.clear();
+        this.fileIndex.clear();
+        this.symbolIndex.clear();
+      }
+      for (const filePath of files) {
+        try {
+          await this.indexFile(filePath);
+          processedFiles++;
+          if (processedFiles % 10 === 0) {
+            console.log(`[VECTOR] Processed ${processedFiles}/${totalFiles} files`);
+          }
+        } catch (error) {
+          console.warn(`[VECTOR] Failed to index file ${filePath}:`, error);
+        }
+      }
+      this.lastIndexTime = /* @__PURE__ */ new Date();
+      this.saveIndex();
+      console.log(`[VECTOR] Indexing complete: ${processedFiles}/${totalFiles} files, ${this.chunks.size} chunks`);
+    } catch (error) {
+      console.error("[VECTOR] Indexing failed:", error);
+      throw error;
+    } finally {
+      this.isIndexing = false;
+    }
+  }
+  async findCodeFiles(workspacePath, options) {
+    const files = [];
+    const codeExtensions = [".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".cpp", ".c", ".cs", ".go", ".rs", ".php", ".rb"];
+    const defaultExcludePatterns = [
+      "node_modules",
+      ".git",
+      "dist",
+      "build",
+      ".next",
+      "__pycache__",
+      ".venv",
+      "venv",
+      ".cache",
+      "coverage"
+    ];
+    const excludePatterns = [...defaultExcludePatterns, ...options?.excludePatterns || []];
+    const walkDir = (dir, depth = 0) => {
+      if (depth > 10) return;
+      try {
+        const entries2 = fs$1.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries2) {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            if (excludePatterns.some((pattern) => entry.name.includes(pattern))) {
+              continue;
+            }
+            walkDir(fullPath, depth + 1);
+          } else if (entry.isFile()) {
+            const ext = path.extname(entry.name).toLowerCase();
+            if (codeExtensions.includes(ext)) {
+              if (options?.includePatterns) {
+                const matches = options.includePatterns.some(
+                  (pattern) => fullPath.includes(pattern) || entry.name.includes(pattern)
+                );
+                if (!matches) continue;
+              }
+              files.push(fullPath);
+            }
+          }
+        }
+      } catch (error) {
+        console.warn(`[VECTOR] Failed to read directory ${dir}:`, error);
+      }
+    };
+    walkDir(workspacePath);
+    return files;
+  }
+  async indexFile(filePath) {
+    try {
+      const content = fs$1.readFileSync(filePath, "utf8");
+      const language = this.detectLanguage(filePath);
+      const chunks = this.chunkFile(content, filePath, language);
+      const oldChunkIds = this.fileIndex.get(filePath) || [];
+      oldChunkIds.forEach((id) => {
+        this.chunks.delete(id);
+        this.embeddings.delete(id);
+      });
+      const newChunkIds = [];
+      for (const chunk of chunks) {
+        const embedding = await this.generateEmbedding(chunk.content);
+        chunk.embedding = embedding;
+        this.chunks.set(chunk.id, chunk);
+        this.embeddings.set(chunk.id, embedding);
+        newChunkIds.push(chunk.id);
+        if (chunk.metadata.symbolName) {
+          const symbolChunks = this.symbolIndex.get(chunk.metadata.symbolName) || [];
+          symbolChunks.push(chunk.id);
+          this.symbolIndex.set(chunk.metadata.symbolName, symbolChunks);
+        }
+      }
+      this.fileIndex.set(filePath, newChunkIds);
+    } catch (error) {
+      console.warn(`[VECTOR] Failed to index file ${filePath}:`, error);
+    }
+  }
+  chunkFile(content, filePath, language) {
+    const chunks = [];
+    const lines = content.split("\n");
+    let currentChunk = "";
+    let startLine = 0;
+    let chunkType = "block";
+    let symbolName;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      line.trim();
+      if (this.isChunkBoundary(line, language)) {
+        if (currentChunk.trim()) {
+          chunks.push(this.createChunk(
+            currentChunk,
+            filePath,
+            startLine,
+            i - 1,
+            chunkType,
+            language,
+            symbolName
+          ));
+        }
+        currentChunk = line + "\n";
+        startLine = i;
+        chunkType = this.detectChunkType(line, language);
+        symbolName = this.extractSymbolName(line, language);
+      } else {
+        currentChunk += line + "\n";
+      }
+      if (currentChunk.length > 2e3) {
+        chunks.push(this.createChunk(
+          currentChunk,
+          filePath,
+          startLine,
+          i,
+          chunkType,
+          language,
+          symbolName
+        ));
+        currentChunk = "";
+        startLine = i + 1;
+        chunkType = "block";
+        symbolName = void 0;
+      }
+    }
+    if (currentChunk.trim()) {
+      chunks.push(this.createChunk(
+        currentChunk,
+        filePath,
+        startLine,
+        lines.length - 1,
+        chunkType,
+        language,
+        symbolName
+      ));
+    }
+    return chunks;
+  }
+  createChunk(content, filePath, startLine, endLine, type2, language, symbolName) {
+    const id = `${filePath}:${startLine}-${endLine}:${Date.now()}`;
+    return {
+      id,
+      content: content.trim(),
+      filePath,
+      startLine,
+      endLine,
+      type: type2,
+      language,
+      metadata: {
+        symbolName,
+        scope: this.detectScope(content, language),
+        complexity: this.calculateComplexity(content, language),
+        dependencies: this.extractDependencies(content, language),
+        lastModified: /* @__PURE__ */ new Date()
+      }
+    };
+  }
+  isChunkBoundary(line, language) {
+    const trimmed = line.trim();
+    const patterns = [
+      /^(export\s+)?(async\s+)?function\s+\w+/,
+      /^(export\s+)?(default\s+)?class\s+\w+/,
+      /^(export\s+)?interface\s+\w+/,
+      /^(export\s+)?type\s+\w+/,
+      /^(export\s+)?enum\s+\w+/,
+      /^import\s+/,
+      /^\/\*\*/,
+      // JSDoc comments
+      /^\/\/ ===/
+      // Section comments
+    ];
+    return patterns.some((pattern) => pattern.test(trimmed));
+  }
+  detectChunkType(line, language) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("import") || trimmed.startsWith("from")) return "import";
+    if (trimmed.includes("function")) return "function";
+    if (trimmed.includes("class")) return "class";
+    if (trimmed.startsWith("//") || trimmed.startsWith("/*")) return "comment";
+    if (trimmed.includes("const") || trimmed.includes("let") || trimmed.includes("var")) return "variable";
+    return "block";
+  }
+  extractSymbolName(line, language) {
+    const patterns = [
+      /(?:function\s+)(\w+)/,
+      /(?:class\s+)(\w+)/,
+      /(?:interface\s+)(\w+)/,
+      /(?:type\s+)(\w+)/,
+      /(?:enum\s+)(\w+)/,
+      /(?:const\s+)(\w+)/,
+      /(?:let\s+)(\w+)/,
+      /(?:var\s+)(\w+)/
+    ];
+    for (const pattern of patterns) {
+      const match = line.match(pattern);
+      if (match) return match[1];
+    }
+    return void 0;
+  }
+  detectScope(content, language) {
+    if (content.includes("export")) return "global";
+    if (content.includes("private")) return "private";
+    if (content.includes("protected")) return "protected";
+    if (content.includes("public")) return "public";
+    return "local";
+  }
+  calculateComplexity(content, language) {
+    const wordKeywords = ["if", "else", "while", "for", "switch", "case", "catch"];
+    const operatorKeywords = ["&&", "||", "?"];
+    let complexity = 1;
+    for (const keyword of wordKeywords) {
+      const regex = new RegExp(`\\b${keyword}\\b`, "g");
+      const matches = content.match(regex);
+      if (matches) complexity += matches.length;
+    }
+    for (const operator of operatorKeywords) {
+      const escapedOperator = operator.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const regex = new RegExp(escapedOperator, "g");
+      const matches = content.match(regex);
+      if (matches) complexity += matches.length;
+    }
+    return complexity;
+  }
+  extractDependencies(content, language) {
+    const dependencies = [];
+    const importRegex = /import\s+.*?from\s+['"]([^'"]+)['"]/g;
+    let match;
+    while ((match = importRegex.exec(content)) !== null) {
+      dependencies.push(match[1]);
+    }
+    const callRegex = /(\w+)\s*\(/g;
+    while ((match = callRegex.exec(content)) !== null) {
+      if (!["if", "for", "while", "switch", "catch"].includes(match[1])) {
+        dependencies.push(match[1]);
+      }
+    }
+    return [...new Set(dependencies)];
+  }
+  detectLanguage(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    const langMap = {
+      ".ts": "typescript",
+      ".tsx": "typescript",
+      ".js": "javascript",
+      ".jsx": "javascript",
+      ".py": "python",
+      ".java": "java",
+      ".cpp": "cpp",
+      ".c": "c",
+      ".cs": "csharp",
+      ".go": "go",
+      ".rs": "rust",
+      ".php": "php",
+      ".rb": "ruby"
+    };
+    return langMap[ext] || "plaintext";
+  }
+  async generateEmbedding(text) {
+    const words = text.toLowerCase().match(/\w+/g) || [];
+    const embedding = new Array(384).fill(0);
+    for (const word of words) {
+      const hash = this.simpleHash(word);
+      const index = Math.abs(hash) % embedding.length;
+      embedding[index] += 1;
+    }
+    const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+    if (magnitude > 0) {
+      for (let i = 0; i < embedding.length; i++) {
+        embedding[i] /= magnitude;
+      }
+    }
+    return embedding;
+  }
+  simpleHash(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash;
+    }
+    return hash;
+  }
+  cosineSimilarity(a, b) {
+    if (a.length !== b.length) return 0;
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+  // Public API Methods
+  async semanticSearch(query) {
+    if (this.chunks.size === 0) {
+      console.warn("[VECTOR] No chunks indexed for search");
+      return [];
+    }
+    try {
+      const queryEmbedding = await this.generateEmbedding(query.text);
+      const results = [];
+      for (const [chunkId, chunk] of this.chunks) {
+        if (query.type && chunk.type !== query.type && query.type !== "any") continue;
+        if (query.language && chunk.language !== query.language) continue;
+        if (query.filePath && !chunk.filePath.includes(query.filePath)) continue;
+        const chunkEmbedding = this.embeddings.get(chunkId);
+        if (!chunkEmbedding) continue;
+        const similarity = this.cosineSimilarity(queryEmbedding, chunkEmbedding);
+        if (similarity >= (query.minSimilarity || 0.1)) {
+          const context = this.getChunkContext(chunk);
+          const relevanceScore = this.calculateRelevanceScore(chunk, query, similarity);
+          results.push({
+            chunk,
+            similarity,
+            relevanceScore,
+            context
+          });
+        }
+      }
+      results.sort((a, b) => b.relevanceScore - a.relevanceScore);
+      const maxResults = query.maxResults || 10;
+      return results.slice(0, maxResults);
+    } catch (error) {
+      console.error("[VECTOR] Semantic search failed:", error);
+      return [];
+    }
+  }
+  async findSimilarCode(codeSnippet, options) {
+    return this.semanticSearch({
+      text: codeSnippet,
+      type: "any",
+      language: options?.language,
+      maxResults: options?.maxResults || 5,
+      minSimilarity: options?.minSimilarity || 0.3
+    });
+  }
+  async getContextualRecommendations(context, filePath) {
+    const recommendations = [];
+    try {
+      const similarResults = await this.findSimilarCode(context, { maxResults: 3 });
+      for (const result of similarResults) {
+        recommendations.push({
+          type: "similar_code",
+          description: `Similar ${result.chunk.type} found`,
+          filePath: result.chunk.filePath,
+          lineNumber: result.chunk.startLine,
+          confidence: result.similarity,
+          snippet: result.chunk.content.slice(0, 200) + "..."
+        });
+      }
+      if (filePath) {
+        const fileChunks = this.fileIndex.get(filePath) || [];
+        for (const chunkId of fileChunks) {
+          const chunk = this.chunks.get(chunkId);
+          if (chunk && chunk.metadata.symbolName) {
+            const relatedChunks = this.symbolIndex.get(chunk.metadata.symbolName) || [];
+            for (const relatedId of relatedChunks) {
+              if (relatedId !== chunkId) {
+                const relatedChunk = this.chunks.get(relatedId);
+                if (relatedChunk) {
+                  recommendations.push({
+                    type: "related_function",
+                    description: `Related function: ${relatedChunk.metadata.symbolName}`,
+                    filePath: relatedChunk.filePath,
+                    lineNumber: relatedChunk.startLine,
+                    confidence: 0.8,
+                    snippet: relatedChunk.content.slice(0, 200) + "..."
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+      recommendations.sort((a, b) => b.confidence - a.confidence);
+      return recommendations.slice(0, 10);
+    } catch (error) {
+      console.error("[VECTOR] Failed to get contextual recommendations:", error);
+      return [];
+    }
+  }
+  getChunkContext(chunk) {
+    try {
+      const content = fs$1.readFileSync(chunk.filePath, "utf8");
+      const lines = content.split("\n");
+      const beforeStart = Math.max(0, chunk.startLine - 3);
+      const afterEnd = Math.min(lines.length, chunk.endLine + 4);
+      return {
+        beforeLines: lines.slice(beforeStart, chunk.startLine),
+        afterLines: lines.slice(chunk.endLine + 1, afterEnd)
+      };
+    } catch (error) {
+      return { beforeLines: [], afterLines: [] };
+    }
+  }
+  calculateRelevanceScore(chunk, query, similarity) {
+    let score = similarity;
+    if (query.type && chunk.type === query.type) {
+      score *= 1.2;
+    }
+    if (chunk.type === "function" || chunk.type === "class") {
+      score *= 1.1;
+    }
+    if (chunk.metadata.complexity && chunk.metadata.complexity > 10) {
+      score *= 0.9;
+    }
+    const daysSinceModified = (Date.now() - chunk.metadata.lastModified.getTime()) / (1e3 * 60 * 60 * 24);
+    if (daysSinceModified < 7) {
+      score *= 1.05;
+    }
+    return Math.min(score, 1);
+  }
+  // Index management methods
+  getIndexStats() {
+    return {
+      totalChunks: this.chunks.size,
+      totalFiles: this.fileIndex.size,
+      totalSymbols: this.symbolIndex.size,
+      lastIndexTime: this.lastIndexTime,
+      isIndexing: this.isIndexing
+    };
+  }
+  async updateFileIndex(filePath) {
+    if (fs$1.existsSync(filePath)) {
+      await this.indexFile(filePath);
+      this.saveIndex();
+    } else {
+      this.removeFileFromIndex(filePath);
+    }
+  }
+  removeFileFromIndex(filePath) {
+    const chunkIds = this.fileIndex.get(filePath) || [];
+    for (const chunkId of chunkIds) {
+      const chunk = this.chunks.get(chunkId);
+      if (chunk && chunk.metadata.symbolName) {
+        const symbolChunks = this.symbolIndex.get(chunk.metadata.symbolName) || [];
+        const filteredChunks = symbolChunks.filter((id) => id !== chunkId);
+        if (filteredChunks.length > 0) {
+          this.symbolIndex.set(chunk.metadata.symbolName, filteredChunks);
+        } else {
+          this.symbolIndex.delete(chunk.metadata.symbolName);
+        }
+      }
+      this.chunks.delete(chunkId);
+      this.embeddings.delete(chunkId);
+    }
+    this.fileIndex.delete(filePath);
+    this.saveIndex();
+  }
+  clearIndex() {
+    this.chunks.clear();
+    this.embeddings.clear();
+    this.fileIndex.clear();
+    this.symbolIndex.clear();
+    this.lastIndexTime = null;
+    try {
+      const files = ["chunks.json", "embeddings.json", "metadata.json"];
+      files.forEach((file) => {
+        const filePath = path.join(this.indexPath, file);
+        if (fs$1.existsSync(filePath)) {
+          fs$1.unlinkSync(filePath);
+        }
+      });
+    } catch (error) {
+      console.warn("[VECTOR] Failed to clear index files:", error);
+    }
+    console.log("[VECTOR] Index cleared");
+  }
+}
+class ErrorRecoverySystem {
+  strategiesPath;
+  errorHistoryPath;
+  strategies = /* @__PURE__ */ new Map();
+  errorHistory = [];
+  contextMemory;
+  activeRecoveries = /* @__PURE__ */ new Map();
+  constructor(workspacePath) {
+    const baseDir = workspacePath ? path.join(workspacePath, ".whizcode", "error-recovery") : path.join(app.getPath("userData"), "error-recovery");
+    this.strategiesPath = path.join(baseDir, "strategies.json");
+    this.errorHistoryPath = path.join(baseDir, "error-history.json");
+    this.contextMemory = new ContextMemory();
+    this.ensureDirectories();
+    this.loadStrategies();
+    this.loadErrorHistory();
+    this.initializeDefaultStrategies();
+  }
+  ensureDirectories() {
+    const dirs = [path.dirname(this.strategiesPath), path.dirname(this.errorHistoryPath)];
+    dirs.forEach((dir) => {
+      if (!fs$1.existsSync(dir)) {
+        fs$1.mkdirSync(dir, { recursive: true });
+      }
+    });
+  }
+  loadStrategies() {
+    try {
+      if (fs$1.existsSync(this.strategiesPath)) {
+        const data = JSON.parse(fs$1.readFileSync(this.strategiesPath, "utf8"));
+        data.forEach((strategy) => {
+          this.strategies.set(strategy.id, strategy);
+        });
+      }
+    } catch (error) {
+      console.warn("[ERROR_RECOVERY] Failed to load strategies:", error);
+    }
+  }
+  loadErrorHistory() {
+    try {
+      if (fs$1.existsSync(this.errorHistoryPath)) {
+        const data = JSON.parse(fs$1.readFileSync(this.errorHistoryPath, "utf8"));
+        this.errorHistory = data.map((error) => ({
+          ...error,
+          timestamp: new Date(error.timestamp)
+        }));
+      }
+    } catch (error) {
+      console.warn("[ERROR_RECOVERY] Failed to load error history:", error);
+    }
+  }
+  saveStrategies() {
+    try {
+      const data = Array.from(this.strategies.values());
+      fs$1.writeFileSync(this.strategiesPath, JSON.stringify(data, null, 2));
+    } catch (error) {
+      console.error("[ERROR_RECOVERY] Failed to save strategies:", error);
+    }
+  }
+  saveErrorHistory() {
+    try {
+      const recentErrors = this.errorHistory.slice(-1e3);
+      fs$1.writeFileSync(this.errorHistoryPath, JSON.stringify(recentErrors, null, 2));
+    } catch (error) {
+      console.error("[ERROR_RECOVERY] Failed to save error history:", error);
+    }
+  }
+  initializeDefaultStrategies() {
+    const defaultStrategies = [
+      {
+        id: "file-not-found-recovery",
+        name: "File Not Found Recovery",
+        description: "Handles file not found errors by searching for similar files",
+        applicableErrors: ["ENOENT", "file not found", "cannot find file"],
+        priority: 1,
+        successRate: 0.7,
+        usageCount: 0,
+        steps: [
+          {
+            type: "diagnostic",
+            description: "Search for similar files in workspace",
+            action: "fuzzy_find_file",
+            parameters: { maxResults: 5 }
+          },
+          {
+            type: "fix",
+            description: "Suggest alternative file paths",
+            action: "suggest_alternatives"
+          }
+        ]
+      },
+      {
+        id: "syntax-error-recovery",
+        name: "Syntax Error Recovery",
+        description: "Fixes common syntax errors automatically",
+        applicableErrors: ["SyntaxError", "syntax error", "unexpected token"],
+        priority: 2,
+        successRate: 0.8,
+        usageCount: 0,
+        steps: [
+          {
+            type: "diagnostic",
+            description: "Analyze syntax error location",
+            action: "analyze_syntax_error"
+          },
+          {
+            type: "fix",
+            description: "Apply common syntax fixes",
+            action: "fix_syntax_error"
+          },
+          {
+            type: "validation",
+            description: "Validate syntax fix",
+            action: "validate_syntax"
+          }
+        ]
+      },
+      {
+        id: "dependency-missing-recovery",
+        name: "Missing Dependency Recovery",
+        description: "Installs missing dependencies automatically",
+        applicableErrors: ["MODULE_NOT_FOUND", "cannot resolve module", "dependency not found"],
+        priority: 1,
+        successRate: 0.9,
+        usageCount: 0,
+        steps: [
+          {
+            type: "diagnostic",
+            description: "Identify missing dependency",
+            action: "identify_missing_dependency"
+          },
+          {
+            type: "fix",
+            description: "Install missing dependency",
+            action: "install_dependency",
+            timeout: 6e4
+          },
+          {
+            type: "validation",
+            description: "Verify dependency installation",
+            action: "verify_dependency"
+          }
+        ],
+        conditions: [
+          {
+            type: "file_exists",
+            parameter: "package.json"
+          }
+        ]
+      },
+      {
+        id: "permission-denied-recovery",
+        name: "Permission Denied Recovery",
+        description: "Handles permission errors by suggesting alternatives",
+        applicableErrors: ["EACCES", "permission denied", "access denied"],
+        priority: 3,
+        successRate: 0.6,
+        usageCount: 0,
+        steps: [
+          {
+            type: "diagnostic",
+            description: "Check file permissions",
+            action: "check_permissions"
+          },
+          {
+            type: "fix",
+            description: "Suggest permission fixes",
+            action: "suggest_permission_fix"
+          }
+        ]
+      },
+      {
+        id: "network-error-recovery",
+        name: "Network Error Recovery",
+        description: "Handles network-related errors with retry logic",
+        applicableErrors: ["ECONNREFUSED", "ETIMEDOUT", "network error", "connection failed"],
+        priority: 2,
+        successRate: 0.5,
+        usageCount: 0,
+        steps: [
+          {
+            type: "diagnostic",
+            description: "Check network connectivity",
+            action: "check_network"
+          },
+          {
+            type: "fix",
+            description: "Retry with exponential backoff",
+            action: "retry_with_backoff",
+            retryCount: 3
+          },
+          {
+            type: "fallback",
+            description: "Use offline alternatives",
+            action: "use_offline_fallback"
+          }
+        ]
+      }
+    ];
+    defaultStrategies.forEach((strategy) => {
+      if (!this.strategies.has(strategy.id)) {
+        this.strategies.set(strategy.id, strategy);
+      }
+    });
+    this.saveStrategies();
+  }
+  async handleError(error, context) {
+    const errorContext = this.createErrorContext(error, context);
+    if (!errorContext.workspacePath) {
+      errorContext.workspacePath = process.cwd();
+    }
+    this.errorHistory.push(errorContext);
+    console.log(`[ERROR_RECOVERY] Handling error: ${errorContext.errorType}`);
+    const recoveryKey = `${errorContext.errorType}:${errorContext.filePath || "global"}`;
+    if (this.activeRecoveries.has(recoveryKey)) {
+      console.log("[ERROR_RECOVERY] Recovery already in progress, waiting...");
+      try {
+        return await this.activeRecoveries.get(recoveryKey);
+      } catch (error2) {
+        console.warn("[ERROR_RECOVERY] Waiting for recovery failed:", error2);
+        return {
+          success: false,
+          strategyUsed: "none",
+          stepsExecuted: 0,
+          timeTaken: 0,
+          errorResolved: false,
+          fallbackUsed: true,
+          recommendations: ["Recovery in progress, please retry"],
+          logs: ["Waiting for concurrent recovery"]
+        };
+      }
+    }
+    const RECOVERY_TIMEOUT_MS = 3e4;
+    const recoveryPromise = this.executeRecovery(errorContext);
+    this.activeRecoveries.set(recoveryKey, recoveryPromise);
+    try {
+      const result = await Promise.race([
+        recoveryPromise,
+        new Promise(
+          (_, reject) => setTimeout(() => reject(new Error("Recovery timed out")), RECOVERY_TIMEOUT_MS)
+        )
+      ]);
+      this.activeRecoveries.delete(recoveryKey);
+      try {
+        await Promise.race([
+          this.contextMemory.analyzeProjectContext(errorContext.workspacePath),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Context analysis timed out")), 5e3))
+        ]);
+      } catch (error2) {
+        console.warn("[ERROR_RECOVERY] Context analysis failed:", error2);
+      }
+      this.updateStrategyMetrics(result);
+      this.saveStrategies();
+      this.saveErrorHistory();
+      return result;
+    } catch (recoveryError) {
+      this.activeRecoveries.delete(recoveryKey);
+      console.error("[ERROR_RECOVERY] Recovery failed:", recoveryError);
+      return {
+        success: false,
+        strategyUsed: "none",
+        stepsExecuted: 0,
+        timeTaken: 0,
+        errorResolved: false,
+        fallbackUsed: false,
+        recommendations: ["Manual intervention required"],
+        logs: [`Recovery system error: ${recoveryError}`]
+      };
+    }
+  }
+  createErrorContext(error, context) {
+    const errorMessage = typeof error === "string" ? error : error.message;
+    const stackTrace = typeof error === "object" ? error.stack : void 0;
+    return {
+      id: `error_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: /* @__PURE__ */ new Date(),
+      errorType: this.classifyError(errorMessage),
+      errorMessage,
+      stackTrace,
+      userRequest: context.userRequest || "Unknown",
+      environment: {
+        os: process.platform,
+        nodeVersion: process.version,
+        workspaceType: context.workspacePath ? this.detectWorkspaceType(context.workspacePath) : void 0
+      },
+      ...context
+    };
+  }
+  classifyError(errorMessage) {
+    const lowerMessage = errorMessage.toLowerCase();
+    if (lowerMessage.includes("enoent") || lowerMessage.includes("file not found")) {
+      return "FILE_NOT_FOUND";
+    }
+    if (lowerMessage.includes("syntax") || lowerMessage.includes("unexpected token")) {
+      return "SYNTAX_ERROR";
+    }
+    if (lowerMessage.includes("module_not_found") || lowerMessage.includes("cannot resolve")) {
+      return "MODULE_NOT_FOUND";
+    }
+    if (lowerMessage.includes("eacces") || lowerMessage.includes("permission denied")) {
+      return "PERMISSION_DENIED";
+    }
+    if (lowerMessage.includes("econnrefused") || lowerMessage.includes("network")) {
+      return "NETWORK_ERROR";
+    }
+    if (lowerMessage.includes("timeout")) {
+      return "TIMEOUT_ERROR";
+    }
+    return "UNKNOWN_ERROR";
+  }
+  detectWorkspaceType(workspacePath) {
+    try {
+      const files = fs$1.readdirSync(workspacePath);
+      if (files.includes("package.json")) return "nodejs";
+      if (files.includes("requirements.txt")) return "python";
+      if (files.includes("Cargo.toml")) return "rust";
+      if (files.includes("go.mod")) return "go";
+      if (files.includes("pom.xml")) return "java";
+      return "unknown";
+    } catch {
+      return "unknown";
+    }
+  }
+  async executeRecovery(errorContext) {
+    const startTime = Date.now();
+    const logs = [];
+    let stepsExecuted = 0;
+    let fallbackUsed = false;
+    const applicableStrategies = this.findApplicableStrategies(errorContext);
+    if (applicableStrategies.length === 0) {
+      logs.push("No applicable recovery strategies found");
+      return {
+        success: false,
+        strategyUsed: "none",
+        stepsExecuted: 0,
+        timeTaken: Date.now() - startTime,
+        errorResolved: false,
+        fallbackUsed: false,
+        recommendations: this.generateFallbackRecommendations(errorContext),
+        logs
+      };
+    }
+    for (const strategy of applicableStrategies) {
+      logs.push(`Attempting strategy: ${strategy.name}`);
+      try {
+        if (strategy.conditions && !this.checkConditions(strategy.conditions, errorContext)) {
+          logs.push(`Strategy conditions not met: ${strategy.name}`);
+          continue;
+        }
+        const stepResults = await this.executeStrategySteps(strategy, errorContext, logs);
+        stepsExecuted += stepResults.stepsExecuted;
+        if (stepResults.success) {
+          logs.push(`Strategy succeeded: ${strategy.name}`);
+          return {
+            success: true,
+            strategyUsed: strategy.id,
+            stepsExecuted,
+            timeTaken: Date.now() - startTime,
+            errorResolved: true,
+            fallbackUsed: stepResults.fallbackUsed,
+            recommendations: stepResults.recommendations,
+            logs
+          };
+        } else {
+          logs.push(`Strategy failed: ${strategy.name}`);
+          fallbackUsed = stepResults.fallbackUsed || fallbackUsed;
+        }
+      } catch (strategyError) {
+        logs.push(`Strategy error: ${strategy.name} - ${strategyError}`);
+      }
+    }
+    logs.push("All recovery strategies failed");
+    return {
+      success: false,
+      strategyUsed: applicableStrategies[0]?.id || "none",
+      stepsExecuted,
+      timeTaken: Date.now() - startTime,
+      errorResolved: false,
+      fallbackUsed,
+      recommendations: this.generateFallbackRecommendations(errorContext),
+      logs
+    };
+  }
+  findApplicableStrategies(errorContext) {
+    const applicable = [];
+    for (const strategy of this.strategies.values()) {
+      const isApplicable = strategy.applicableErrors.some(
+        (errorPattern) => errorContext.errorMessage.toLowerCase().includes(errorPattern.toLowerCase()) || errorContext.errorType.toLowerCase().includes(errorPattern.toLowerCase())
+      );
+      if (isApplicable) {
+        applicable.push(strategy);
+      }
+    }
+    return applicable.sort((a, b) => {
+      if (a.priority !== b.priority) {
+        return a.priority - b.priority;
+      }
+      return b.successRate - a.successRate;
+    });
+  }
+  checkConditions(conditions, errorContext) {
+    return conditions.every((condition) => {
+      switch (condition.type) {
+        case "file_exists":
+          const filePath = errorContext.workspacePath ? path.join(errorContext.workspacePath, condition.parameter) : condition.parameter;
+          return fs$1.existsSync(filePath);
+        case "command_available":
+          return true;
+        case "environment_var":
+          return process.env[condition.parameter] !== void 0;
+        case "workspace_type":
+          return errorContext.environment.workspaceType === condition.expected;
+        default:
+          return true;
+      }
+    });
+  }
+  async executeStrategySteps(strategy, errorContext, logs) {
+    let stepsExecuted = 0;
+    let fallbackUsed = false;
+    const recommendations = [];
+    for (const step of strategy.steps) {
+      logs.push(`Executing step: ${step.description}`);
+      stepsExecuted++;
+      try {
+        const stepResult = await this.executeStep(step, errorContext);
+        if (step.type === "fallback") {
+          fallbackUsed = true;
+        }
+        if (stepResult.recommendations) {
+          recommendations.push(...stepResult.recommendations);
+        }
+        if (stepResult.success) {
+          logs.push(`Step succeeded: ${step.description}`);
+          if (step.type === "validation") {
+            return { success: true, stepsExecuted, fallbackUsed, recommendations };
+          }
+        } else {
+          logs.push(`Step failed: ${step.description}`);
+          if (step.type !== "fallback") {
+            return { success: false, stepsExecuted, fallbackUsed, recommendations };
+          }
+        }
+      } catch (stepError) {
+        logs.push(`Step error: ${step.description} - ${stepError}`);
+        if (step.type !== "fallback") {
+          return { success: false, stepsExecuted, fallbackUsed, recommendations };
+        }
+      }
+    }
+    return { success: true, stepsExecuted, fallbackUsed, recommendations };
+  }
+  async executeStep(step, errorContext) {
+    switch (step.action) {
+      case "fuzzy_find_file":
+        return this.executeFuzzyFindFile(step, errorContext);
+      case "suggest_alternatives":
+        return this.executeSuggestAlternatives(step, errorContext);
+      case "analyze_syntax_error":
+        return this.executeAnalyzeSyntaxError(step, errorContext);
+      case "fix_syntax_error":
+        return this.executeFixSyntaxError(step, errorContext);
+      case "install_dependency":
+        return this.executeInstallDependency(step, errorContext);
+      case "retry_with_backoff":
+        return this.executeRetryWithBackoff(step, errorContext);
+      default:
+        return { success: false, recommendations: [`Unknown action: ${step.action}`] };
+    }
+  }
+  async executeFuzzyFindFile(_step, errorContext) {
+    if (!errorContext.workspacePath || !errorContext.filePath) {
+      return { success: false };
+    }
+    try {
+      const fileName = path.basename(errorContext.filePath);
+      const files = this.findSimilarFiles(errorContext.workspacePath, fileName);
+      if (files.length > 0) {
+        return {
+          success: true,
+          recommendations: files.map((file) => `Consider using: ${file}`)
+        };
+      }
+      return { success: false };
+    } catch {
+      return { success: false };
+    }
+  }
+  findSimilarFiles(workspacePath, targetFile) {
+    const similarFiles = [];
+    const walkDir = (dir, depth = 0) => {
+      if (depth > 5) return;
+      try {
+        const entries2 = fs$1.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries2) {
+          if (entry.isDirectory() && !entry.name.startsWith(".")) {
+            walkDir(path.join(dir, entry.name), depth + 1);
+          } else if (entry.isFile()) {
+            const similarity = this.calculateStringSimilarity(targetFile, entry.name);
+            if (similarity > 0.6) {
+              similarFiles.push(path.join(dir, entry.name));
+            }
+          }
+        }
+      } catch {
+      }
+    };
+    walkDir(workspacePath);
+    return similarFiles.slice(0, 5);
+  }
+  calculateStringSimilarity(str1, str2) {
+    const longer = str1.length > str2.length ? str1 : str2;
+    const shorter = str1.length > str2.length ? str2 : str1;
+    if (longer.length === 0) return 1;
+    const editDistance = this.levenshteinDistance(longer, shorter);
+    return (longer.length - editDistance) / longer.length;
+  }
+  levenshteinDistance(str1, str2) {
+    const matrix = Array(str2.length + 1).fill(null).map(() => Array(str1.length + 1).fill(null));
+    for (let i = 0; i <= str1.length; i++) matrix[0][i] = i;
+    for (let j = 0; j <= str2.length; j++) matrix[j][0] = j;
+    for (let j = 1; j <= str2.length; j++) {
+      for (let i = 1; i <= str1.length; i++) {
+        const indicator = str1[i - 1] === str2[j - 1] ? 0 : 1;
+        matrix[j][i] = Math.min(
+          matrix[j][i - 1] + 1,
+          matrix[j - 1][i] + 1,
+          matrix[j - 1][i - 1] + indicator
+        );
+      }
+    }
+    return matrix[str2.length][str1.length];
+  }
+  async executeSuggestAlternatives(_step, _errorContext) {
+    const recommendations = [
+      "Check if the file path is correct",
+      "Verify the file exists in the expected location",
+      "Consider using relative paths instead of absolute paths"
+    ];
+    return { success: true, recommendations };
+  }
+  async executeAnalyzeSyntaxError(_step, errorContext) {
+    const recommendations = [];
+    if (errorContext.errorMessage.includes("unexpected token")) {
+      recommendations.push("Check for missing or extra brackets, parentheses, or semicolons");
+    }
+    if (errorContext.errorMessage.includes("unexpected end of input")) {
+      recommendations.push("Check for unclosed brackets or parentheses");
+    }
+    return { success: true, recommendations };
+  }
+  async executeFixSyntaxError(_step, _errorContext) {
+    return {
+      success: false,
+      recommendations: ["Automatic syntax fixing not implemented - manual review required"]
+    };
+  }
+  async executeInstallDependency(_step, errorContext) {
+    const workspacePath = errorContext.workspacePath || process.cwd();
+    try {
+      const projectContext = await this.contextMemory.analyzeProjectContext(workspacePath);
+      const packageStatus = projectContext.packageStatus;
+      if (!packageStatus) {
+        return {
+          success: false,
+          recommendations: ["Unable to analyze package status. Check workspace path."]
+        };
+      }
+      if (!packageStatus.hasPackageJson) {
+        return {
+          success: false,
+          recommendations: [
+            "No package.json found in workspace.",
+            "Initialize with npm init first.",
+            `Working directory: ${workspacePath}`
+          ]
+        };
+      }
+      if (!packageStatus.hasNodeModules) {
+        return {
+          success: false,
+          recommendations: [
+            "Dependencies not installed. Run npm install to install all dependencies.",
+            `Working directory: ${workspacePath}`
+          ]
+        };
+      }
+      if (packageStatus.missingPackages.length > 0) {
+        return {
+          success: false,
+          recommendations: [
+            `Missing packages detected: ${packageStatus.missingPackages.join(", ")}`,
+            "Run npm install to install missing dependencies",
+            `Working directory: ${workspacePath}`,
+            `Installed packages: ${packageStatus.installedPackages.length} packages`
+          ]
+        };
+      }
+      return {
+        success: true,
+        recommendations: [
+          `All dependencies are installed (${packageStatus.installedPackages.length} packages).`,
+          "If you're still seeing module errors, try:",
+          "1. Delete node_modules and package-lock.json, then run npm install",
+          "2. Check for TypeScript declaration files if using TypeScript",
+          "3. Verify import paths are correct",
+          `Working directory: ${workspacePath}`
+        ]
+      };
+    } catch (error) {
+      return {
+        success: false,
+        recommendations: [
+          `Error checking dependencies: ${error instanceof Error ? error.message : "Unknown error"}`,
+          "Try running npm install manually",
+          `Working directory: ${workspacePath}`
+        ]
+      };
+    }
+  }
+  async executeRetryWithBackoff(step, _errorContext) {
+    const retryCount = step.retryCount || 3;
+    for (let i = 0; i < retryCount; i++) {
+      await new Promise((resolve2) => setTimeout(resolve2, Math.pow(2, i) * 1e3));
+      if (i === retryCount - 1) {
+        return { success: true, recommendations: ["Operation succeeded after retry"] };
+      }
+    }
+    return { success: false, recommendations: ["All retry attempts failed"] };
+  }
+  generateFallbackRecommendations(errorContext) {
+    const recommendations = [
+      "Review the error message and stack trace for clues",
+      "Check the documentation for the tool or library involved",
+      "Search for similar issues online",
+      "Consider asking for help in relevant forums or communities"
+    ];
+    if (errorContext.filePath) {
+      recommendations.push(`Check the file: ${errorContext.filePath}`);
+    }
+    if (errorContext.workspacePath) {
+      recommendations.push(`Verify workspace configuration in: ${errorContext.workspacePath}`);
+    }
+    return recommendations;
+  }
+  updateStrategyMetrics(result) {
+    const strategy = this.strategies.get(result.strategyUsed);
+    if (strategy) {
+      strategy.usageCount++;
+      const alpha = 0.1;
+      const newSuccessRate = result.success ? 1 : 0;
+      strategy.successRate = (1 - alpha) * strategy.successRate + alpha * newSuccessRate;
+      this.strategies.set(strategy.id, strategy);
+    }
+  }
+  // Public API methods
+  getErrorHistory(limit) {
+    return limit ? this.errorHistory.slice(-limit) : this.errorHistory;
+  }
+  getRecoveryStrategies() {
+    return Array.from(this.strategies.values());
+  }
+  getErrorStatistics() {
+    const errorsByType = {};
+    this.errorHistory.forEach((error) => {
+      errorsByType[error.errorType] = (errorsByType[error.errorType] || 0) + 1;
+    });
+    const strategies = Array.from(this.strategies.values());
+    const totalUsage = strategies.reduce((sum, s) => sum + s.usageCount, 0);
+    const weightedSuccessRate = strategies.reduce(
+      (sum, s) => sum + s.successRate * s.usageCount,
+      0
+    );
+    const recoverySuccessRate = totalUsage > 0 ? weightedSuccessRate / totalUsage : 0;
+    const mostCommonErrors = Object.entries(errorsByType).map(([type2, count]) => ({ type: type2, count })).sort((a, b) => b.count - a.count).slice(0, 10);
+    return {
+      totalErrors: this.errorHistory.length,
+      errorsByType,
+      recoverySuccessRate,
+      mostCommonErrors
+    };
+  }
+  addCustomStrategy(strategy) {
+    this.strategies.set(strategy.id, strategy);
+    this.saveStrategies();
+  }
+  removeStrategy(strategyId) {
+    const removed = this.strategies.delete(strategyId);
+    if (removed) {
+      this.saveStrategies();
+    }
+    return removed;
+  }
+  clearErrorHistory() {
+    this.errorHistory = [];
+    this.saveErrorHistory();
+  }
+}
+class ToolResultCache {
+  cache = /* @__PURE__ */ new Map();
+  cachePath;
+  config;
+  stats = {
+    hits: 0,
+    misses: 0,
+    totalSize: 0
+  };
+  cleanupTimer;
+  // Tool-specific cache configurations
+  toolConfigs = /* @__PURE__ */ new Map();
+  constructor(workspacePath, config) {
+    const baseDir = workspacePath ? path.join(workspacePath, ".whizcode", "tool-cache") : path.join(app.getPath("userData"), "tool-cache");
+    this.cachePath = path.join(baseDir, "cache.json");
+    this.config = {
+      maxSize: 100 * 1024 * 1024,
+      // 100MB
+      maxEntries: 1e4,
+      defaultTTL: 60 * 60 * 1e3,
+      // 1 hour
+      cleanupInterval: 5 * 60 * 1e3,
+      // 5 minutes
+      persistToDisk: true,
+      ...config
+    };
+    this.initializeToolConfigs();
+    this.ensureDirectories();
+    if (this.config.persistToDisk) {
+      this.loadCache();
+    }
+    this.startCleanupTimer();
+  }
+  initializeToolConfigs() {
+    const configs = [
+      {
+        tool: "read_file",
+        config: {
+          ttl: 30 * 1e3,
+          // 30 seconds
+          cacheable: true,
+          invalidateOn: ["write_file", "edit_code", "strReplace"],
+          dependencies: ["file_content"]
+        }
+      },
+      {
+        tool: "list_directory",
+        config: {
+          ttl: 60 * 1e3,
+          // 1 minute
+          cacheable: true,
+          invalidateOn: ["write_file", "delete_file", "create_directory"],
+          dependencies: ["directory_structure"]
+        }
+      },
+      {
+        tool: "getDiagnostics",
+        config: {
+          ttl: 10 * 1e3,
+          // 10 seconds
+          cacheable: true,
+          invalidateOn: ["write_file", "edit_code", "strReplace"],
+          dependencies: ["file_content", "project_config"]
+        }
+      },
+      {
+        tool: "grepSearch",
+        config: {
+          ttl: 5 * 60 * 1e3,
+          // 5 minutes
+          cacheable: true,
+          invalidateOn: ["write_file", "edit_code", "strReplace"],
+          dependencies: ["file_content"]
+        }
+      },
+      {
+        tool: "fuzzy_find_file",
+        config: {
+          ttl: 2 * 60 * 1e3,
+          // 2 minutes
+          cacheable: true,
+          invalidateOn: ["write_file", "delete_file", "create_directory"],
+          dependencies: ["directory_structure"]
+        }
+      },
+      {
+        tool: "readCode",
+        config: {
+          ttl: 60 * 1e3,
+          // 1 minute
+          cacheable: true,
+          invalidateOn: ["write_file", "edit_code", "strReplace"],
+          dependencies: ["file_content"]
+        }
+      },
+      {
+        tool: "run_command",
+        config: {
+          ttl: 0,
+          // No caching for commands by default
+          cacheable: false,
+          dependencies: ["system_state"]
+        }
+      },
+      {
+        tool: "semantic_rename",
+        config: {
+          ttl: 0,
+          // No caching for destructive operations
+          cacheable: false,
+          invalidateOn: ["file_content", "project_structure"]
+        }
+      },
+      {
+        tool: "smart_relocate",
+        config: {
+          ttl: 0,
+          // No caching for destructive operations
+          cacheable: false,
+          invalidateOn: ["file_content", "project_structure"]
+        }
+      }
+    ];
+    configs.forEach(({ tool, config }) => {
+      this.toolConfigs.set(tool, config);
+    });
+  }
+  ensureDirectories() {
+    const dir = path.dirname(this.cachePath);
+    if (!fs$1.existsSync(dir)) {
+      fs$1.mkdirSync(dir, { recursive: true });
+    }
+  }
+  loadCache() {
+    try {
+      if (fs$1.existsSync(this.cachePath)) {
+        const data = JSON.parse(fs$1.readFileSync(this.cachePath, "utf8"));
+        data.entries.forEach((entry) => {
+          entry.timestamp = new Date(entry.timestamp);
+          entry.lastAccessed = new Date(entry.lastAccessed);
+          if (entry.expiresAt) {
+            entry.expiresAt = new Date(entry.expiresAt);
+          }
+          this.cache.set(entry.id, entry);
+          this.stats.totalSize += entry.size;
+        });
+        if (data.stats) {
+          this.stats.hits = data.stats.hits || 0;
+          this.stats.misses = data.stats.misses || 0;
+        }
+        console.log(`[CACHE] Loaded ${this.cache.size} entries from disk`);
+      }
+    } catch (error) {
+      console.warn("[CACHE] Failed to load cache from disk:", error);
+    }
+  }
+  saveCache() {
+    if (!this.config.persistToDisk) return;
+    try {
+      const data = {
+        entries: Array.from(this.cache.values()),
+        stats: this.stats,
+        timestamp: /* @__PURE__ */ new Date()
+      };
+      fs$1.writeFileSync(this.cachePath, JSON.stringify(data, null, 2));
+    } catch (error) {
+      console.error("[CACHE] Failed to save cache to disk:", error);
+    }
+  }
+  startCleanupTimer() {
+    this.cleanupTimer = setInterval(() => {
+      this.cleanup();
+    }, this.config.cleanupInterval);
+  }
+  generateCacheKey(toolName, parameters, metadata) {
+    const keyData = {
+      tool: toolName,
+      params: parameters,
+      meta: metadata
+    };
+    const keyString = JSON.stringify(keyData, Object.keys(keyData).sort());
+    return crypto.createHash("sha256").update(keyString).digest("hex");
+  }
+  calculateSize(data) {
+    return Buffer.byteLength(JSON.stringify(data), "utf8");
+  }
+  isExpired(entry) {
+    if (!entry.expiresAt) return false;
+    return /* @__PURE__ */ new Date() > entry.expiresAt;
+  }
+  shouldCache(toolName) {
+    const config = this.toolConfigs.get(toolName);
+    return config?.cacheable !== false;
+  }
+  getTTL(toolName) {
+    const config = this.toolConfigs.get(toolName);
+    return config?.ttl ?? this.config.defaultTTL;
+  }
+  getFileHash(filePath) {
+    try {
+      if (fs$1.existsSync(filePath)) {
+        const content = fs$1.readFileSync(filePath);
+        return crypto.createHash("md5").update(content).digest("hex");
+      }
+    } catch {
+    }
+    return void 0;
+  }
+  // Public API Methods
+  async get(toolName, parameters, metadata) {
+    if (!this.shouldCache(toolName)) {
+      this.stats.misses++;
+      return null;
+    }
+    const cacheKey = this.generateCacheKey(toolName, parameters, metadata);
+    const entry = this.cache.get(cacheKey);
+    if (!entry) {
+      this.stats.misses++;
+      return null;
+    }
+    if (this.isExpired(entry)) {
+      this.cache.delete(cacheKey);
+      this.stats.totalSize -= entry.size;
+      this.stats.misses++;
+      return null;
+    }
+    if (entry.metadata.filePath && entry.metadata.fileHash) {
+      const currentHash = this.getFileHash(entry.metadata.filePath);
+      if (currentHash !== entry.metadata.fileHash) {
+        this.cache.delete(cacheKey);
+        this.stats.totalSize -= entry.size;
+        this.stats.misses++;
+        return null;
+      }
+    }
+    entry.accessCount++;
+    entry.lastAccessed = /* @__PURE__ */ new Date();
+    this.stats.hits++;
+    console.log(`[CACHE] Hit for ${toolName}: ${cacheKey.substring(0, 8)}...`);
+    return entry.result;
+  }
+  async set(toolName, parameters, result, metadata) {
+    if (!this.shouldCache(toolName)) {
+      return;
+    }
+    const cacheKey = this.generateCacheKey(toolName, parameters, metadata);
+    const size = this.calculateSize(result);
+    const ttl = this.getTTL(toolName);
+    const now = /* @__PURE__ */ new Date();
+    const entryMetadata = {
+      workspacePath: metadata?.workspacePath,
+      filePath: metadata?.filePath,
+      fileHash: metadata?.filePath ? this.getFileHash(metadata.filePath) : void 0,
+      dependencies: this.toolConfigs.get(toolName)?.dependencies || [],
+      tags: metadata?.tags || [],
+      ...metadata
+    };
+    const entry = {
+      id: cacheKey,
+      toolName,
+      parameters,
+      result,
+      timestamp: now,
+      expiresAt: ttl > 0 ? new Date(now.getTime() + ttl) : void 0,
+      accessCount: 1,
+      lastAccessed: now,
+      size,
+      hash: cacheKey,
+      metadata: entryMetadata
+    };
+    await this.ensureSpace(size);
+    const existingEntry = this.cache.get(cacheKey);
+    if (existingEntry) {
+      this.stats.totalSize -= existingEntry.size;
+    }
+    this.cache.set(cacheKey, entry);
+    this.stats.totalSize += size;
+    console.log(`[CACHE] Cached ${toolName}: ${cacheKey.substring(0, 8)}... (${size} bytes)`);
+    if (this.cache.size % 10 === 0) {
+      this.saveCache();
+    }
+  }
+  async ensureSpace(requiredSize) {
+    while (this.stats.totalSize + requiredSize > this.config.maxSize && this.cache.size > 0) {
+      await this.evictLeastRecentlyUsed();
+    }
+    while (this.cache.size >= this.config.maxEntries) {
+      await this.evictLeastRecentlyUsed();
+    }
+  }
+  async evictLeastRecentlyUsed() {
+    let oldestEntry = null;
+    let oldestKey = null;
+    for (const [key, entry] of this.cache) {
+      if (!oldestEntry || entry.lastAccessed < oldestEntry.lastAccessed) {
+        oldestEntry = entry;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey && oldestEntry) {
+      this.cache.delete(oldestKey);
+      this.stats.totalSize -= oldestEntry.size;
+      console.log(`[CACHE] Evicted ${oldestEntry.toolName}: ${oldestKey.substring(0, 8)}...`);
+    }
+  }
+  invalidate(toolName, filePath, tags) {
+    let invalidatedCount = 0;
+    const toDelete = [];
+    for (const [key, entry] of this.cache) {
+      let shouldInvalidate = false;
+      if (toolName && entry.toolName === toolName) {
+        shouldInvalidate = true;
+      }
+      if (filePath && entry.metadata.filePath === filePath) {
+        shouldInvalidate = true;
+      }
+      if (tags && entry.metadata.tags) {
+        const hasMatchingTag = tags.some((tag) => entry.metadata.tags?.includes(tag));
+        if (hasMatchingTag) {
+          shouldInvalidate = true;
+        }
+      }
+      if (!shouldInvalidate && toolName) {
+        const config = this.toolConfigs.get(toolName);
+        if (config?.invalidateOn) {
+          const shouldInvalidateByRule = config.invalidateOn.some((rule) => {
+            return entry.metadata.dependencies?.includes(rule);
+          });
+          if (shouldInvalidateByRule) {
+            shouldInvalidate = true;
+          }
+        }
+      }
+      if (shouldInvalidate) {
+        toDelete.push(key);
+        this.stats.totalSize -= entry.size;
+        invalidatedCount++;
+      }
+    }
+    toDelete.forEach((key) => this.cache.delete(key));
+    if (invalidatedCount > 0) {
+      console.log(`[CACHE] Invalidated ${invalidatedCount} entries`);
+      this.saveCache();
+    }
+    return invalidatedCount;
+  }
+  cleanup() {
+    let cleanedCount = 0;
+    const toDelete = [];
+    for (const [key, entry] of this.cache) {
+      if (this.isExpired(entry)) {
+        toDelete.push(key);
+        this.stats.totalSize -= entry.size;
+        cleanedCount++;
+      }
+    }
+    toDelete.forEach((key) => this.cache.delete(key));
+    if (cleanedCount > 0) {
+      console.log(`[CACHE] Cleaned up ${cleanedCount} expired entries`);
+      this.saveCache();
+    }
+    return cleanedCount;
+  }
+  clear() {
+    this.cache.clear();
+    this.stats.totalSize = 0;
+    this.stats.hits = 0;
+    this.stats.misses = 0;
+    if (this.config.persistToDisk) {
+      this.saveCache();
+    }
+    console.log("[CACHE] Cache cleared");
+  }
+  getStats() {
+    const entries2 = Array.from(this.cache.values());
+    const totalRequests = this.stats.hits + this.stats.misses;
+    const toolCounts = /* @__PURE__ */ new Map();
+    entries2.forEach((entry) => {
+      const current = toolCounts.get(entry.toolName) || 0;
+      toolCounts.set(entry.toolName, current + entry.accessCount);
+    });
+    let mostAccessedTool;
+    let maxAccess = 0;
+    for (const [tool, count] of toolCounts) {
+      if (count > maxAccess) {
+        maxAccess = count;
+        mostAccessedTool = tool;
+      }
+    }
+    return {
+      totalEntries: this.cache.size,
+      totalSize: this.stats.totalSize,
+      hitRate: totalRequests > 0 ? this.stats.hits / totalRequests : 0,
+      missRate: totalRequests > 0 ? this.stats.misses / totalRequests : 0,
+      totalHits: this.stats.hits,
+      totalMisses: this.stats.misses,
+      oldestEntry: entries2.length > 0 ? new Date(Math.min(...entries2.map((e) => e.timestamp.getTime()))) : void 0,
+      newestEntry: entries2.length > 0 ? new Date(Math.max(...entries2.map((e) => e.timestamp.getTime()))) : void 0,
+      mostAccessedTool
+    };
+  }
+  getEntriesByTool(toolName) {
+    return Array.from(this.cache.values()).filter((entry) => entry.toolName === toolName);
+  }
+  getConfig() {
+    return { ...this.config };
+  }
+  updateConfig(newConfig) {
+    this.config = { ...this.config, ...newConfig };
+    if (newConfig.cleanupInterval && this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.startCleanupTimer();
+    }
+  }
+  // Tool-specific cache management
+  preloadCache(toolName, parametersList, metadata) {
+    const promises = parametersList.map(async (parameters) => {
+      const cached = await this.get(toolName, parameters, metadata);
+      if (!cached) {
+        console.log(`[CACHE] Would preload ${toolName} with params:`, parameters);
+      }
+    });
+    return Promise.all(promises);
+  }
+  warmupCache(workspacePath) {
+    return new Promise(async (resolve2) => {
+      try {
+        console.log("[CACHE] Warming up cache for workspace...");
+        const commonOperations = [
+          { tool: "list_directory", params: { path: workspacePath } },
+          { tool: "list_directory", params: { path: path.join(workspacePath, "src") } },
+          { tool: "fuzzy_find_file", params: { query: "package.json", workspacePath } },
+          { tool: "fuzzy_find_file", params: { query: "tsconfig.json", workspacePath } }
+        ];
+        console.log(`[CACHE] Would warm up ${commonOperations.length} common operations`);
+        resolve2();
+      } catch (error) {
+        console.error("[CACHE] Cache warmup failed:", error);
+        resolve2();
+      }
+    });
+  }
+  shutdown() {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+    if (this.config.persistToDisk) {
+      this.saveCache();
+    }
+    console.log("[CACHE] Cache system shutdown");
+  }
+}
+const execAsync$1 = promisify(exec);
+class ProcessManager {
+  processHistoryPath;
+  runningProcesses = /* @__PURE__ */ new Map();
+  commonDevPorts = [3e3, 3001, 4e3, 4173, 5e3, 5173, 8e3, 8080, 8081, 9e3];
+  constructor(workspacePath) {
+    const baseDir = workspacePath ? path.join(workspacePath, ".whizcode", "processes") : path.join(app.getPath("userData"), "processes");
+    this.processHistoryPath = path.join(baseDir, "running-processes.json");
+    this.ensureDirectories();
+    this.loadProcessHistory();
+  }
+  ensureDirectories() {
+    const dir = path.dirname(this.processHistoryPath);
+    if (!fs$1.existsSync(dir)) {
+      fs$1.mkdirSync(dir, { recursive: true });
+    }
+  }
+  loadProcessHistory() {
+    try {
+      if (fs$1.existsSync(this.processHistoryPath)) {
+        const data = JSON.parse(fs$1.readFileSync(this.processHistoryPath, "utf8"));
+        data.forEach((proc) => {
+          this.runningProcesses.set(proc.pid.toString(), {
+            ...proc,
+            startTime: new Date(proc.startTime)
+          });
+        });
+      }
+    } catch (error) {
+      console.warn("[PROCESS_MANAGER] Failed to load process history:", error);
+    }
+  }
+  saveProcessHistory() {
+    try {
+      const data = Array.from(this.runningProcesses.values());
+      fs$1.writeFileSync(this.processHistoryPath, JSON.stringify(data, null, 2));
+    } catch (error) {
+      console.error("[PROCESS_MANAGER] Failed to save process history:", error);
+    }
+  }
+  /**
+   * Check for running instances of the current project
+   */
+  async checkForRunningInstances(workspacePath) {
+    const result = {
+      hasRunningInstances: false,
+      processes: [],
+      conflictingPorts: []
+    };
+    try {
+      try {
+        await Promise.race([
+          this.cleanupDeadProcesses(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Cleanup timed out")), 5e3))
+        ]);
+      } catch (error) {
+        console.warn("[PROCESS_MANAGER] Cleanup timed out, continuing:", error);
+      }
+      let nodeProcesses = [];
+      try {
+        nodeProcesses = await Promise.race([
+          this.findNodeProcesses(workspacePath),
+          new Promise((resolve2) => setTimeout(() => resolve2([]), 1e4))
+        ]);
+      } catch (error) {
+        console.warn("[PROCESS_MANAGER] Node process check timed out:", error);
+      }
+      let portConflicts = [];
+      try {
+        portConflicts = await Promise.race([
+          this.checkPortConflicts(),
+          new Promise((resolve2) => setTimeout(() => resolve2([]), 1e4))
+        ]);
+      } catch (error) {
+        console.warn("[PROCESS_MANAGER] Port conflict check timed out:", error);
+      }
+      result.processes = [...nodeProcesses];
+      result.conflictingPorts = portConflicts;
+      result.hasRunningInstances = nodeProcesses.length > 0 || portConflicts.length > 0;
+      return result;
+    } catch (error) {
+      console.error("[PROCESS_MANAGER] Error checking running instances:", error);
+      return result;
+    }
+  }
+  /**
+   * Find Node.js processes that might be related to the current project
+   */
+  async findNodeProcesses(workspacePath) {
+    const processes = [];
+    try {
+      let command;
+      let parseOutput;
+      if (process.platform === "win32") {
+        command = `wmic process where "name='node.exe' or name='npm.exe' or name='yarn.exe' or name='pnpm.exe'" get ProcessId,CommandLine,CreationDate /format:csv`;
+        parseOutput = this.parseWindowsProcessOutput.bind(this);
+      } else {
+        command = 'ps aux | grep -E "(node|npm|yarn|pnpm)" | grep -v grep';
+        parseOutput = this.parseUnixProcessOutput.bind(this);
+      }
+      const { stdout } = await execAsync$1(command);
+      const allProcesses = parseOutput(stdout);
+      const projectName = path.basename(workspacePath).toLowerCase();
+      const workspacePathLower = workspacePath.toLowerCase();
+      for (const proc of allProcesses) {
+        if (this.isProjectRelated(proc, workspacePathLower, projectName)) {
+          processes.push(proc);
+          this.runningProcesses.set(proc.pid.toString(), proc);
+        }
+      }
+      this.saveProcessHistory();
+      return processes;
+    } catch (error) {
+      console.warn("[PROCESS_MANAGER] Error finding Node processes:", error);
+      return processes;
+    }
+  }
+  parseWindowsProcessOutput(output) {
+    const processes = [];
+    const lines = output.split("\n").slice(1);
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const parts = line.split(",");
+      if (parts.length < 3) continue;
+      try {
+        const commandLine = parts[1]?.trim();
+        const pid = parseInt(parts[2]?.trim());
+        const creationDate = parts[3]?.trim();
+        if (!commandLine || !pid || isNaN(pid)) continue;
+        processes.push({
+          pid,
+          command: commandLine,
+          startTime: creationDate ? new Date(creationDate) : /* @__PURE__ */ new Date(),
+          type: this.classifyProcessType(commandLine)
+        });
+      } catch (error) {
+        continue;
+      }
+    }
+    return processes;
+  }
+  parseUnixProcessOutput(output) {
+    const processes = [];
+    const lines = output.split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 11) continue;
+        const pid = parseInt(parts[1]);
+        if (isNaN(pid)) continue;
+        const command = parts.slice(10).join(" ");
+        processes.push({
+          pid,
+          command,
+          startTime: /* @__PURE__ */ new Date(),
+          // Unix ps doesn't easily give creation time
+          type: this.classifyProcessType(command)
+        });
+      } catch (error) {
+        continue;
+      }
+    }
+    return processes;
+  }
+  isProjectRelated(proc, workspacePathLower, projectName) {
+    const commandLower = proc.command.toLowerCase();
+    if (commandLower.includes(workspacePathLower)) {
+      return true;
+    }
+    if (commandLower.includes(projectName)) {
+      return true;
+    }
+    const devPatterns = [
+      "vite",
+      "webpack-dev-server",
+      "next dev",
+      "react-scripts start",
+      "vue-cli-service serve",
+      "ng serve",
+      "nuxt dev",
+      "gatsby develop",
+      "npm run dev",
+      "yarn dev",
+      "pnpm dev"
+    ];
+    return devPatterns.some((pattern) => commandLower.includes(pattern));
+  }
+  classifyProcessType(command) {
+    const commandLower = command.toLowerCase();
+    if (commandLower.includes("dev") || commandLower.includes("serve") || commandLower.includes("start")) {
+      return "dev-server";
+    }
+    if (commandLower.includes("build") || commandLower.includes("compile")) {
+      return "build";
+    }
+    if (commandLower.includes("test") || commandLower.includes("jest") || commandLower.includes("vitest")) {
+      return "test";
+    }
+    return "other";
+  }
+  /**
+   * Check for processes using common development ports
+   */
+  async checkPortConflicts() {
+    const conflictingPorts = [];
+    try {
+      const portChecks = this.commonDevPorts.map(
+        (port) => Promise.race([
+          this.isPortInUse(port),
+          new Promise((resolve2) => setTimeout(() => resolve2(false), 2e3))
+        ]).then((isInUse) => isInUse ? port : null)
+      );
+      const results = await Promise.all(portChecks);
+      return results.filter((port) => port !== null);
+    } catch (error) {
+      console.warn("[PROCESS_MANAGER] Error checking port conflicts:", error);
+    }
+    return conflictingPorts;
+  }
+  async isPortInUse(port) {
+    try {
+      let command;
+      if (process.platform === "win32") {
+        command = `netstat -an | findstr :${port}`;
+      } else {
+        command = `lsof -i :${port}`;
+      }
+      const { stdout } = await execAsync$1(command);
+      return stdout.trim().length > 0;
+    } catch (error) {
+      return false;
+    }
+  }
+  /**
+   * Stop running processes
+   */
+  async stopProcesses(processes) {
+    const result = { stopped: 0, failed: 0, errors: [] };
+    for (const proc of processes) {
+      try {
+        await this.stopProcess(proc.pid);
+        this.runningProcesses.delete(proc.pid.toString());
+        result.stopped++;
+        console.log(`[PROCESS_MANAGER] Stopped process ${proc.pid}: ${proc.command}`);
+      } catch (error) {
+        result.failed++;
+        const errorMsg = `Failed to stop process ${proc.pid}: ${error}`;
+        result.errors.push(errorMsg);
+        console.error(`[PROCESS_MANAGER] ${errorMsg}`);
+      }
+    }
+    this.saveProcessHistory();
+    return result;
+  }
+  async stopProcess(pid) {
+    return new Promise((resolve2, reject) => {
+      let command;
+      if (process.platform === "win32") {
+        command = `taskkill /F /PID ${pid}`;
+      } else {
+        command = `kill -TERM ${pid}`;
+      }
+      exec(command, (error, _stdout, _stderr) => {
+        if (error) {
+          if (process.platform !== "win32") {
+            exec(`kill -KILL ${pid}`, (killError) => {
+              if (killError) {
+                reject(new Error(`Failed to kill process ${pid}: ${killError.message}`));
+              } else {
+                resolve2();
+              }
+            });
+          } else {
+            reject(new Error(`Failed to terminate process ${pid}: ${error.message}`));
+          }
+        } else {
+          resolve2();
+        }
+      });
+    });
+  }
+  /**
+   * Clean up processes that are no longer running
+   */
+  async cleanupDeadProcesses() {
+    const deadProcesses = [];
+    for (const [pidStr, proc] of this.runningProcesses.entries()) {
+      const isAlive = await this.isProcessAlive(proc.pid);
+      if (!isAlive) {
+        deadProcesses.push(pidStr);
+      }
+    }
+    for (const pidStr of deadProcesses) {
+      this.runningProcesses.delete(pidStr);
+    }
+    if (deadProcesses.length > 0) {
+      this.saveProcessHistory();
+    }
+  }
+  async isProcessAlive(pid) {
+    try {
+      let command;
+      if (process.platform === "win32") {
+        command = `tasklist /FI "PID eq ${pid}" /FO CSV | findstr ${pid}`;
+      } else {
+        command = `kill -0 ${pid}`;
+      }
+      await execAsync$1(command);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+  /**
+   * Get summary of current running processes
+   */
+  getRunningProcessesSummary() {
+    if (this.runningProcesses.size === 0) {
+      return "No tracked processes currently running.";
+    }
+    const summary = Array.from(this.runningProcesses.values()).map((proc) => `• PID ${proc.pid}: ${proc.type} - ${proc.command.substring(0, 80)}${proc.command.length > 80 ? "..." : ""}`).join("\n");
+    return `Currently tracked processes (${this.runningProcesses.size}):
+${summary}`;
+  }
+  /**
+   * Clear all tracked processes (useful for cleanup)
+   */
+  clearTrackedProcesses() {
+    this.runningProcesses.clear();
+    this.saveProcessHistory();
+  }
+}
+class TerminalManager extends EventEmitter$1 {
+  terminals = /* @__PURE__ */ new Map();
+  terminalCounter = 0;
+  /**
+   * Create a new terminal instance with a specific ID
+   */
+  /**
+     * Create a new terminal instance with a specific ID
+     */
+  createTerminal(config, customId) {
+    const id = customId || `terminal_${++this.terminalCounter}`;
+    let shell2 = this.getShellCommand(config.type);
+    const cwd = config.cwd || process.cwd();
+    try {
+      let childProcess;
+      try {
+        childProcess = pty$1.spawn(shell2.command, shell2.args, {
+          name: "xterm-color",
+          cols: 80,
+          rows: 24,
+          cwd,
+          env: { ...process.env, ...config.env }
+        });
+      } catch (err) {
+        const currentPlatform = platform();
+        if (currentPlatform === "win32" && config.type === "bash") {
+          shell2 = { command: "powershell.exe", args: ["-NoExit", "-Command", "Clear-Host"] };
+          childProcess = pty$1.spawn(shell2.command, shell2.args, {
+            name: "xterm-color",
+            cols: 80,
+            rows: 24,
+            cwd,
+            env: { ...process.env, ...config.env }
+          });
+        } else {
+          throw err;
+        }
+      }
+      const terminal = {
+        id,
+        type: config.type,
+        process: childProcess,
+        cols: 80,
+        rows: 24,
+        cwd,
+        createdAt: Date.now(),
+        lastActivity: Date.now()
+      };
+      childProcess.onData((data) => {
+        this.emit("data", id, data);
+      });
+      childProcess.onExit(({ exitCode }) => {
+        this.emit("exit", id, exitCode);
+        this.terminals.delete(id);
+      });
+      this.terminals.set(id, terminal);
+      try {
+        childProcess.resize(80, 24);
+      } catch (err) {
+      }
+      return id;
+    } catch (err) {
+      throw new Error(`Failed to create terminal: ${err}`);
+    }
+  }
+  /**
+   * Write data to terminal
+   */
+  write(id, data) {
+    const terminal = this.terminals.get(id);
+    if (!terminal) {
+      throw new Error(`Terminal ${id} not found`);
+    }
+    terminal.lastActivity = Date.now();
+    terminal.process.write(data);
+  }
+  /**
+   * Resize terminal
+   */
+  resize(id, cols, rows) {
+    const terminal = this.terminals.get(id);
+    if (!terminal) throw new Error(`Terminal ${id} not found`);
+    terminal.cols = cols;
+    terminal.rows = rows;
+    try {
+      terminal.process.resize(cols, rows);
+    } catch (err) {
+      console.error("Failed to resize terminal:", err);
+    }
+  }
+  /**
+   * Kill terminal
+   */
+  kill(id) {
+    const terminal = this.terminals.get(id);
+    if (!terminal) return;
+    try {
+      terminal.process.kill();
+    } catch (err) {
+      console.error("Failed to kill terminal:", err);
+    }
+    this.terminals.delete(id);
+  }
+  /**
+   * Get terminal info
+   */
+  getTerminal(id) {
+    return this.terminals.get(id);
+  }
+  /**
+   * Get all terminals
+   */
+  getAllTerminals() {
+    return Array.from(this.terminals.values());
+  }
+  /**
+   * Get available shell types for current platform
+   */
+  getAvailableShells() {
+    const currentPlatform = platform();
+    if (currentPlatform === "win32") {
+      return ["powershell", "cmd"];
+    } else if (currentPlatform === "darwin") {
+      return ["bash", "zsh", "sh"];
+    } else {
+      return ["bash", "sh"];
+    }
+  }
+  /**
+   * Get default shell for platform
+   */
+  getDefaultShell() {
+    const currentPlatform = platform();
+    if (currentPlatform === "win32") {
+      return "powershell";
+    } else if (currentPlatform === "darwin") {
+      return "zsh";
+    } else {
+      return "bash";
+    }
+  }
+  /**
+   * Get shell command and args
+   */
+  getShellCommand(type2) {
+    const currentPlatform = platform();
+    switch (type2) {
+      case "bash":
+        if (currentPlatform === "win32") {
+          return { command: "bash.exe", args: ["-i"] };
+        }
+        return { command: "bash", args: ["-i"] };
+      case "zsh":
+        return { command: "zsh", args: ["-i"] };
+      case "sh":
+        return { command: "sh", args: ["-i"] };
+      case "cmd":
+        return { command: "cmd.exe", args: [] };
+      case "powershell":
+        if (currentPlatform === "win32") {
+          return { command: "powershell.exe", args: ["-NoExit", "-Command", '$host.ui.RawUI.WindowTitle = "PowerShell"'] };
+        } else {
+          return { command: "pwsh", args: ["-NoExit", "-Command", '$host.ui.RawUI.WindowTitle = "PowerShell"'] };
+        }
+      default:
+        throw new Error(`Unknown shell type: ${type2}`);
+    }
+  }
+  /**
+   * Clear all terminals
+   */
+  clearAll() {
+    for (const [id] of this.terminals) {
+      this.kill(id);
+    }
+    this.terminals.clear();
+  }
+}
+function setupTerminalHandlers(win2, getWorkspacePath) {
+  const terminalManager = new TerminalManager();
+  terminalManager.on("data", (id, data) => {
+    win2?.webContents.send("terminal:incomingData", data, id);
+  });
+  terminalManager.on("exit", (id, code) => {
+    win2?.webContents.send("terminal:exited", id, code);
+  });
+  terminalManager.on("error", (id, err) => {
+    win2?.webContents.send("terminal:error", id, err.message);
+  });
+  ipcMain.on("terminal:create", (_event, { id, type: type2 }) => {
+    try {
+      const workspacePath = getWorkspacePath?.() || void 0;
+      terminalManager.createTerminal({ type: type2, cwd: workspacePath }, id);
+      _event.sender.send("terminal:created", id, id);
+    } catch (err) {
+      console.error(`Failed to create terminal:`, err);
+      _event.sender.send("terminal:error", id, err.message);
+    }
+  });
+  ipcMain.on("terminal:keystroke", (_event, data, terminalId) => {
+    try {
+      const terminal = terminalManager.getTerminal(terminalId);
+      if (!terminal) {
+        return;
+      }
+      terminalManager.write(terminalId, data);
+    } catch (err) {
+      console.error(`Terminal write error for ${terminalId}:`, err);
+    }
+  });
+  ipcMain.on("terminal:resize", (_event, cols, rows, terminalId) => {
+    try {
+      if (cols > 0 && rows > 0) {
+        terminalManager.resize(terminalId, cols, rows);
+      }
+    } catch (err) {
+      console.error("Terminal resize error:", err);
+    }
+  });
+  ipcMain.on("terminal:close", (_event, terminalId) => {
+    try {
+      terminalManager.kill(terminalId);
+    } catch (err) {
+      console.error("Terminal close error:", err);
+    }
+  });
+  ipcMain.on("terminal:openLink", (_event, uri2) => {
+    try {
+      const { shell: shell2 } = require("electron");
+      shell2.openExternal(uri2);
+    } catch (err) {
+      console.error("Failed to open link:", err);
+    }
+  });
+  ipcMain.handle("terminal:getAvailableShells", () => {
+    return terminalManager.getAvailableShells();
+  });
+  ipcMain.handle("terminal:getDefaultShell", () => {
+    return terminalManager.getDefaultShell();
+  });
+  ipcMain.handle("terminal:getAll", () => {
+    return terminalManager.getAllTerminals().map((t) => ({
+      id: t.id,
+      type: t.type,
+      cols: t.cols,
+      rows: t.rows,
+      cwd: t.cwd,
+      createdAt: t.createdAt
+    }));
+  });
+  ipcMain.handle("terminal:killAll", () => {
+    terminalManager.clearAll();
+    return true;
+  });
+  return terminalManager;
+}
+class CircularBuffer {
+  buffer = [];
+  maxSize;
+  writeIndex = 0;
+  constructor(maxSize = 1e4) {
+    this.maxSize = maxSize;
+  }
+  push(item) {
+    if (this.buffer.length < this.maxSize) {
+      this.buffer.push(item);
+    } else {
+      this.buffer[this.writeIndex] = item;
+      this.writeIndex = (this.writeIndex + 1) % this.maxSize;
+    }
+  }
+  getAll() {
+    if (this.buffer.length < this.maxSize) {
+      return [...this.buffer];
+    }
+    return [
+      ...this.buffer.slice(this.writeIndex),
+      ...this.buffer.slice(0, this.writeIndex)
+    ];
+  }
+  getLast(count) {
+    const all = this.getAll();
+    return all.slice(Math.max(0, all.length - count));
+  }
+  clear() {
+    this.buffer = [];
+    this.writeIndex = 0;
+  }
+  size() {
+    return this.buffer.length;
+  }
+  isFull() {
+    return this.buffer.length >= this.maxSize;
+  }
+}
 const _require = createRequire(import.meta.url);
 const pty = _require("node-pty");
-const execAsync = promisify(exec);
+const execAsync = promisify$1(exec$1);
 const __filename$1 = fileURLToPath(import.meta.url);
 const __dirname$1 = dirname(__filename$1);
 function analyzeCommandError(errorOutput, command) {
@@ -14109,10 +18696,18 @@ let specsManager = null;
 let mcpManager = null;
 let memoryManager = null;
 let currentHistoryManager = null;
+let strategicPlanner = null;
+let contextMemory = null;
+let learningSystem = null;
+let codeIntelligence = null;
+let enhancedMCPSystem = null;
+let vectorSearchSystem = null;
+let errorRecoverySystem = null;
+let toolResultCache = null;
 let currentConversationId = Date.now().toString();
-const terminalOutputBuffer = [];
+const terminalOutputBuffer = new CircularBuffer(1e4);
 const OLLAMA_URL = "http://127.0.0.1:11434/api/chat";
-const MODEL_NAME = "deepseek-coder-v2:latest";
+const MODEL_NAME = "qwen2.5-coder:latest";
 const WORKSPACE_STORAGE_FILE = join(app.getPath("userData"), "last-workspace.json");
 const WINDOW_BOUNDS_FILE = join(app.getPath("userData"), "window-bounds.json");
 async function saveLastWorkspace(workspacePath) {
@@ -14149,6 +18744,7 @@ async function loadWindowBounds() {
   }
 }
 async function createWindow() {
+  console.log("[WINDOW] Creating window...");
   const savedBounds = await loadWindowBounds();
   win = new BrowserWindow({
     x: savedBounds?.x,
@@ -14173,18 +18769,25 @@ async function createWindow() {
     },
     backgroundColor: "#1e1e1e"
   });
+  console.log("[WINDOW] Window created, setting up event handlers...");
+  setupTerminalHandlers(win, () => currentWorkspacePath);
   win.on("resize", () => saveWindowBounds());
   win.on("move", () => saveWindowBounds());
   win.once("ready-to-show", () => {
+    console.log("[WINDOW] Window ready to show, maximizing and showing...");
     win?.maximize();
     win?.show();
   });
+  console.log("[WINDOW] VITE_DEV_SERVER_URL:", VITE_DEV_SERVER_URL);
   if (VITE_DEV_SERVER_URL) {
+    console.log("[WINDOW] Loading dev server URL:", VITE_DEV_SERVER_URL);
     win.loadURL(VITE_DEV_SERVER_URL);
   } else {
+    console.log("[WINDOW] Loading production file:", join(RENDERER_DIST, "index.html"));
     win.loadFile(join(RENDERER_DIST, "index.html"));
   }
   win.webContents.on("did-finish-load", async () => {
+    console.log("[WINDOW] Window content loaded");
     const lastWorkspace = await loadLastWorkspace();
     if (lastWorkspace) {
       try {
@@ -14198,7 +18801,32 @@ async function createWindow() {
     }
   });
 }
-app.on("window-all-closed", () => {
+app.on("window-all-closed", async () => {
+  if (contextMemory) {
+    try {
+      contextMemory.endSession();
+      await contextMemory.saveMemory();
+      console.log("[CLEANUP] Saved context memory");
+    } catch (error) {
+      console.warn("[CLEANUP] Failed to save context memory:", error);
+    }
+  }
+  if (enhancedMCPSystem) {
+    try {
+      await enhancedMCPSystem.shutdown();
+      console.log("[CLEANUP] Enhanced MCP system shutdown");
+    } catch (error) {
+      console.warn("[CLEANUP] Failed to shutdown MCP system:", error);
+    }
+  }
+  if (toolResultCache) {
+    try {
+      toolResultCache.shutdown();
+      console.log("[CLEANUP] Tool cache shutdown");
+    } catch (error) {
+      console.warn("[CLEANUP] Failed to shutdown tool cache:", error);
+    }
+  }
   if (process.platform !== "darwin") {
     app.quit();
     win = null;
@@ -14475,7 +19103,8 @@ async function semanticRename(_filePath, oldName, newName, workspacePath) {
             try {
               const content = await fs.readFile(fullPath, "utf-8");
               const lines = content.split("\n");
-              const regex = new RegExp(`\\b${oldName}\\b`, "g");
+              const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const regex = new RegExp(`\\b${escapedOldName}\\b`, "g");
               for (let i = 0; i < lines.length; i++) {
                 if (regex.test(lines[i])) {
                   references.push({
@@ -14501,7 +19130,8 @@ async function semanticRename(_filePath, oldName, newName, workspacePath) {
       const fullPath = join(workspacePath || ".", ref2.path);
       try {
         let content = await fs.readFile(fullPath, "utf-8");
-        const newContent = content.replace(new RegExp(`\\b${oldName}\\b`, "g"), newName);
+        const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const newContent = content.replace(new RegExp(`\\b${escapedOldName}\\b`, "g"), newName);
         if (newContent !== content) {
           await fs.writeFile(fullPath, newContent, "utf-8");
           renamedCount++;
@@ -14577,6 +19207,44 @@ function resolvePath(agentPath, workspacePath, cwd) {
   }
   return agentPath;
 }
+function isDevServerCommand(command) {
+  const commandLower = command.toLowerCase();
+  const devPatterns = [
+    "npm run dev",
+    "npm start",
+    "yarn dev",
+    "yarn start",
+    "pnpm dev",
+    "pnpm start",
+    "vite",
+    "webpack-dev-server",
+    "next dev",
+    "react-scripts start",
+    "vue-cli-service serve",
+    "ng serve",
+    "nuxt dev",
+    "gatsby develop",
+    "serve",
+    "http-server"
+  ];
+  return devPatterns.some((pattern) => commandLower.includes(pattern));
+}
+function formatProcessCheckResult(checkResult) {
+  let summary = "";
+  if (checkResult.processes.length > 0) {
+    summary += `Running processes (${checkResult.processes.length}):
+`;
+    checkResult.processes.forEach((proc) => {
+      summary += `• PID ${proc.pid}: ${proc.type} - ${proc.command.substring(0, 60)}${proc.command.length > 60 ? "..." : ""}
+`;
+    });
+  }
+  if (checkResult.conflictingPorts.length > 0) {
+    summary += `
+Ports in use: ${checkResult.conflictingPorts.join(", ")}`;
+  }
+  return summary.trim();
+}
 const WHIZCODE_SYSTEM_PROMPT = `
 <identity>
 You are WhizCode, an Autonomous Engineering Agent. 
@@ -14635,6 +19303,7 @@ Your goal is to build, debug, and maintain software by DIRECTLY using the tools 
 
 **Execution:**
 - run_command: Execute shell commands (requires user approval). Set "is_background": true to run interactive processes or dev servers.
+- check_processes: Check for running development server processes that might conflict with new ones.
 - command_status: Check the output and status of a running background command using its "CommandId".
 - send_command_input: Send "Input" (like "Y" or passwords) to an interactive background command using its "CommandId".
   - For run_command, ALWAYS use the "cwd" parameter to run in a specific directory.
@@ -14703,13 +19372,13 @@ async function callAI(messages, modelConfig, config, signal, temperature = 0.1) 
   try {
     let response;
     let data;
-    const { provider, model } = modelConfig;
+    const { provider, model, openaiKey, geminiKey, bedrockRegion, bedrockAccessKey, bedrockSecretKey } = modelConfig;
     if (provider === "openai") {
       response = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${config.openaiKey}`
+          "Authorization": `Bearer ${openaiKey || config.openaiKey}`
         },
         body: JSON.stringify({
           model: model || "gpt-4o",
@@ -14733,7 +19402,7 @@ async function callAI(messages, modelConfig, config, signal, temperature = 0.1) 
       body.generationConfig = {
         temperature: temperature || 0.1
       };
-      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model || "gemini-1.5-flash"}:generateContent?key=${config.geminiKey}`, {
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model || "gemini-1.5-flash"}:generateContent?key=${geminiKey || config.geminiKey}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -14752,6 +19421,65 @@ async function callAI(messages, modelConfig, config, signal, temperature = 0.1) 
         }
       }
       return combinedContent;
+    } else if (provider === "bedrock") {
+      const { BedrockRuntimeClient, InvokeModelCommand } = require("@aws-sdk/client-bedrock-runtime");
+      const client2 = new BedrockRuntimeClient({
+        region: bedrockRegion || "us-east-1",
+        credentials: {
+          accessKeyId: bedrockAccessKey || process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: bedrockSecretKey || process.env.AWS_SECRET_ACCESS_KEY
+        }
+      });
+      let body;
+      const modelId = model || "anthropic.claude-3-5-sonnet-20241022-v2:0";
+      if (modelId.startsWith("anthropic.claude")) {
+        const claudeMessages = messages.filter((m) => m.role !== "system").map((m) => ({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content: m.content
+        }));
+        const systemMessage = messages.find((m) => m.role === "system")?.content || "";
+        body = {
+          anthropic_version: "bedrock-2023-05-31",
+          max_tokens: 4e3,
+          temperature: temperature || 0.1,
+          messages: claudeMessages,
+          ...systemMessage && { system: systemMessage }
+        };
+      } else if (modelId.startsWith("meta.llama")) {
+        let prompt = "";
+        for (const msg of messages) {
+          if (msg.role === "system") {
+            prompt += `<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+${msg.content}<|eot_id|>`;
+          } else if (msg.role === "user") {
+            prompt += `<|start_header_id|>user<|end_header_id|>
+${msg.content}<|eot_id|>`;
+          } else if (msg.role === "assistant") {
+            prompt += `<|start_header_id|>assistant<|end_header_id|>
+${msg.content}<|eot_id|>`;
+          }
+        }
+        prompt += "<|start_header_id|>assistant<|end_header_id|>\n";
+        body = {
+          prompt,
+          max_gen_len: 4e3,
+          temperature: temperature || 0.1
+        };
+      }
+      const command = new InvokeModelCommand({
+        modelId,
+        contentType: "application/json",
+        accept: "application/json",
+        body: JSON.stringify(body)
+      });
+      const bedrockResponse = await client2.send(command);
+      const responseBody = JSON.parse(new TextDecoder().decode(bedrockResponse.body));
+      if (modelId.startsWith("anthropic.claude")) {
+        return responseBody.content?.[0]?.text || "";
+      } else if (modelId.startsWith("meta.llama")) {
+        return responseBody.generation || "";
+      }
+      return responseBody.completion || responseBody.text || "";
     } else {
       response = await fetch(OLLAMA_URL, {
         method: "POST",
@@ -14941,14 +19669,28 @@ const DANGEROUS_COMMAND_PATTERNS = [
   /DROP\s+DATABASE/i,
   /:\s*\(\s*\)\s*\{.*fork bomb/i
 ];
-async function executeToolCall(toolData, workspacePath, iteration, isAutopilotMode = false, toolModel, config) {
+async function executeToolCall(toolData, workspacePath, iteration, isAutopilotMode = false, model, config) {
   const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath, toolData.cwd) : "";
   console.log(`
 [TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ""}`);
+  if (toolResultCache) {
+    const cacheMetadata = {
+      workspacePath,
+      filePath: resolvedPath || void 0,
+      iteration,
+      timestamp: /* @__PURE__ */ new Date()
+    };
+    const cachedResult = await toolResultCache.get(toolData.tool, toolData, cacheMetadata);
+    if (cachedResult) {
+      console.log(`[CACHE] Using cached result for ${toolData.tool}`);
+      return { result: cachedResult };
+    }
+  }
   const requestApproval = async (summary) => {
     if (isAutopilotMode) return true;
     console.log(`[APPROVAL] Requesting permission for: ${summary}`);
     const requestId = `${toolData.tool}_${++permissionRequestCounter}`;
+    const PERMISSION_TIMEOUT_MS = 6e4;
     win?.webContents.send("agent:step", {
       tool: toolData.tool,
       status: "awaiting_permission",
@@ -14956,12 +19698,25 @@ async function executeToolCall(toolData, workspacePath, iteration, isAutopilotMo
       iteration,
       requestId
     });
-    const decision = await new Promise((resolve2) => {
-      pendingPermissionResolvers.set(requestId, resolve2);
-    });
-    pendingPermissionResolvers.delete(requestId);
-    console.log(`[APPROVAL] Decision received: ${decision.approved}`);
-    return decision.approved;
+    try {
+      const decision = await new Promise((resolve2, reject) => {
+        const timeoutHandle = setTimeout(() => {
+          pendingPermissionResolvers.delete(requestId);
+          reject(new Error(`Permission request timed out after ${PERMISSION_TIMEOUT_MS}ms`));
+        }, PERMISSION_TIMEOUT_MS);
+        pendingPermissionResolvers.set(requestId, (result) => {
+          clearTimeout(timeoutHandle);
+          resolve2(result);
+        });
+      });
+      pendingPermissionResolvers.delete(requestId);
+      console.log(`[APPROVAL] Decision received: ${decision.approved}`);
+      return decision.approved;
+    } catch (error) {
+      console.warn(`[APPROVAL] Permission request failed: ${error}`);
+      pendingPermissionResolvers.delete(requestId);
+      return false;
+    }
   };
   if (hooksManager) {
     try {
@@ -14978,17 +19733,31 @@ async function executeToolCall(toolData, workspacePath, iteration, isAutopilotMo
       console.warn("[HOOK] preToolUse error:", e);
     }
   }
+  let toolResult;
   try {
     switch (toolData.tool) {
       case "read_file": {
         if (!toolData.path) return { result: '❌ Error: Tool "read_file" requires a "path" parameter.' };
-        const isBinary = await isBinaryFile(resolvedPath);
-        if (isBinary) {
-          return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
+        try {
+          try {
+            await fs.access(resolvedPath);
+          } catch {
+            return { result: `❌ Error: File not found: ${toolData.path}
+
+Resolved path: ${resolvedPath}
+
+Use 'list_directory' to check available files.` };
+          }
+          const isBinary = await isBinaryFile(resolvedPath);
+          if (isBinary) {
+            return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
+          }
+          const content = await fs.readFile(resolvedPath, "utf-8");
+          const lines = content.split("\n");
+          return { result: lines.map((line, i) => `${i + 1}: ${line}`).join("\n") };
+        } catch (error) {
+          return { result: `❌ Error reading file ${toolData.path}: ${error instanceof Error ? error.message : String(error)}` };
         }
-        const content = await fs.readFile(resolvedPath, "utf-8");
-        const lines = content.split("\n");
-        return { result: lines.map((line, i) => `${i + 1}: ${line}`).join("\n") };
       }
       case "write_file": {
         if (!toolData.path) {
@@ -15000,6 +19769,7 @@ async function executeToolCall(toolData, workspacePath, iteration, isAutopilotMo
         const dir = dirname(resolvedPath);
         await fs.mkdir(dir, { recursive: true });
         await fs.writeFile(resolvedPath, toolData.content, "utf-8");
+        win?.webContents.send("file:changed", { path: resolvedPath, content: toolData.content });
         const lineCount = toolData.content.split("\n").length;
         if (workspacePath) {
           const files = await readDirectoryRecursive(workspacePath, 3e3);
@@ -15044,6 +19814,7 @@ Make sure you have the latest content via 'read_file'.` };
           }
         }
         await fs.writeFile(resolvedPath, content, "utf-8");
+        win?.webContents.send("file:changed", { path: resolvedPath, content });
         if (workspacePath) {
           const files = await readDirectoryRecursive(workspacePath, 3e3);
           workspaceManifest = `## PROJECT MANIFEST
@@ -15081,6 +19852,7 @@ Make sure you have the latest content via 'read_file'.` };
             ...lines.slice(endIdx)
           ];
           await fs.writeFile(resolvedPath, newLines.join("\n"), "utf-8");
+          win?.webContents.send("file:changed", { path: resolvedPath, content: newLines.join("\n") });
           if (workspacePath) {
             const files = await readDirectoryRecursive(workspacePath, 3e3);
             workspaceManifest = `## PROJECT MANIFEST
@@ -15120,6 +19892,7 @@ Make sure you have the latest content via 'read_file'.` };
             ];
           }
           await fs.writeFile(resolvedPath, lines.join("\n"), "utf-8");
+          win?.webContents.send("file:changed", { path: resolvedPath, content: lines.join("\n") });
           if (workspacePath) {
             const files = await readDirectoryRecursive(workspacePath, 3e3);
             workspaceManifest = `## PROJECT MANIFEST
@@ -15178,6 +19951,28 @@ Requires manual approval.`,
           return { result: "❌ Command denied by user.", abort: true };
         }
         const logs = [];
+        if (workspacePath && isDevServerCommand(command)) {
+          const processManager = new ProcessManager(workspacePath);
+          const checkResult = await processManager.checkForRunningInstances(workspacePath);
+          if (checkResult.hasRunningInstances) {
+            const summary = formatProcessCheckResult(checkResult);
+            const stopApproval = await requestApproval(
+              `Found running instances that may conflict:
+${summary}
+
+Stop these processes before starting new one?`
+            );
+            if (stopApproval) {
+              const stopResult = await processManager.stopProcesses(checkResult.processes);
+              logs.push(`Stopped ${stopResult.stopped} processes, ${stopResult.failed} failed`);
+              if (stopResult.errors.length > 0) {
+                logs.push(`Errors: ${stopResult.errors.join(", ")}`);
+              }
+            } else {
+              logs.push("⚠️ Warning: Proceeding with existing processes running - may cause port conflicts");
+            }
+          }
+        }
         win?.webContents.send("agent:step", {
           tool: "run_command",
           status: "running",
@@ -15343,6 +20138,22 @@ ${trimmedOutput}`);
           if (ptyProcess) ptyProcess.write(errOutput + "\r\n");
           return { result: errOutput, logs };
         }
+      }
+      case "check_processes": {
+        if (!workspacePath) return { result: "❌ Error: No workspace opened." };
+        const processManager = new ProcessManager(workspacePath);
+        const checkResult = await processManager.checkForRunningInstances(workspacePath);
+        if (!checkResult.hasRunningInstances) {
+          return { result: "✅ No conflicting processes found." };
+        }
+        const summary = formatProcessCheckResult(checkResult);
+        return {
+          result: `Found potentially conflicting processes:
+
+${summary}
+
+Use the run_command tool to start your development server - it will automatically handle these conflicts.`
+        };
       }
       case "command_status": {
         if (!toolData.CommandId) return { result: '❌ Error: Tool "command_status" requires a "CommandId" parameter.' };
@@ -15576,10 +20387,12 @@ ${structure.map((s) => `${s.type}: ${s.name} (lines ${s.startLine}-${s.endLine})
         if (isBinary) return { result: `❌ Cannot edit ${toolData.path}: This appears to be a binary file.` };
         try {
           let content = await fs.readFile(resolvedPath2, "utf-8");
-          const searchRegex = new RegExp(`\\b${toolData.search}\\b`, "g");
+          const escapedSearch = toolData.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const searchRegex = new RegExp(`\\b${escapedSearch}\\b`, "g");
           if (searchRegex.test(content)) {
             const newContent = content.replace(searchRegex, toolData.replace);
             await fs.writeFile(resolvedPath2, newContent, "utf-8");
+            win?.webContents.send("file:changed", { path: resolvedPath2, content: newContent });
             return {
               result: `✅ Successfully replaced "${toolData.search}" with "${toolData.replace}" in ${toolData.path}`,
               data: { path: toolData.path, search: toolData.search, replace: toolData.replace }
@@ -15633,6 +20446,7 @@ ${structure.map((s) => `${s.type}: ${s.name} (lines ${s.startLine}-${s.endLine})
           if (content.includes(toolData.oldStr)) {
             const newContent = content.replace(toolData.oldStr, toolData.newStr);
             await fs.writeFile(resolvedPath2, newContent, "utf-8");
+            win?.webContents.send("file:changed", { path: resolvedPath2, content: newContent });
             return {
               result: `✅ Successfully replaced in ${toolData.path}`,
               data: { path: toolData.path, oldStr: toolData.oldStr, newStr: toolData.newStr }
@@ -15656,7 +20470,7 @@ ${structure.map((s) => `${s.type}: ${s.name} (lines ${s.startLine}-${s.endLine})
         const subAgentResult = await runSubAgent(
           toolData.task,
           agentConfig,
-          toolModel || { provider: "ollama", model: "qwen2.5-coder:latest" },
+          model || { provider: "ollama", model: "qwen2.5-coder:latest" },
           config || { openaiKey: "", geminiKey: "" },
           workspacePath,
           isAutopilotMode
@@ -15845,10 +20659,95 @@ ${list2}` };
         return { result: ok ? `✅ Learned fact and saved to memory: ${toolData.topic}` : `❌ Failed to save to memory` };
       }
       default:
-        return { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, replace_file_content, multi_replace_file_content, edit_file, list_directory, search_files, run_command, command_status, send_command_input, browser_subagent, readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace, invokeSubAgent, listSubAgents, webFetch, web_search, mcp_call, createSpec, readSpec, updateSpec, listSpecs, completeTask` };
+        if (enhancedMCPSystem) {
+          try {
+            const availableTools = enhancedMCPSystem.getAvailableTools();
+            const mcpTool = availableTools.find((tool) => tool.name === toolData.tool);
+            if (mcpTool) {
+              console.log(`[MCP] Executing tool ${toolData.tool} via enhanced MCP system`);
+              const mcpResult = await enhancedMCPSystem.executePowerTool(
+                mcpTool.category,
+                // Use category as power ID for now
+                toolData.tool,
+                toolData
+              );
+              toolResult = { result: `✅ MCP [${toolData.tool}]:
+${JSON.stringify(mcpResult, null, 2)}` };
+              break;
+            }
+          } catch (mcpError) {
+            console.warn(`[MCP] Failed to execute ${toolData.tool}:`, mcpError);
+          }
+        }
+        toolResult = { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, replace_file_content, multi_replace_file_content, edit_file, list_directory, search_files, run_command, command_status, send_command_input, browser_subagent, readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace, invokeSubAgent, listSubAgents, webFetch, web_search, mcp_call, createSpec, readSpec, updateSpec, listSpecs, completeTask` };
     }
+    if (toolResultCache && toolResult && !toolResult.abort) {
+      const cacheMetadata = {
+        workspacePath,
+        filePath: resolvedPath || void 0,
+        iteration,
+        timestamp: /* @__PURE__ */ new Date(),
+        success: !toolResult.result.startsWith("❌")
+      };
+      await toolResultCache.set(toolData.tool, toolData, toolResult.result, cacheMetadata);
+    }
+    if (vectorSearchSystem && resolvedPath && ["write_file", "edit_file", "strReplace"].includes(toolData.tool)) {
+      try {
+        await vectorSearchSystem.updateFileIndex(resolvedPath);
+        console.log(`[VECTOR] Updated index for ${resolvedPath}`);
+      } catch (error) {
+        console.warn(`[VECTOR] Failed to update index for ${resolvedPath}:`, error);
+      }
+    }
+    if (toolResultCache && resolvedPath && ["write_file", "edit_file", "strReplace", "delete_file"].includes(toolData.tool)) {
+      const invalidatedCount = toolResultCache.invalidate(void 0, resolvedPath);
+      if (invalidatedCount > 0) {
+        console.log(`[CACHE] Invalidated ${invalidatedCount} entries for ${resolvedPath}`);
+      }
+    }
+    return toolResult;
     return { result: "❌ Internal error: unhandled tool case" };
   } catch (e) {
+    if (errorRecoverySystem) {
+      try {
+        console.log(`[ERROR_RECOVERY] Attempting recovery for tool error: ${e.message}`);
+        const recoveryResult = await errorRecoverySystem.handleError(e, {
+          toolName: toolData.tool,
+          filePath: resolvedPath,
+          userRequest: `Tool execution: ${toolData.tool}`,
+          workspacePath: workspacePath || void 0
+        });
+        if (recoveryResult.success && recoveryResult.errorResolved) {
+          console.log(`[ERROR_RECOVERY] Successfully recovered from error using strategy: ${recoveryResult.strategyUsed}`);
+          return {
+            result: `⚠️ Tool error occurred but was handled by error recovery system.
+
+Original error: ${e.message}
+
+Recovery strategy: ${recoveryResult.strategyUsed}
+
+Recommendations:
+${recoveryResult.recommendations.join("\n")}
+
+Time taken: ${recoveryResult.timeTaken}ms`,
+            logs: recoveryResult.logs
+          };
+        } else {
+          console.log(`[ERROR_RECOVERY] Recovery failed or incomplete. Strategy: ${recoveryResult.strategyUsed}`);
+          return {
+            result: `❌ Tool error (${toolData.tool}): ${e.message}
+
+Error recovery attempted but failed.
+
+Recommendations:
+${recoveryResult.recommendations.join("\n")}`,
+            logs: recoveryResult.logs
+          };
+        }
+      } catch (recoveryError) {
+        console.error(`[ERROR_RECOVERY] Recovery system failed:`, recoveryError);
+      }
+    }
     return { result: `❌ Tool error (${toolData.tool}): ${e.message}` };
   } finally {
     if (hooksManager) {
@@ -15866,9 +20765,7 @@ ${list2}` };
             await runAgentLoop(
               `[AUTOMATED HOOK: ${hook.id}]
 ${hook.prompt}`,
-              toolModel || fallbackModel,
-              // Use tool model for hooks for efficiency
-              toolModel || fallbackModel,
+              model || fallbackModel,
               config,
               workspacePath,
               null,
@@ -15975,14 +20872,128 @@ ${truncatedResult}
     steps
   };
 }
-async function runAgentLoop(userMessage, primaryModel, toolModel, config, workspacePath, activeContext = null, isAutopilotMode = false, startIteration = 0) {
+async function runAgentLoop(userMessage, model, config, workspacePath, activeContext = null, isAutopilotMode = false, startIteration = 0) {
   const steps = [];
   abortRequested = false;
   conversationHistory.push({ role: "user", content: userMessage });
+  let executionPlan = null;
+  let currentTaskIndex = 0;
+  let adaptiveBehavior = [];
+  if (strategicPlanner && workspacePath) {
+    try {
+      console.log("[STRATEGIC PLANNING] Creating execution plan...");
+      let projectAnalysis = "";
+      if (codeIntelligence) {
+        const semanticContext = await codeIntelligence.analyzeWorkspace(workspacePath);
+        projectAnalysis = `Project Type: ${semanticContext.metrics ? "Analyzed" : "Unknown"}
+`;
+        if (semanticContext.suggestions.length > 0) {
+          projectAnalysis += `Code Intelligence Suggestions:
+${semanticContext.suggestions.slice(0, 3).join("\n")}
+`;
+        }
+      }
+      const planningContext = {
+        userRequest: userMessage,
+        workspacePath,
+        projectType: await detectProjectType(workspacePath),
+        codebaseSize: await estimateCodebaseSize(workspacePath),
+        availableTools: getAvailableTools(),
+        previousPlans: strategicPlanner.getPlanHistory().slice(-3)
+        // Last 3 plans for context
+      };
+      executionPlan = await strategicPlanner.createExecutionPlan(planningContext);
+      console.log(`[STRATEGIC PLANNING] Created plan with ${executionPlan.tasks.length} tasks, ${executionPlan.parallelGroups.length} execution groups`);
+      console.log(`[STRATEGIC PLANNING] Estimated duration: ${executionPlan.estimatedDuration}, Risk level: ${executionPlan.riskLevel}`);
+      if (learningSystem) {
+        adaptiveBehavior = await learningSystem.adaptBehavior({
+          workspacePath,
+          userMessage,
+          executionPlan
+        });
+        if (adaptiveBehavior.length > 0) {
+          console.log(`[ADAPTIVE BEHAVIOR] Applied ${adaptiveBehavior.length} behavioral adaptations`);
+        }
+      }
+      win?.webContents.send("agent:plan", {
+        id: executionPlan.id,
+        objective: executionPlan.objective,
+        tasks: executionPlan.tasks.map((t) => ({
+          id: t.id,
+          description: t.description,
+          type: t.type,
+          priority: t.priority,
+          complexity: t.estimatedComplexity
+        })),
+        parallelGroups: executionPlan.parallelGroups.length,
+        riskLevel: executionPlan.riskLevel,
+        estimatedDuration: executionPlan.estimatedDuration,
+        adaptations: adaptiveBehavior
+      });
+    } catch (error) {
+      console.warn("[STRATEGIC PLANNING] Failed to create execution plan:", error);
+    }
+  }
+  let learningRecommendations = [];
+  if (learningSystem && workspacePath) {
+    try {
+      const taskType = classifyUserRequest(userMessage);
+      learningRecommendations = await learningSystem.generateRecommendations(taskType, { workspacePath, userMessage });
+      if (learningRecommendations.length > 0) {
+        console.log(`[LEARNING SYSTEM] Generated ${learningRecommendations.length} recommendations based on past experience`);
+      }
+    } catch (error) {
+      console.warn("[LEARNING SYSTEM] Failed to generate recommendations:", error);
+    }
+  }
   let projectContext = `
 
 <project_context>
 `;
+  if (executionPlan) {
+    projectContext += `<execution_plan>
+`;
+    projectContext += `Objective: ${executionPlan.objective}
+`;
+    projectContext += `Tasks: ${executionPlan.tasks.length} (Risk: ${executionPlan.riskLevel})
+`;
+    projectContext += `Current Phase: ${executionPlan.tasks[currentTaskIndex]?.description || "Planning"}
+`;
+    if (adaptiveBehavior.length > 0) {
+      projectContext += `Behavioral Adaptations: ${adaptiveBehavior.join("; ")}
+`;
+    }
+    projectContext += `</execution_plan>
+
+`;
+  }
+  if (learningRecommendations.length > 0) {
+    projectContext += `<learning_recommendations>
+`;
+    projectContext += learningRecommendations.slice(0, 3).join("\n");
+    projectContext += `
+</learning_recommendations>
+
+`;
+  }
+  if (codeIntelligence && workspacePath) {
+    try {
+      const context = codeIntelligence.getWorkspaceContext(workspacePath);
+      if (context && context.suggestions.length > 0) {
+        projectContext += `<code_intelligence>
+`;
+        projectContext += `Metrics: Complexity ${context.metrics.complexity.toFixed(1)}, Maintainability ${context.metrics.maintainability.toFixed(1)}
+`;
+        projectContext += `Suggestions: ${context.suggestions.slice(0, 2).join("; ")}
+`;
+        projectContext += `</code_intelligence>
+
+`;
+      }
+    } catch (error) {
+      console.warn("[CODE INTELLIGENCE] Failed to get context:", error);
+    }
+  }
   const fileRefs = userMessage.match(/#File:([^\s]+)/g);
   if (fileRefs && workspacePath) {
     for (const ref2 of fileRefs) {
@@ -16078,8 +21089,9 @@ ${truncatedDiff}
     } catch (e) {
     }
   }
-  if (terminalOutputBuffer.length > 0) {
-    const lastLines = terminalOutputBuffer.slice(-50).join("\n");
+  const terminalLines = terminalOutputBuffer.getLast(50);
+  if (terminalLines.length > 0) {
+    const lastLines = terminalLines.join("\n");
     projectContext += `
 <terminal_output>
 ${lastLines}
@@ -16128,21 +21140,40 @@ ${lastLines}
     if (iteration >= currentIterationLimit) {
       console.log(`[ITERATION LIMIT] Reached ${currentIterationLimit} iterations, asking user to continue...`);
       const continueRequestId = `continue_${++permissionRequestCounter}`;
+      const PERMISSION_TIMEOUT_MS = 6e4;
       win?.webContents.send("agent:step", {
         tool: "continue_iterations",
         status: "awaiting_permission",
         summary: `Reached ${currentIterationLimit} iterations. Continue with ${MAX_AGENT_ITERATIONS} more iterations?`,
         requestId: continueRequestId
       });
-      const continueDecision = await new Promise((resolve2) => {
-        pendingPermissionResolvers.set(continueRequestId, resolve2);
-      });
-      pendingPermissionResolvers.delete(continueRequestId);
-      if (continueDecision.approved) {
-        console.log(`[ITERATION LIMIT] User approved continuation, extending limit by ${MAX_AGENT_ITERATIONS} iterations`);
-        currentIterationLimit += MAX_AGENT_ITERATIONS;
-      } else {
-        const finalMsg2 = `Reached maximum iterations (${currentIterationLimit}). Task stopped by user choice.`;
+      try {
+        const continueDecision = await new Promise((resolve2, reject) => {
+          const timeoutHandle = setTimeout(() => {
+            pendingPermissionResolvers.delete(continueRequestId);
+            reject(new Error(`Iteration continuation request timed out after ${PERMISSION_TIMEOUT_MS}ms`));
+          }, PERMISSION_TIMEOUT_MS);
+          pendingPermissionResolvers.set(continueRequestId, (result) => {
+            clearTimeout(timeoutHandle);
+            resolve2(result);
+          });
+        });
+        pendingPermissionResolvers.delete(continueRequestId);
+        if (continueDecision.approved) {
+          console.log(`[ITERATION LIMIT] User approved continuation, extending limit by ${MAX_AGENT_ITERATIONS} iterations`);
+          currentIterationLimit += MAX_AGENT_ITERATIONS;
+        } else {
+          const finalMsg2 = `Reached maximum iterations (${currentIterationLimit}). Task stopped by user choice.`;
+          conversationHistory.push({ role: "assistant", content: finalMsg2 });
+          if (currentHistoryManager) {
+            const title = conversationHistory.find((m) => m.role === "user")?.content.substring(0, 40) || "Untitled Chat";
+            await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+          }
+          return { finalResponse: finalMsg2, steps };
+        }
+      } catch (error) {
+        console.warn(`[ITERATION LIMIT] Permission request failed: ${error}, stopping agent`);
+        const finalMsg2 = `Reached maximum iterations (${currentIterationLimit}). Task stopped due to timeout.`;
         conversationHistory.push({ role: "assistant", content: finalMsg2 });
         if (currentHistoryManager) {
           const title = conversationHistory.find((m) => m.role === "user")?.content.substring(0, 40) || "Untitled Chat";
@@ -16159,14 +21190,13 @@ ${lastLines}
         const title = conversationHistory.find((m) => m.role === "user")?.content.substring(0, 40) || "Untitled Chat";
         await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
       }
-      distillKnowledgeBackground(conversationHistory, toolModel || primaryModel, config).catch((e) => console.error(e));
+      distillKnowledgeBackground(conversationHistory, model, config).catch((e) => console.error(e));
       return { finalResponse: abortMsg, steps };
     }
     console.log(`
 [ITERATION ${iteration + 1}/${currentIterationLimit}]`);
-    const useToolModel = iteration > 0;
-    const selectedModel = useToolModel ? toolModel : primaryModel;
-    console.log(`[MODEL] Using ${selectedModel.provider}/${selectedModel.model} (${useToolModel ? "tool" : "primary"} model)`);
+    const selectedModel = model;
+    console.log(`[MODEL] Using ${selectedModel.provider}/${selectedModel.model}`);
     const aiResponse = await callAI(
       currentMessages,
       selectedModel,
@@ -16211,7 +21241,7 @@ ${lastLines}
         const title = conversationHistory.find((m) => m.role === "user")?.content.substring(0, 40) || "Untitled Chat";
         await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
       }
-      distillKnowledgeBackground(conversationHistory, toolModel || primaryModel, config).catch((e) => console.error(e));
+      distillKnowledgeBackground(conversationHistory, model, config).catch((e) => console.error(e));
       return { finalResponse: aiResponse, steps };
     }
     consecutiveThinkingCount = 0;
@@ -16247,12 +21277,18 @@ ${lastLines}
         }
         const toolName = toolCall.tool;
         const toolSummary = getToolSummary(toolCall);
-        const stepData = { tool: toolName, status: "running", summary: toolSummary, iteration: iteration + 1 };
+        const stepData = {
+          tool: toolName,
+          status: "running",
+          summary: toolSummary,
+          iteration: iteration + 1,
+          startTime: Date.now()
+        };
         const stepIndex = steps.push(stepData) - 1;
         win?.webContents.send("agent:step", stepData);
         console.log(`[LOOP] Executing (Sequential): ${toolName}`);
         try {
-          const execution = await executeToolCall(toolCall, workspacePath, iteration + 1, isAutopilotMode, toolModel, config);
+          const execution = await executeToolCall(toolCall, workspacePath, iteration + 1, isAutopilotMode, model, config);
           const truncatedResult = execution.result.length > 15e3 ? execution.result.substring(0, 15e3) + "\n... (truncated)" : execution.result;
           steps[stepIndex].status = "done";
           steps[stepIndex].result = truncatedResult.substring(0, 500);
@@ -16263,6 +21299,24 @@ ${lastLines}
           if (toolName === "run_command" && (truncatedResult.toLowerCase().includes("operation cancelled") || truncatedResult.includes("Error:") || truncatedResult.includes("ENOENT"))) {
             enhancedResult = analyzeCommandError(truncatedResult, toolCall.command || "");
           }
+          if (toolName === "write_file" || toolName === "edit_file" || toolName === "strReplace") {
+            if (codeIntelligence && workspacePath && toolCall.path) {
+              try {
+                const suggestions = await Promise.race([
+                  codeIntelligence.suggestRefactoring(workspacePath, toolCall.path),
+                  new Promise((resolve2) => setTimeout(() => resolve2([]), 3e3))
+                ]);
+                if (suggestions.length > 0) {
+                  enhancedResult += `
+
+[CODE INTELLIGENCE] Suggestions:
+${suggestions.slice(0, 2).join("\n")}`;
+                }
+              } catch (error) {
+                console.warn("[CODE INTELLIGENCE] Failed to analyze file:", error);
+              }
+            }
+          }
           if (execution.abort) {
             shouldAbort = true;
             finalMsg = `Task stopped: User denied operation or requested abort during ${toolName}.`;
@@ -16270,6 +21324,40 @@ ${lastLines}
           }
           turnResults.push(`[${toolName} Result]
 ${enhancedResult}`);
+          if (learningSystem && contextMemory) {
+            try {
+              const toolSuccess = !enhancedResult.toLowerCase().includes("error:") && !enhancedResult.toLowerCase().includes("failed") && !execution.abort;
+              await Promise.race([
+                recordInteractionForLearning(
+                  userMessage,
+                  enhancedResult,
+                  [toolName],
+                  toolSuccess,
+                  Date.now() - (steps[stepIndex].startTime || Date.now()),
+                  {
+                    workspacePath,
+                    toolCall,
+                    iteration: iteration + 1,
+                    executionPlan: executionPlan?.id
+                  }
+                ),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Learning recording timed out")), 5e3))
+              ]);
+              if (executionPlan && strategicPlanner) {
+                const currentTask = executionPlan.tasks[currentTaskIndex];
+                if (currentTask && toolSuccess) {
+                  console.log(`[STRATEGIC PLANNING] Task "${currentTask.description}" completed successfully`);
+                  currentTaskIndex++;
+                  if (currentTaskIndex < executionPlan.tasks.length) {
+                    const nextTask = executionPlan.tasks[currentTaskIndex];
+                    console.log(`[STRATEGIC PLANNING] Moving to next task: "${nextTask.description}"`);
+                  }
+                }
+              }
+            } catch (error) {
+              console.warn("[LEARNING] Failed to record tool execution:", error);
+            }
+          }
           if (enhancedResult.toLowerCase().includes("error:") || enhancedResult.toLowerCase().includes("failed")) {
             console.log(`[LOOP] Command failed, stopping sequential execution to let agent adapt`);
             break;
@@ -16293,7 +21381,7 @@ Tool execution failed: ${e.message}`);
         const title = conversationHistory.find((m) => m.role === "user")?.content.substring(0, 40) || "Untitled Chat";
         await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
       }
-      distillKnowledgeBackground(conversationHistory, toolModel || primaryModel, config).catch((e) => console.error(e));
+      distillKnowledgeBackground(conversationHistory, model, config).catch((e) => console.error(e));
       return { finalResponse: finalMsg, steps };
     }
     iteration++;
@@ -16314,28 +21402,28 @@ async function refreshManifest(workspacePath) {
   }
 }
 function getToolSummary(toolCall) {
-  const path = toolCall.path || "(missing path)";
+  const path2 = toolCall.path || "(missing path)";
   switch (toolCall.tool) {
     case "read_file":
-      return `Reading ${path}`;
+      return `Reading ${path2}`;
     case "write_file":
-      return `Writing ${path}`;
+      return `Writing ${path2}`;
     case "edit_file":
-      return `Editing ${path} (${toolCall.edits?.length || 0} edits)`;
+      return `Editing ${path2} (${toolCall.edits?.length || 0} edits)`;
     case "list_directory":
-      return `Listing ${path}`;
+      return `Listing ${path2}`;
     case "search_files":
       return `Searching for "${toolCall.pattern || "?"}"${toolCall.include ? ` in ${toolCall.include}` : ""}`;
     case "run_command":
       return `Running: ${toolCall.command || "(missing command)"}`;
     case "create_directory":
-      return `Creating directory ${path}`;
+      return `Creating directory ${path2}`;
     case "delete_file":
-      return `Deleting ${path}`;
+      return `Deleting ${path2}`;
     case "semantic_search":
       return `Searching semantically for "${toolCall.query || "?"}"`;
     case "get_blast_radius":
-      return `Calculating blast radius for ${path}`;
+      return `Calculating blast radius for ${path2}`;
     case "apply_diffs":
       return `Applying diffs to ${toolCall.changes?.length || 0} files`;
     case "validate_project":
@@ -16343,11 +21431,11 @@ function getToolSummary(toolCall) {
     case "run_tests":
       return "Running test suite";
     case "readCode":
-      return `Reading code structure from ${path}`;
+      return `Reading code structure from ${path2}`;
     case "editCode":
-      return `Editing code in ${path}`;
+      return `Editing code in ${path2}`;
     case "getDiagnostics":
-      return `Getting diagnostics for ${path}`;
+      return `Getting diagnostics for ${path2}`;
     case "grepSearch":
       return `Grep searching for "${toolCall.pattern || "?"}"${toolCall.include ? ` in ${toolCall.include}` : ""}`;
     case "fileSearch":
@@ -16359,7 +21447,7 @@ function getToolSummary(toolCall) {
     case "smartRelocate":
       return `Moving ${toolCall.sourcePath} to ${toolCall.destinationPath}`;
     case "strReplace":
-      return `Replacing string in ${path}`;
+      return `Replacing string in ${path2}`;
     case "invokeSubAgent":
       return `Delegating to ${toolCall.agentName}: ${toolCall.task?.substring(0, 50) || ""}...`;
     case "browser_subagent":
@@ -16407,6 +21495,27 @@ function setupWorkspaceWatcher(watchPath) {
   memoryManager.initialize().catch(console.error);
   currentHistoryManager = new HistoryManager(watchPath);
   currentHistoryManager.initialize().catch(console.error);
+  contextMemory = new ContextMemory();
+  strategicPlanner = new StrategicPlanner();
+  learningSystem = new LearningSystem(contextMemory);
+  codeIntelligence = new CodeIntelligence();
+  enhancedMCPSystem = new EnhancedMCPSystem(watchPath);
+  vectorSearchSystem = new VectorSearchSystem(watchPath);
+  errorRecoverySystem = new ErrorRecoverySystem(watchPath);
+  toolResultCache = new ToolResultCache(watchPath);
+  if (contextMemory) {
+    contextMemory.startSession();
+  }
+  if (vectorSearchSystem) {
+    vectorSearchSystem.indexWorkspace(watchPath).catch((error) => {
+      console.warn("[VECTOR] Background indexing failed:", error);
+    });
+  }
+  if (toolResultCache) {
+    toolResultCache.warmupCache(watchPath).catch((error) => {
+      console.warn("[CACHE] Cache warmup failed:", error);
+    });
+  }
   currentConversationId = Date.now().toString();
   workspaceWatcher = watch(watchPath, {
     ignored: /(^|[\\/\\])(node_modules|\.git|dist|dist-electron|build|\.next|__pycache__|\.venv|venv|\.cache|coverage)([\\/\\]|$)/,
@@ -16444,7 +21553,6 @@ Event: ${eventType}
 ${hook.prompt.replace("${filePath}", filePath)}`,
                 fallbackModel,
                 // Use defaults for background hooks
-                fallbackModel,
                 { openaiKey: "", geminiKey: "" },
                 watchPath,
                 null,
@@ -16459,11 +21567,11 @@ ${hook.prompt.replace("${filePath}", filePath)}`,
       refreshManifest(currentWorkspacePath).catch(console.error);
     }
   };
-  workspaceWatcher.on("add", (path) => notifyRenderer("add", path));
-  workspaceWatcher.on("change", (path) => notifyRenderer("change", path));
-  workspaceWatcher.on("addDir", (path) => notifyRenderer("addDir", path));
-  workspaceWatcher.on("unlink", (path) => notifyRenderer("unlink", path));
-  workspaceWatcher.on("unlinkDir", (path) => notifyRenderer("unlinkDir", path));
+  workspaceWatcher.on("add", (path2) => notifyRenderer("add", path2));
+  workspaceWatcher.on("change", (path2) => notifyRenderer("change", path2));
+  workspaceWatcher.on("addDir", (path2) => notifyRenderer("addDir", path2));
+  workspaceWatcher.on("unlink", (path2) => notifyRenderer("unlink", path2));
+  workspaceWatcher.on("unlinkDir", (path2) => notifyRenderer("unlinkDir", path2));
   console.log(`[WATCHER] Watching workspace: ${watchPath}`);
 }
 ipcMain.handle("dialog:openFile", async () => {
@@ -16505,6 +21613,7 @@ ipcMain.handle("fs:readFile", async (_event, filePath) => {
 ipcMain.handle("fs:writeFile", async (_event, filePath, content) => {
   try {
     await fs.writeFile(filePath, content, "utf-8");
+    win?.webContents.send("file:changed", { path: filePath, content });
     return true;
   } catch (e) {
     console.error(e);
@@ -16598,10 +21707,7 @@ ipcMain.on("terminal:spawn", (_event, terminalId = "default") => {
   ptyProcess.onData((data) => {
     win?.webContents.send("terminal:incomingData", data, terminalId);
     const lines = data.split(/\r?\n/);
-    terminalOutputBuffer.push(...lines.filter((l) => l.trim()));
-    if (terminalOutputBuffer.length > 200) {
-      terminalOutputBuffer.splice(0, terminalOutputBuffer.length - 200);
-    }
+    lines.filter((l) => l.trim()).forEach((line) => terminalOutputBuffer.push(line));
   });
   ptyProcess.onExit(() => {
     console.log("[TERMINAL] Process exited");
@@ -16631,12 +21737,60 @@ ipcMain.handle("terminal:reset", () => {
 });
 ipcMain.handle("ollama:getModels", async () => {
   try {
-    const res = await fetch("http://127.0.0.1:11434/api/tags");
-    if (!res.ok) throw new Error("Ollama not responding");
+    console.log("[OLLAMA] Attempting to connect to Ollama at http://127.0.0.1:11434");
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5e3);
+    const res = await fetch("http://127.0.0.1:11434/api/tags", {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      console.error(`[OLLAMA] HTTP ${res.status}: ${res.statusText}`);
+      throw new Error(`Ollama HTTP ${res.status}: ${res.statusText}`);
+    }
     const data = await res.json();
-    return data.models.map((m) => m.name);
+    console.log("[OLLAMA] Response received:", data);
+    if (!data.models || !Array.isArray(data.models)) {
+      console.error("[OLLAMA] Invalid response format:", data);
+      throw new Error("Invalid response format from Ollama");
+    }
+    const modelNames = data.models.map((m) => m.name);
+    console.log("[OLLAMA] Found models:", modelNames);
+    return modelNames;
   } catch (e) {
+    console.error("[OLLAMA] Failed to get models:", e);
+    if (e.name === "AbortError") {
+      return { error: "Ollama connection timeout - is Ollama running on port 11434?" };
+    } else if (e.code === "ECONNREFUSED" || e.message.includes("ECONNREFUSED")) {
+      return { error: "Connection refused - Ollama is not running on port 11434" };
+    } else if (e.message.includes("fetch") || e.name === "TypeError") {
+      return { error: "Cannot connect to Ollama - check if it's running (ollama serve)" };
+    }
     return { error: e.message };
+  }
+});
+ipcMain.handle("ollama:healthCheck", async () => {
+  try {
+    console.log("[OLLAMA] Health check...");
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3e3);
+    const res = await fetch("http://127.0.0.1:11434/api/version", {
+      method: "GET",
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (res.ok) {
+      const data = await res.json();
+      console.log("[OLLAMA] Health check passed, version:", data.version);
+      return { healthy: true, version: data.version };
+    } else {
+      return { healthy: false, error: `HTTP ${res.status}` };
+    }
+  } catch (e) {
+    console.error("[OLLAMA] Health check failed:", e.message);
+    return { healthy: false, error: e.message };
   }
 });
 ipcMain.handle("fs:readDirectoryRecursive", async (_event, dirPath) => {
@@ -16647,7 +21801,7 @@ ipcMain.handle("fs:readDirectoryRecursive", async (_event, dirPath) => {
     return [];
   }
 });
-ipcMain.handle("execute-agent-task", async (_event, { task, primaryModel, toolModel, workspacePath, activeFile, config, isAutopilotMode }) => {
+ipcMain.handle("execute-agent-task", async (_event, { task, model, workspacePath, activeFile, config, isAutopilotMode }) => {
   if (!workspacePath) {
     return {
       response: "I'm ready to help, but I need you to open a folder first so I have a place to work. Please use the 'Open Folder' button in the Title Bar or File menu.",
@@ -16680,7 +21834,7 @@ ipcMain.handle("execute-agent-task", async (_event, { task, primaryModel, toolMo
       refreshManifest(workspacePath).catch(() => {
       });
     }
-    const result = await runAgentLoop(task, primaryModel, toolModel, config, workspacePath, activeFile, isAutopilotMode);
+    const result = await runAgentLoop(task, model, config, workspacePath, activeFile, isAutopilotMode);
     return {
       response: result.finalResponse,
       steps: result.steps
@@ -16707,7 +21861,7 @@ ipcMain.handle("agent:stop", () => {
     try {
       const proc = procObj.process;
       if (process.platform === "win32" && proc.pid) {
-        exec(`taskkill /pid ${proc.pid} /t /f`);
+        exec$1(`taskkill /pid ${proc.pid} /t /f`);
       } else {
         proc.kill("SIGKILL");
       }
@@ -16772,7 +21926,7 @@ ipcMain.handle("steering:reload", async () => {
   await steeringManager.loadSteeringFiles();
   return { success: true };
 });
-ipcMain.handle("search:files", async (_event, { path, query, include, exclude }) => {
+ipcMain.handle("search:files", async (_event, { path: path2, query, include, exclude }) => {
   try {
     const results = [];
     async function searchInFile(filePath) {
@@ -16810,7 +21964,7 @@ ipcMain.handle("search:files", async (_event, { path, query, include, exclude })
         }
       }
     }
-    await searchDirectory(path);
+    await searchDirectory(path2);
     return results.slice(0, 500);
   } catch (err) {
     console.error("Search error:", err);
@@ -16833,18 +21987,18 @@ ipcMain.handle("git:status", async (_event, workspacePath) => {
     return null;
   }
 });
-ipcMain.handle("git:stage", async (_event, { path, file }) => {
+ipcMain.handle("git:stage", async (_event, { path: path2, file }) => {
   try {
-    await execAsync(`git add "${file}"`, { cwd: path });
+    await execAsync(`git add "${file}"`, { cwd: path2 });
     return true;
   } catch (err) {
     console.error("Git stage error:", err);
     return false;
   }
 });
-ipcMain.handle("git:commit", async (_event, { path, message }) => {
+ipcMain.handle("git:commit", async (_event, { path: path2, message }) => {
   try {
-    await execAsync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: path });
+    await execAsync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: path2 });
     return true;
   } catch (err) {
     console.error("Git commit error:", err);
@@ -16930,6 +22084,344 @@ ipcMain.handle("fs:checkFileExists", async (_event, filePath) => {
     return true;
   } catch (error) {
     return false;
+  }
+});
+async function detectProjectType(workspacePath) {
+  if (!workspacePath) return "unknown";
+  try {
+    const files = await fs.readdir(workspacePath);
+    if (files.includes("package.json")) {
+      const packageJson = JSON.parse(await fs.readFile(join(workspacePath, "package.json"), "utf8"));
+      if (packageJson.dependencies?.react) return "react";
+      if (packageJson.dependencies?.vue) return "vue";
+      if (packageJson.dependencies?.angular) return "angular";
+      if (packageJson.dependencies?.electron) return "electron";
+      return "nodejs";
+    }
+    if (files.includes("requirements.txt") || files.includes("setup.py")) return "python";
+    if (files.includes("Cargo.toml")) return "rust";
+    if (files.includes("go.mod")) return "go";
+    if (files.includes("pom.xml") || files.includes("build.gradle")) return "java";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+async function estimateCodebaseSize(workspacePath) {
+  if (!workspacePath) return "small";
+  try {
+    const files = await readDirectoryRecursive(workspacePath, 1e3);
+    const codeFiles = files.filter((f) => {
+      const ext = f.path.split(".").pop()?.toLowerCase();
+      return ["ts", "tsx", "js", "jsx", "py", "java", "cpp", "c", "cs", "go", "rs"].includes(ext || "");
+    });
+    if (codeFiles.length > 200) return "large";
+    if (codeFiles.length > 50) return "medium";
+    return "small";
+  } catch {
+    return "small";
+  }
+}
+function getAvailableTools() {
+  return [
+    "read_file",
+    "write_file",
+    "edit_code",
+    "strReplace",
+    "delete_file",
+    "list_directory",
+    "search_files",
+    "fuzzy_find_file",
+    "grepSearch",
+    "readCode",
+    "getDiagnostics",
+    "semantic_rename",
+    "smart_relocate",
+    "run_command",
+    "readMultipleFiles"
+  ];
+}
+function classifyUserRequest(userMessage) {
+  const lowerMessage = userMessage.toLowerCase();
+  if (lowerMessage.includes("fix") || lowerMessage.includes("error") || lowerMessage.includes("bug")) {
+    return "bug-fix";
+  }
+  if (lowerMessage.includes("add") || lowerMessage.includes("create") || lowerMessage.includes("implement")) {
+    return "feature-implementation";
+  }
+  if (lowerMessage.includes("refactor") || lowerMessage.includes("improve") || lowerMessage.includes("optimize")) {
+    return "refactoring";
+  }
+  if (lowerMessage.includes("analyze") || lowerMessage.includes("understand") || lowerMessage.includes("explain")) {
+    return "analysis";
+  }
+  return "general";
+}
+async function recordInteractionForLearning(userRequest, agentResponse, toolsUsed, success, duration, context) {
+  if (!learningSystem || !contextMemory) return;
+  try {
+    const interaction = {
+      timestamp: /* @__PURE__ */ new Date(),
+      userRequest,
+      agentResponse,
+      toolsUsed,
+      success,
+      duration,
+      context
+    };
+    await learningSystem.updateLearning(interaction);
+    if (success && toolsUsed.length > 0) {
+      const taskType = classifyUserRequest(userRequest);
+      const strategy = toolsUsed.join(" -> ");
+      contextMemory.recordSuccessfulStrategy(
+        taskType,
+        strategy,
+        toolsUsed,
+        duration,
+        success
+      );
+    }
+    if (Math.random() < 0.1) {
+      await contextMemory.saveMemory();
+    }
+  } catch (error) {
+    console.warn("[LEARNING] Failed to record interaction:", error);
+  }
+}
+ipcMain.handle("ai:get-learning-insights", async () => {
+  if (!learningSystem) return [];
+  try {
+    return await learningSystem.analyzeInteractionPatterns();
+  } catch (error) {
+    console.error("Failed to get learning insights:", error);
+    return [];
+  }
+});
+ipcMain.handle("ai:get-learning-metrics", async () => {
+  if (!learningSystem) return null;
+  try {
+    return await learningSystem.generateLearningMetrics();
+  } catch (error) {
+    console.error("Failed to get learning metrics:", error);
+    return null;
+  }
+});
+ipcMain.handle("ai:get-code-metrics", async (_, workspacePath) => {
+  if (!codeIntelligence) return null;
+  try {
+    return codeIntelligence.getCodeMetrics(workspacePath);
+  } catch (error) {
+    console.error("Failed to get code metrics:", error);
+    return null;
+  }
+});
+ipcMain.handle("ai:analyze-workspace", async (_, workspacePath) => {
+  if (!codeIntelligence) return null;
+  try {
+    return await codeIntelligence.analyzeWorkspace(workspacePath);
+  } catch (error) {
+    console.error("Failed to analyze workspace:", error);
+    return null;
+  }
+});
+ipcMain.handle("ai:get-symbol-info", async (_, workspacePath, symbolName) => {
+  if (!codeIntelligence) return null;
+  try {
+    return await codeIntelligence.getSymbolInfo(workspacePath, symbolName);
+  } catch (error) {
+    console.error("Failed to get symbol info:", error);
+    return null;
+  }
+});
+ipcMain.handle("ai:suggest-refactoring", async (_, workspacePath, filePath) => {
+  if (!codeIntelligence) return [];
+  try {
+    return await codeIntelligence.suggestRefactoring(workspacePath, filePath);
+  } catch (error) {
+    console.error("Failed to suggest refactoring:", error);
+    return [];
+  }
+});
+ipcMain.handle("ai:get-execution-plans", async () => {
+  if (!strategicPlanner) return [];
+  try {
+    return strategicPlanner.getPlanHistory();
+  } catch (error) {
+    console.error("Failed to get execution plans:", error);
+    return [];
+  }
+});
+ipcMain.handle("ai:get-context-memory-stats", async () => {
+  if (!contextMemory) return null;
+  try {
+    return {
+      codePatterns: contextMemory.getCodePatterns().length,
+      userPreferences: contextMemory.getUserPreferences().length,
+      errorPatterns: contextMemory.getErrorPatterns().length,
+      successfulStrategies: contextMemory.getSuccessfulStrategies().length,
+      sessionHistory: contextMemory.getSessionHistory().length
+    };
+  } catch (error) {
+    console.error("Failed to get context memory stats:", error);
+    return null;
+  }
+});
+ipcMain.handle("mcp:get-marketplace", async () => {
+  if (!enhancedMCPSystem) return null;
+  try {
+    return enhancedMCPSystem.getMarketplace();
+  } catch (error) {
+    console.error("Failed to get MCP marketplace:", error);
+    return null;
+  }
+});
+ipcMain.handle("mcp:refresh-marketplace", async () => {
+  if (!enhancedMCPSystem) return false;
+  try {
+    await enhancedMCPSystem.refreshMarketplace();
+    return true;
+  } catch (error) {
+    console.error("Failed to refresh MCP marketplace:", error);
+    return false;
+  }
+});
+ipcMain.handle("mcp:install-power", async (_, powerId) => {
+  if (!enhancedMCPSystem) return false;
+  try {
+    await enhancedMCPSystem.installPower(powerId);
+    return true;
+  } catch (error) {
+    console.error("Failed to install MCP power:", error);
+    return false;
+  }
+});
+ipcMain.handle("mcp:enable-power", async (_, powerId, config) => {
+  if (!enhancedMCPSystem) return false;
+  try {
+    await enhancedMCPSystem.enablePower(powerId, config);
+    return true;
+  } catch (error) {
+    console.error("Failed to enable MCP power:", error);
+    return false;
+  }
+});
+ipcMain.handle("mcp:get-available-tools", async () => {
+  if (!enhancedMCPSystem) return [];
+  try {
+    return enhancedMCPSystem.getAvailableTools();
+  } catch (error) {
+    console.error("Failed to get available MCP tools:", error);
+    return [];
+  }
+});
+ipcMain.handle("vector:semantic-search", async (_, query) => {
+  if (!vectorSearchSystem) return [];
+  try {
+    return await vectorSearchSystem.semanticSearch(query);
+  } catch (error) {
+    console.error("Failed to perform semantic search:", error);
+    return [];
+  }
+});
+ipcMain.handle("vector:find-similar-code", async (_, codeSnippet, options) => {
+  if (!vectorSearchSystem) return [];
+  try {
+    return await vectorSearchSystem.findSimilarCode(codeSnippet, options);
+  } catch (error) {
+    console.error("Failed to find similar code:", error);
+    return [];
+  }
+});
+ipcMain.handle("vector:get-contextual-recommendations", async (_, context, filePath) => {
+  if (!vectorSearchSystem) return [];
+  try {
+    return await vectorSearchSystem.getContextualRecommendations(context, filePath);
+  } catch (error) {
+    console.error("Failed to get contextual recommendations:", error);
+    return [];
+  }
+});
+ipcMain.handle("vector:get-index-stats", async () => {
+  if (!vectorSearchSystem) return null;
+  try {
+    return vectorSearchSystem.getIndexStats();
+  } catch (error) {
+    console.error("Failed to get vector index stats:", error);
+    return null;
+  }
+});
+ipcMain.handle("vector:reindex-workspace", async (_, workspacePath) => {
+  if (!vectorSearchSystem) return false;
+  try {
+    await vectorSearchSystem.indexWorkspace(workspacePath, { forceReindex: true });
+    return true;
+  } catch (error) {
+    console.error("Failed to reindex workspace:", error);
+    return false;
+  }
+});
+ipcMain.handle("error-recovery:get-error-history", async (_, limit) => {
+  if (!errorRecoverySystem) return [];
+  try {
+    return errorRecoverySystem.getErrorHistory(limit);
+  } catch (error) {
+    console.error("Failed to get error history:", error);
+    return [];
+  }
+});
+ipcMain.handle("error-recovery:get-statistics", async () => {
+  if (!errorRecoverySystem) return null;
+  try {
+    return errorRecoverySystem.getErrorStatistics();
+  } catch (error) {
+    console.error("Failed to get error statistics:", error);
+    return null;
+  }
+});
+ipcMain.handle("error-recovery:get-strategies", async () => {
+  if (!errorRecoverySystem) return [];
+  try {
+    return errorRecoverySystem.getRecoveryStrategies();
+  } catch (error) {
+    console.error("Failed to get recovery strategies:", error);
+    return [];
+  }
+});
+ipcMain.handle("cache:get-stats", async () => {
+  if (!toolResultCache) return null;
+  try {
+    return toolResultCache.getStats();
+  } catch (error) {
+    console.error("Failed to get cache stats:", error);
+    return null;
+  }
+});
+ipcMain.handle("cache:clear", async () => {
+  if (!toolResultCache) return false;
+  try {
+    toolResultCache.clear();
+    return true;
+  } catch (error) {
+    console.error("Failed to clear cache:", error);
+    return false;
+  }
+});
+ipcMain.handle("cache:invalidate", async (_, toolName, filePath, tags) => {
+  if (!toolResultCache) return 0;
+  try {
+    return toolResultCache.invalidate(toolName, filePath, tags);
+  } catch (error) {
+    console.error("Failed to invalidate cache:", error);
+    return 0;
+  }
+});
+ipcMain.handle("cache:cleanup", async () => {
+  if (!toolResultCache) return 0;
+  try {
+    return toolResultCache.cleanup();
+  } catch (error) {
+    console.error("Failed to cleanup cache:", error);
+    return 0;
   }
 });
 export {

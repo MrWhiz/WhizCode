@@ -62,6 +62,16 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
         }
     };
 
+    // Determine phase badge
+    const getPhaseLabel = (phase?: string) => {
+        switch (phase) {
+            case 'planning': return '📋 PLANNING';
+            case 'execution': return '⚙️ EXECUTION';
+            case 'summary': return '📊 SUMMARY';
+            default: return '';
+        }
+    };
+
     return (
         <div className={`agent-step ${step.status}`}>
             <div
@@ -78,6 +88,18 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
                     <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
                 )}
                 <span className="agent-step-summary">{step.summary}</span>
+                {step.planPhase && (
+                    <span style={{ 
+                        fontSize: '9px', 
+                        opacity: 0.6, 
+                        marginLeft: '8px',
+                        padding: '2px 6px',
+                        background: 'rgba(0,0,0,0.2)',
+                        borderRadius: '3px'
+                    }}>
+                        {getPhaseLabel(step.planPhase)}
+                    </span>
+                )}
                 {step.status === 'done' && <span className="agent-step-check">✓</span>}
                 {canOpenLogs && (
                     <span style={{ marginLeft: 'auto', fontSize: '10px', opacity: 0.7, paddingLeft: 6 }}>
@@ -95,6 +117,91 @@ const EditDetails = ({ data }: { data: any }) => {
     const [isOpen, setIsOpen] = React.useState(false);
 
     if (!data) return null;
+
+    // Handle plan data
+    if (data.plan) {
+        const plan = data.plan;
+        return (
+            <div className="agent-step-details" style={{ marginTop: '8px' }}>
+                <div
+                    className="details-toggle"
+                    onClick={() => setIsOpen(!isOpen)}
+                    style={{
+                        fontSize: '11px',
+                        color: 'var(--accent-primary)',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        userSelect: 'none',
+                        fontWeight: 600
+                    }}
+                >
+                    {isOpen ? '⊖ Hide Plan' : '⊕ View Plan'}
+                </div>
+                {isOpen && (
+                    <div className="details-content" style={{
+                        marginTop: '8px',
+                        background: 'rgba(0,0,0,0.2)',
+                        borderRadius: '4px',
+                        overflow: 'hidden',
+                        border: '1px solid var(--border-color)',
+                        padding: '8px'
+                    }}>
+                        <div style={{ marginBottom: '8px' }}>
+                            <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', fontWeight: 600, textTransform: 'uppercase', marginBottom: '4px' }}>
+                                Objective
+                            </div>
+                            <div style={{ fontSize: '11px', color: 'var(--text-primary)' }}>{plan.objective}</div>
+                        </div>
+                        
+                        <div style={{ marginBottom: '8px' }}>
+                            <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', fontWeight: 600, textTransform: 'uppercase', marginBottom: '4px' }}>
+                                Tasks ({plan.tasks?.length || 0})
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                {plan.tasks?.map((task: any, i: number) => (
+                                    <div key={i} style={{
+                                        fontSize: '10px',
+                                        padding: '4px 6px',
+                                        background: 'rgba(0,0,0,0.3)',
+                                        borderRadius: '3px',
+                                        borderLeft: '2px solid var(--accent-primary)'
+                                    }}>
+                                        <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                                            {i + 1}. {task.description}
+                                        </div>
+                                        <div style={{ fontSize: '9px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                                            Type: {task.type} • Duration: ~{task.estimatedDuration}s
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', fontSize: '10px' }}>
+                            <div>
+                                <div style={{ color: 'var(--text-tertiary)', fontWeight: 600, textTransform: 'uppercase', marginBottom: '2px' }}>
+                                    Duration
+                                </div>
+                                <div style={{ color: 'var(--text-primary)' }}>~{plan.estimatedDuration}s</div>
+                            </div>
+                            <div>
+                                <div style={{ color: 'var(--text-tertiary)', fontWeight: 600, textTransform: 'uppercase', marginBottom: '2px' }}>
+                                    Risk Level
+                                </div>
+                                <div style={{ 
+                                    color: plan.riskLevel === 'high' ? '#ff6b6b' : plan.riskLevel === 'medium' ? '#ffa500' : '#51cf66'
+                                }}>
+                                    {plan.riskLevel?.toUpperCase()}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    }
 
     return (
         <div className="agent-step-details" style={{ marginTop: '8px' }}>

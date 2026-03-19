@@ -4,10 +4,10 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 
 interface TerminalPaneProps {
-    terminalId?: string
+    terminalId: string
 }
 
-export const TerminalPane = ({ terminalId = 'default' }: TerminalPaneProps) => {
+export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
     const terminalRef = useRef<HTMLDivElement>(null)
 
     useEffect(() => {
@@ -51,12 +51,64 @@ export const TerminalPane = ({ terminalId = 'default' }: TerminalPaneProps) => {
                 cursorBlink: true,
                 cursorStyle: 'block',
                 allowTransparency: false,
-                convertEol: true
+                convertEol: true,
+                screenReaderMode: false,
+                disableStdin: false
             })
 
             const fitAddon = new FitAddon()
             term.loadAddon(fitAddon)
+
+            // Set up data handler BEFORE opening terminal
+            if (ipc) {
+                onIncomingData = (_event: any, data: string, id: string) => {
+                    if (id === terminalId && term) {
+                        term.write(data)
+                    }
+                }
+
+                ipc.on('terminal:incomingData', onIncomingData)
+            }
+
             term.open(terminalRef.current)
+
+            // Focus terminal on mount
+            setTimeout(() => {
+                if (!unmounted && term) {
+                    term.focus()
+                }
+            }, 50)
+
+            // Add click handler to ensure focus
+            if (terminalRef.current) {
+                terminalRef.current.addEventListener('click', () => {
+                    if (term) {
+                        term.focus()
+                    }
+                })
+            }
+
+            // Register link matcher for URLs with Ctrl+click support
+            const urlRegex = /(https?:\/\/[^\s]+|file:\/\/[^\s]+)/g
+            if (term.registerLinkMatcher) {
+                term.registerLinkMatcher(
+                    urlRegex,
+                    (event: MouseEvent, uri: string) => {
+                        // Only open on Ctrl+click or Cmd+click
+                        if (event.ctrlKey || event.metaKey) {
+                            console.log('[TERMINAL] Opening link:', uri)
+                            ipc.send('terminal:openLink', uri)
+                        }
+                    },
+                    {
+                        priority: 1,
+                        willLinkActivate: (event: MouseEvent, uri: string) => {
+                            // Show link is clickable on Ctrl+hover
+                            return event.ctrlKey || event.metaKey
+                        }
+                    }
+                )
+            }
 
             // Initial fit
             setTimeout(() => {
@@ -66,16 +118,6 @@ export const TerminalPane = ({ terminalId = 'default' }: TerminalPaneProps) => {
             }, 50)
 
             if (ipc) {
-                ipc.send('terminal:spawn', terminalId)
-
-                onIncomingData = (_event: any, data: string, id: string) => {
-                    if (id === terminalId && term) {
-                        term.write(data)
-                    }
-                }
-
-                ipc.on('terminal:incomingData', onIncomingData)
-
                 term.onData((data: string) => {
                     ipc.send('terminal:keystroke', data, terminalId)
                 })

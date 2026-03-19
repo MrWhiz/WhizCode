@@ -8,6 +8,7 @@ export interface AgentStep {
     logs?: string[];
     data?: any;
     requestId?: string;
+    planPhase?: 'planning' | 'execution' | 'summary';
 }
 
 export interface Message {
@@ -28,7 +29,9 @@ export interface OpenFileProps {
     content: string;
 }
 
-export type AIProvider = 'ollama' | 'openai' | 'gemini';
+export type AIProvider = 'ollama' | 'openai' | 'gemini' | 'bedrock';
+
+export type TerminalType = 'bash' | 'cmd' | 'powershell' | 'zsh' | 'sh';
 
 export interface ModelConfig {
     provider: AIProvider;

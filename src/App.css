@@ -231,6 +231,59 @@ body {
   background-color: var(--bg-secondary);
 }
 
+.sidebar-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sidebar-action-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+}
+
+.sidebar-action-btn:hover {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.sidebar-action-btn:active {
+  background-color: var(--selection);
+}
+
+.sidebar-action-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.file-filter {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.file-filter-input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.file-filter-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
 .sidebar-section-header {
   padding: 8px 16px;
   font-size: 12px;
@@ -1394,4 +1447,543 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* AI Insights Panel Styles */
+.ai-insights-panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--vscode-sideBar-background);
+  color: var(--vscode-sideBar-foreground);
+}
+
+.ai-insights-panel .panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--vscode-sideBar-border);
+}
+
+.ai-insights-panel .panel-header h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vscode-sideBarTitle-foreground);
+}
+
+.ai-insights-panel .refresh-btn {
+  background: none;
+  border: none;
+  color: var(--vscode-icon-foreground);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 3px;
+  font-size: 14px;
+}
+
+.ai-insights-panel .refresh-btn:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+}
+
+.ai-insights-panel .refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ai-insights-panel .tab-bar {
+  display: flex;
+  border-bottom: 1px solid var(--vscode-sideBar-border);
+  overflow-x: auto;
+}
+
+.ai-insights-panel .tab {
+  background: none;
+  border: none;
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--vscode-tab-inactiveForeground);
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+}
+
+.ai-insights-panel .tab:hover {
+  color: var(--vscode-tab-activeForeground);
+  background: var(--vscode-tab-hoverBackground);
+}
+
+.ai-insights-panel .tab.active {
+  color: var(--vscode-tab-activeForeground);
+  border-bottom-color: var(--vscode-tab-activeBorder);
+}
+
+.ai-insights-panel .tab-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.ai-insights-panel .empty-state {
+  text-align: center;
+  padding: 20px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.ai-insights-panel .empty-state p {
+  margin: 4px 0;
+  font-size: 12px;
+}
+
+/* Insights Tab */
+.insights-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.insight-card {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 12px;
+}
+
+.insight-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.insight-type {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+}
+
+.insight-type.pattern {
+  background: #3b82f6;
+  color: white;
+}
+
+.insight-type.preference {
+  background: #8b5cf6;
+  color: white;
+}
+
+.insight-type.strategy {
+  background: #10b981;
+  color: white;
+}
+
+.insight-type.error {
+  background: #ef4444;
+  color: white;
+}
+
+.confidence-bar {
+  height: 3px;
+  border-radius: 2px;
+  min-width: 20px;
+}
+
+.insight-description {
+  font-size: 12px;
+  margin: 8px 0;
+  line-height: 1.4;
+}
+
+.insight-recommendation {
+  font-size: 11px;
+  color: var(--vscode-textLink-foreground);
+  margin: 8px 0;
+  line-height: 1.4;
+}
+
+.insight-evidence {
+  margin-top: 8px;
+}
+
+.insight-evidence summary {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+}
+
+.insight-evidence ul {
+  margin: 4px 0 0 16px;
+  padding: 0;
+}
+
+.insight-evidence li {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+  margin: 2px 0;
+}
+
+/* Metrics Tab */
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.metric-card {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 12px;
+  text-align: center;
+}
+
+.metric-card h4 {
+  margin: 0 0 8px 0;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  font-weight: 500;
+}
+
+.metric-value {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.trends-section {
+  grid-column: 1 / -1;
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 12px;
+}
+
+.trends-section h4 {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.trend-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 11px;
+}
+
+.trend-metric {
+  text-transform: capitalize;
+}
+
+.trend-change.positive {
+  color: #10b981;
+}
+
+.trend-change.negative {
+  color: #ef4444;
+}
+
+/* Memory Tab */
+.memory-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stat-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--vscode-foreground);
+}
+
+.stat-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--vscode-textLink-foreground);
+}
+/* Additional AI Insights Panel Styles for High-Priority Systems */
+
+/* Error Recovery Tab */
+.error-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.common-errors {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 12px;
+}
+
+.common-errors h4 {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.error-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 11px;
+}
+
+.error-type {
+  text-transform: capitalize;
+  color: var(--vscode-foreground);
+}
+
+.error-count {
+  font-weight: 600;
+  color: var(--vscode-textLink-foreground);
+}
+
+/* MCP Tab */
+.mcp-marketplace {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.marketplace-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.power-categories {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 12px;
+}
+
+.power-categories h4 {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.category-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.category-tag {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: capitalize;
+}
+
+.featured-powers {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 12px;
+}
+
+.featured-powers h4 {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.power-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.power-item:last-child {
+  border-bottom: none;
+}
+
+.power-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.power-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.power-description {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+  line-height: 1.3;
+}
+
+.power-status {
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.status-enabled {
+  color: #10b981;
+}
+
+.status-installed {
+  color: #fbbf24;
+}
+
+.status-available {
+  color: var(--vscode-descriptionForeground);
+}
+
+/* Vector and Cache Tabs use existing metrics-grid styles */
+
+/* Tab bar scrolling for many tabs */
+.ai-insights-panel .tab-bar {
+  display: flex;
+  border-bottom: 1px solid var(--vscode-sideBar-border);
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.ai-insights-panel .tab-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.ai-insights-panel .tab {
+  background: none;
+  border: none;
+  padding: 6px 8px;
+  font-size: 10px;
+  color: var(--vscode-tab-inactiveForeground);
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  min-width: fit-content;
+}
+
+.ai-insights-panel .tab:hover {
+  color: var(--vscode-tab-activeForeground);
+  background: var(--vscode-tab-hoverBackground);
+}
+
+.ai-insights-panel .tab.active {
+  color: var(--vscode-tab-activeForeground);
+  border-bottom-color: var(--vscode-tab-activeBorder);
+}
+/* Settings Select Dropdown */
+.settings-select {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.settings-select:focus {
+  border-color: var(--accent-primary);
+}
+
+.settings-select:hover {
+  border-color: var(--border-hover);
+}
+
+.settings-field-description {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.settings-field-description a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+
+.settings-field-description a:hover {
+  text-decoration: underline;
+}
+
+.refresh-btn-mini {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 2px;
+  font-size: 12px;
+  transition: background-color 0.15s ease;
+}
+
+.refresh-btn-mini:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+/* Code styling in settings */
+.settings-field-description code {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 2px 4px;
+  border-radius: 2px;
+  font-family: 'Courier New', monospace;
+  font-size: 10px;
+}
+.refresh-btn-mini:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.refresh-btn-mini:disabled:hover {
+  background: none;
+  color: var(--text-secondary);
+}
+/* Custom model input styling */
+.settings-input {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.settings-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.settings-input:hover {
+  border-color: var(--border-hover);
+}
+
+.settings-input::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.7;
 }

@@ -7,12 +7,14 @@ interface ContextMenu {
     entry: FileEntry
 }
 
-const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu }: { 
+const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu, collapseAll = false, fileFilter = '' }: { 
     entry: FileEntry, 
     level?: number, 
     onFileOpen: (path: string, name: string) => void, 
     refreshKey: number,
-    onContextMenu: (e: React.MouseEvent, entry: FileEntry) => void
+    onContextMenu: (e: React.MouseEvent, entry: FileEntry) => void,
+    collapseAll?: boolean,
+    fileFilter?: string
 }) => {
     const [expanded, setExpanded] = useState(false)
     const [children, setChildren] = useState<FileEntry[]>([])
@@ -24,6 +26,13 @@ const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu 
             setChildren(res);
         }
     }, [entry.path, entry.isDirectory])
+
+    // Handle collapse all
+    useEffect(() => {
+        if (collapseAll) {
+            setExpanded(false);
+        }
+    }, [collapseAll])
 
     // Re-fetch children when refreshKey changes (file system changed)
     useEffect(() => {
@@ -93,8 +102,10 @@ const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu 
             </div>
             {expanded && entry.isDirectory && (
                 <div className="explorer-children">
-                    {children.map((child) => (
-                        <FileTreeItem key={child.path} entry={child} level={level + 1} onFileOpen={onFileOpen} refreshKey={refreshKey} onContextMenu={onContextMenu} />
+                    {children
+                        .filter(child => !fileFilter || child.name.toLowerCase().includes(fileFilter.toLowerCase()))
+                        .map((child) => (
+                        <FileTreeItem key={child.path} entry={child} level={level + 1} onFileOpen={onFileOpen} refreshKey={refreshKey} onContextMenu={onContextMenu} collapseAll={collapseAll} fileFilter={fileFilter} />
                     ))}
                 </div>
             )}
@@ -106,12 +117,18 @@ export const FileTree = ({
     path, 
     onFileOpen, 
     onFileDeleted, 
-    onFileRenamed 
+    onFileRenamed,
+    refreshKey: externalRefreshKey = 0,
+    collapseAll = false,
+    fileFilter = ''
 }: { 
     path: string, 
     onFileOpen: (path: string, name: string) => void,
     onFileDeleted?: (deletedPath: string) => void,
-    onFileRenamed?: (oldPath: string, newPath: string) => void
+    onFileRenamed?: (oldPath: string, newPath: string) => void,
+    refreshKey?: number,
+    collapseAll?: boolean,
+    fileFilter?: string
 }) => {
     const [files, setFiles] = useState<FileEntry[]>([])
     const [refreshKey, setRefreshKey] = useState(0)
@@ -129,7 +146,7 @@ export const FileTree = ({
 
     useEffect(() => {
         fetchFiles()
-    }, [fetchFiles])
+    }, [fetchFiles, externalRefreshKey])
 
     // Listen for file system changes from main process
     useEffect(() => {
@@ -281,7 +298,9 @@ export const FileTree = ({
 
     return (
         <div className="explorer-tree" onContextMenu={handleRootContextMenu} style={{ minHeight: '100%', position: 'relative' }}>
-            {files.map((file) => (
+            {files
+                .filter(file => !fileFilter || file.name.toLowerCase().includes(fileFilter.toLowerCase()))
+                .map((file) => (
                 <FileTreeItem 
                     key={file.path} 
                     entry={file} 
@@ -289,6 +308,8 @@ export const FileTree = ({
                     onFileOpen={onFileOpen} 
                     refreshKey={refreshKey} 
                     onContextMenu={handleContextMenu}
+                    collapseAll={collapseAll}
+                    fileFilter={fileFilter}
                 />
             ))}
             

@@ -7,8 +7,10 @@ import { FileTree } from './components/Explorer/FileTree'
 import { SearchPanel } from './components/Explorer/SearchPanel'
 import { SourceControlPanel } from './components/Explorer/SourceControlPanel'
 import { EditorArea } from './components/Editor/EditorArea'
-import { ChatPanel } from './components/Chat/ChatPanel'
 import { TerminalPane } from './components/Terminal/TerminalPane'
+import { MultiTerminalPane } from './components/Terminal/MultiTerminalPane'
+import { ChatPanel } from './components/Chat/ChatPanel'
+import { AIInsightsPanel } from './components/Explorer/AIInsightsPanel'
 
 // Types
 import type { Message, AgentStep, OpenFileProps, AIProvider } from './types'
@@ -25,10 +27,15 @@ function App() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const [activeMenu, setActiveMenu] = useState<string | null>(null)
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, agentSteps])
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [activeFileId, setActiveFileId] = useState<string | null>(null)
   const [openFiles, setOpenFiles] = useState<OpenFileProps[]>([])
-  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | null>('explorer')
+  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | 'ai-insights' | null>('explorer')
   const [sidebarWidth, setSidebarWidth] = useState(260)
   const [isTerminalOpen, setIsTerminalOpen] = useState(false)
   const [terminalHeight, setTerminalHeight] = useState(250)
@@ -36,13 +43,35 @@ function App() {
   const [isChatOpen, setIsChatOpen] = useState(true)
   const [chatWidth, setChatWidth] = useState(400)
 
+  // Explorer state
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [collapseAll, setCollapseAll] = useState(false)
+  const [showFileFilter, setShowFileFilter] = useState(false)
+  const [fileFilter, setFileFilter] = useState('')
+  const [newFileDialog, setNewFileDialog] = useState<{ parentPath: string } | null>(null)
+  const [newFolderDialog, setNewFolderDialog] = useState<{ parentPath: string } | null>(null)
+  const [newItemName, setNewItemName] = useState('')
+
   // Model settings
-  const [primaryModelProvider, setPrimaryModelProvider] = useState<AIProvider>(() => (localStorage.getItem('primaryModelProvider') as AIProvider) || 'ollama')
-  const [primaryModel, setPrimaryModel] = useState(() => localStorage.getItem('primaryModel') || 'llama3')
-  const [toolModelProvider, setToolModelProvider] = useState<AIProvider>(() => (localStorage.getItem('toolModelProvider') as AIProvider) || 'ollama')
-  const [toolModel, setToolModel] = useState(() => localStorage.getItem('toolModel') || 'llama3')
+  const [modelProvider, setModelProvider] = useState<AIProvider>(() => (localStorage.getItem('modelProvider') as AIProvider) || 'ollama')
+  const [model, setModel] = useState(() => {
+    const savedModel = localStorage.getItem('model');
+    if (savedModel) return savedModel;
+    
+    // Set better defaults based on provider
+    const savedProvider = localStorage.getItem('modelProvider') as AIProvider;
+    switch (savedProvider) {
+      case 'openai': return 'gpt-4o';
+      case 'gemini': return 'gemini-1.5-pro';
+      case 'bedrock': return 'anthropic.claude-3-5-sonnet-20241022-v2:0';
+      default: return 'qwen2.5-coder:latest';
+    }
+  })
   const [openaiKey, setOpenaiKey] = useState(() => localStorage.getItem('openaiKey') || '')
   const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('geminiKey') || '')
+  const [bedrockRegion, setBedrockRegion] = useState(() => localStorage.getItem('bedrockRegion') || 'us-east-1')
+  const [bedrockAccessKey, setBedrockAccessKey] = useState(() => localStorage.getItem('bedrockAccessKey') || '')
+  const [bedrockSecretKey, setBedrockSecretKey] = useState(() => localStorage.getItem('bedrockSecretKey') || '')
   const [ollamaModels, setOllamaModels] = useState<string[]>([])
   const [ollamaError, setOllamaError] = useState<string | null>(null)
   const [ollamaChecking, setOllamaChecking] = useState(false)
@@ -55,21 +84,29 @@ function App() {
 
   // Save settings
   useEffect(() => {
-    localStorage.setItem('primaryModelProvider', primaryModelProvider)
-    localStorage.setItem('primaryModel', primaryModel)
-    localStorage.setItem('toolModelProvider', toolModelProvider)
-    localStorage.setItem('toolModel', toolModel)
+    localStorage.setItem('modelProvider', modelProvider)
+    localStorage.setItem('model', model)
     localStorage.setItem('openaiKey', openaiKey)
     localStorage.setItem('geminiKey', geminiKey)
+    localStorage.setItem('bedrockRegion', bedrockRegion)
+    localStorage.setItem('bedrockAccessKey', bedrockAccessKey)
+    localStorage.setItem('bedrockSecretKey', bedrockSecretKey)
     localStorage.setItem('isAutopilotMode', String(isAutopilotMode))
-  }, [primaryModelProvider, primaryModel, toolModelProvider, toolModel, openaiKey, geminiKey, isAutopilotMode])
+  }, [modelProvider, model, openaiKey, geminiKey, bedrockRegion, bedrockAccessKey, bedrockSecretKey, isAutopilotMode])
 
-  // Ollama models
+  // Test Ollama connection on startup
   useEffect(() => {
-    if (isSettingsOpen && (primaryModelProvider === 'ollama' || toolModelProvider === 'ollama')) {
+    if (modelProvider === 'ollama') {
       refreshOllamaModels()
     }
-  }, [isSettingsOpen, primaryModelProvider, toolModelProvider])
+  }, [modelProvider])
+
+  // Refresh Ollama models when settings are opened
+  useEffect(() => {
+    if (isSettingsOpen && modelProvider === 'ollama') {
+      refreshOllamaModels()
+    }
+  }, [isSettingsOpen])
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -84,10 +121,30 @@ function App() {
         e.preventDefault()
         handleFileSave()
       }
+      // Ctrl+N to create new file (when explorer is focused)
+      if (e.ctrlKey && e.key === 'n' && activeView === 'explorer' && workspacePath) {
+        e.preventDefault()
+        setNewFileDialog({ parentPath: workspacePath })
+      }
+      // Ctrl+Shift+N to create new folder (when explorer is focused)
+      if (e.ctrlKey && e.shiftKey && e.key === 'N' && activeView === 'explorer' && workspacePath) {
+        e.preventDefault()
+        setNewFolderDialog({ parentPath: workspacePath })
+      }
+      // F5 to refresh explorer
+      if (e.key === 'F5' && activeView === 'explorer') {
+        e.preventDefault()
+        setRefreshKey(prev => prev + 1)
+      }
+      // Ctrl+P for file filter
+      if (e.ctrlKey && e.key === 'p' && activeView === 'explorer') {
+        e.preventDefault()
+        setShowFileFilter(true)
+      }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeFileId, openFiles])
+  }, [activeFileId, openFiles, activeView, workspacePath])
 
   // Restore last workspace on startup
   useEffect(() => {
@@ -104,26 +161,61 @@ function App() {
     }
   }, [])
 
+  // Listen for file changes from the backend (when agent updates files)
+  useEffect(() => {
+    const ipc = (window as any).ipcRenderer
+    if (!ipc) return
+
+    const fileChangeHandler = (_event: any, { path, content }: { path: string; content: string }) => {
+      // Update the file in openFiles if it's currently open
+      setOpenFiles(prev => {
+        const fileExists = prev.some(f => f.path === path)
+        if (fileExists) {
+          return prev.map(f => f.path === path ? { ...f, content } : f)
+        }
+        return prev
+      })
+    }
+
+    ipc.on('file:changed', fileChangeHandler)
+    return () => {
+      ipc.off('file:changed', fileChangeHandler)
+    }
+  }, [])
+
   const refreshOllamaModels = async () => {
     const ipc = (window as any).ipcRenderer
     if (!ipc) return
     setOllamaChecking(true)
     setOllamaError(null)
+    
     try {
+      console.log('[FRONTEND] Checking Ollama health...')
+      // First do a health check
+      const healthCheck = await ipc.invoke('ollama:healthCheck')
+      if (!healthCheck.healthy) {
+        setOllamaError(`Ollama health check failed: ${healthCheck.error}`)
+        setOllamaModels([])
+        return
+      }
+      
+      console.log('[FRONTEND] Ollama is healthy, fetching models...')
+      // Then get models
       const res = await ipc.invoke('ollama:getModels')
       if (res.error) {
-        setOllamaError("Ollama is not running.")
+        setOllamaError(res.error)
         setOllamaModels([])
       } else {
+        console.log('[FRONTEND] Received models:', res)
         setOllamaModels(res)
         setOllamaError(null)
-        if (res.length > 0) {
-          if (!res.includes(primaryModel)) setPrimaryModel(res[0])
-          if (!res.includes(toolModel)) setToolModel(res[0])
+        if (res.length > 0 && !res.includes(model)) {
+          setModel(res[0])
         }
       }
-    } catch {
-      setOllamaError("Could not connect to Ollama.")
+    } catch (error: any) {
+      console.error('[FRONTEND] Ollama connection error:', error)
+      setOllamaError("Could not connect to Ollama: " + (error.message || 'Unknown error'))
       setOllamaModels([])
     } finally {
       setOllamaChecking(false)
@@ -359,8 +451,15 @@ function App() {
         const activeFile = openFiles.find(f => f.path === activeFileId)
         const result = await ipc.invoke('execute-agent-task', {
           task: userMsg.content,
-          primaryModel: { provider: primaryModelProvider, model: primaryModel },
-          toolModel: { provider: toolModelProvider, model: toolModel },
+          model: { 
+            provider: modelProvider, 
+            model: model,
+            openaiKey,
+            geminiKey,
+            bedrockRegion,
+            bedrockAccessKey,
+            bedrockSecretKey
+          },
           workspacePath,
           activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
           config: { openaiKey, geminiKey },
@@ -368,6 +467,8 @@ function App() {
         })
         const response = typeof result === 'string' ? result : result?.response || 'No response'
         const steps = typeof result === 'object' ? result?.steps || [] : []
+        // Clear live steps before adding final message
+        setAgentSteps([])
         // Replace streaming placeholder with final authoritative response
         setMessages(prev => {
           const withoutStream = prev.filter(m => (m as any).__id !== STREAMING_MSG_ID)
@@ -381,7 +482,6 @@ function App() {
       })
     } finally {
       setIsLoading(false)
-      setAgentSteps([])
       if (ipc) {
         ipc.off('agent:step', stepHandler)
         ipc.off('agent:stream', streamHandler)
@@ -433,6 +533,50 @@ function App() {
       case 'indexing_workspace': return '📦'
       case 'continue_iterations': return '🔄'
       default: return '🛠️'
+    }
+  }
+
+  const handleCreateNewFile = async () => {
+    if (!newFileDialog || !newItemName.trim()) return
+    
+    const ipc = (window as any).ipcRenderer
+    if (!ipc) return
+
+    try {
+      const separator = newFileDialog.parentPath.includes('\\') ? '\\' : '/'
+      const fullPath = newFileDialog.parentPath + separator + newItemName.trim()
+      
+      await ipc.invoke('fs:createFile', fullPath)
+      // Automatically open newly created files
+      handleFileOpen(fullPath, newItemName.trim())
+      
+      setRefreshKey(prev => prev + 1)
+      setNewFileDialog(null)
+      setNewItemName('')
+    } catch (error) {
+      console.error('Create file failed:', error)
+      alert('Failed to create file: ' + (error as Error).message)
+    }
+  }
+
+  const handleCreateNewFolder = async () => {
+    if (!newFolderDialog || !newItemName.trim()) return
+    
+    const ipc = (window as any).ipcRenderer
+    if (!ipc) return
+
+    try {
+      const separator = newFolderDialog.parentPath.includes('\\') ? '\\' : '/'
+      const fullPath = newFolderDialog.parentPath + separator + newItemName.trim()
+      
+      await ipc.invoke('fs:createDirectory', fullPath)
+      
+      setRefreshKey(prev => prev + 1)
+      setNewFolderDialog(null)
+      setNewItemName('')
+    } catch (error) {
+      console.error('Create folder failed:', error)
+      alert('Failed to create folder: ' + (error as Error).message)
     }
   }
 
@@ -494,12 +638,102 @@ function App() {
                   {activeView === 'explorer' && 'EXPLORER'}
                   {activeView === 'search' && 'SEARCH'}
                   {activeView === 'source-control' && 'SOURCE CONTROL'}
+                  {activeView === 'ai-insights' && 'AI INSIGHTS'}
                 </span>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="1" />
-                  <circle cx="19" cy="12" r="1" />
-                  <circle cx="5" cy="12" r="1" />
-                </svg>
+                <div className="sidebar-header-actions">
+                  {activeView === 'explorer' && workspacePath && (
+                    <>
+                      <button 
+                        className="sidebar-action-btn" 
+                        onClick={() => {
+                          // Trigger refresh by incrementing a key
+                          setRefreshKey(prev => prev + 1);
+                        }}
+                        title="Refresh Explorer"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polyline points="23 4 23 10 17 10"></polyline>
+                          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                        </svg>
+                      </button>
+                      <button 
+                        className="sidebar-action-btn" 
+                        onClick={() => {
+                          setCollapseAll(prev => !prev);
+                        }}
+                        title="Collapse All"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polyline points="6 9 12 15 18 9"></polyline>
+                        </svg>
+                      </button>
+                      <button 
+                        className="sidebar-action-btn" 
+                        onClick={() => {
+                          setShowFileFilter(prev => !prev);
+                          if (showFileFilter) setFileFilter('');
+                        }}
+                        title="Filter Files"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+                        </svg>
+                      </button>
+                      <button 
+                        className="sidebar-action-btn" 
+                        onClick={() => {
+                          const ipc = (window as any).ipcRenderer;
+                          if (ipc) {
+                            ipc.invoke('dialog:openFolder').then((result: any) => {
+                              if (result && !result.canceled && result.filePaths?.length > 0) {
+                                setWorkspacePath(result.filePaths[0]);
+                              }
+                            });
+                          }
+                        }}
+                        title="Open Folder"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                        </svg>
+                      </button>
+                      <button 
+                        className="sidebar-action-btn" 
+                        onClick={() => {
+                          setNewFileDialog({ parentPath: workspacePath });
+                        }}
+                        title="New File"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                          <polyline points="14 2 14 8 20 8"></polyline>
+                          <line x1="12" y1="18" x2="12" y2="12"></line>
+                          <line x1="9" y1="15" x2="15" y2="15"></line>
+                        </svg>
+                      </button>
+                      <button 
+                        className="sidebar-action-btn" 
+                        onClick={() => {
+                          setNewFolderDialog({ parentPath: workspacePath });
+                        }}
+                        title="New Folder"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                          <line x1="12" y1="11" x2="12" y2="17"></line>
+                          <line x1="9" y1="14" x2="15" y2="14"></line>
+                        </svg>
+                      </button>
+                    </>
+                  )}
+                  <button className="sidebar-action-btn" title="More Actions">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <circle cx="12" cy="12" r="1" />
+                      <circle cx="19" cy="12" r="1" />
+                      <circle cx="5" cy="12" r="1" />
+                    </svg>
+                  </button>
+                </div>
               </div>
 
               {activeView === 'explorer' && (
@@ -510,6 +744,18 @@ function App() {
                     </svg>
                     <strong>{workspacePath ? workspacePath.split(/[/\\]/).pop()?.toUpperCase() : 'WHIZCODE'}</strong>
                   </div>
+                  {showFileFilter && (
+                    <div className="file-filter">
+                      <input
+                        type="text"
+                        placeholder="Filter files..."
+                        value={fileFilter}
+                        onChange={(e) => setFileFilter(e.target.value)}
+                        className="file-filter-input"
+                        autoFocus
+                      />
+                    </div>
+                  )}
                   <div className="chat-history">
                     {workspacePath ? (
                       <FileTree 
@@ -517,6 +763,9 @@ function App() {
                         onFileOpen={handleFileOpen}
                         onFileDeleted={handleFileDeleted}
                         onFileRenamed={handleFileRenamed}
+                        refreshKey={refreshKey}
+                        collapseAll={collapseAll}
+                        fileFilter={fileFilter}
                       />
                     ) : (
                       <div className="empty-state">No folder opened.</div>
@@ -531,6 +780,10 @@ function App() {
 
               {activeView === 'source-control' && (
                 <SourceControlPanel workspacePath={workspacePath} />
+              )}
+
+              {activeView === 'ai-insights' && (
+                <AIInsightsPanel />
               )}
             </aside>
             <div className="sidebar-resize-handle" onMouseDown={handleSidebarResize} />
@@ -559,54 +812,11 @@ function App() {
             }}
           />
 
-          {isTerminalOpen && (
-            <div className="terminal-panel" style={{ height: `${terminalHeight}px` }}>
-              <div className="terminal-resize-handle" onMouseDown={handleTerminalResize} />
-              <div className="terminal-header">
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <div style={{ 
-                    fontSize: '11px', 
-                    fontWeight: 600, 
-                    color: 'var(--text-secondary)',
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.5px',
-                    padding: '0 4px'
-                  }}>
-                    Terminal
-                  </div>
-                </div>
-                <div className="terminal-actions">
-                  <button
-                    className="terminal-action-btn"
-                    onClick={async () => {
-                      const ipc = (window as any).ipcRenderer
-                      if (ipc) {
-                        await ipc.invoke('terminal:reset')
-                        setTerminalKey(k => k + 1)
-                      }
-                    }}
-                    title="Kill Terminal (Restart)"
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="23 4 23 10 17 10" />
-                      <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
-                    </svg>
-                  </button>
-                  <button
-                    className="terminal-action-btn"
-                    onClick={() => setIsTerminalOpen(false)}
-                    title="Hide Terminal (Ctrl+`)"
-                    style={{ fontSize: '18px', lineHeight: '1' }}
-                  >
-                    ×
-                  </button>
-                </div>
-              </div>
-              <div className="terminal-content">
-                <TerminalPane key={terminalKey} />
-              </div>
-            </div>
-          )}
+          <MultiTerminalPane 
+            isOpen={isTerminalOpen}
+            height={terminalHeight}
+            onHeightChange={setTerminalHeight}
+          />
         </div>
 
         <ChatPanel
@@ -629,9 +839,10 @@ function App() {
           handleStop={handleStop}
           settingsProps={{
             isSettingsOpen, setIsSettingsOpen,
-            primaryModelProvider, setPrimaryModelProvider, primaryModel, setPrimaryModel,
-            toolModelProvider, setToolModelProvider, toolModel, setToolModel,
-            ollamaModels, ollamaChecking, ollamaError, refreshOllamaModels, openaiKey, setOpenaiKey, geminiKey, setGeminiKey,
+            modelProvider, setModelProvider, model, setModel,
+            ollamaModels, ollamaChecking, ollamaError, refreshOllamaModels, 
+            openaiKey, setOpenaiKey, geminiKey, setGeminiKey,
+            bedrockRegion, setBedrockRegion, bedrockAccessKey, setBedrockAccessKey, bedrockSecretKey, setBedrockSecretKey,
             isAutopilotMode, setIsAutopilotMode
           }}
         />
@@ -660,20 +871,89 @@ function App() {
           )}
         </div>
         <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
-          {/* Current iteration and tool model */}
+          {/* Current iteration and model */}
           {agentSteps.length > 0 && (
             <div style={{ fontSize: '11px', opacity: 0.9 }}>
-              Iteration: {Math.max(...agentSteps.map(s => s.iteration || 0))} • 
-              Tool: {toolModelProvider === 'ollama' ? 'Ollama' : toolModelProvider === 'openai' ? 'OpenAI' : 'Gemini'}: {toolModel}
+              Iteration: {Math.max(...agentSteps.map(s => s.iteration || 0))}
             </div>
           )}
           
-          {/* Primary model */}
+          {/* Model info */}
           <div style={{ fontSize: '11px', opacity: 0.9 }}>
-            {primaryModelProvider === 'ollama' ? 'Ollama' : primaryModelProvider === 'openai' ? 'OpenAI' : 'Gemini'}: {primaryModel}
+            {modelProvider === 'ollama' ? 'Ollama' : 
+             modelProvider === 'openai' ? 'OpenAI' : 
+             modelProvider === 'gemini' ? 'Gemini' : 'Bedrock'}: {model}
           </div>
         </div>
       </div>
+
+      {/* New File Dialog */}
+      {newFileDialog && (
+        <div className="modal-overlay">
+          <div className="modal-dialog">
+            <h3>Create New File</h3>
+            <input
+              type="text"
+              value={newItemName}
+              onChange={(e) => setNewItemName(e.target.value)}
+              placeholder="Enter file name..."
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleCreateNewFile()
+                if (e.key === 'Escape') {
+                  setNewFileDialog(null)
+                  setNewItemName('')
+                }
+              }}
+            />
+            <div className="modal-buttons">
+              <button onClick={handleCreateNewFile} disabled={!newItemName.trim()}>
+                Create
+              </button>
+              <button onClick={() => {
+                setNewFileDialog(null)
+                setNewItemName('')
+              }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Folder Dialog */}
+      {newFolderDialog && (
+        <div className="modal-overlay">
+          <div className="modal-dialog">
+            <h3>Create New Folder</h3>
+            <input
+              type="text"
+              value={newItemName}
+              onChange={(e) => setNewItemName(e.target.value)}
+              placeholder="Enter folder name..."
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleCreateNewFolder()
+                if (e.key === 'Escape') {
+                  setNewFolderDialog(null)
+                  setNewItemName('')
+                }
+              }}
+            />
+            <div className="modal-buttons">
+              <button onClick={handleCreateNewFolder} disabled={!newItemName.trim()}>
+                Create
+              </button>
+              <button onClick={() => {
+                setNewFolderDialog(null)
+                setNewItemName('')
+              }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

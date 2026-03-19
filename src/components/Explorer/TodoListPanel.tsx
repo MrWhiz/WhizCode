@@ -1,18 +1,4 @@
 import { useState, useEffect } from 'react';
-import { 
-  Box, 
-  Typography, 
-  TextField, 
-  List, 
-  ListItem, 
-  ListItemText, 
-  ListItemSecondaryAction, 
-  IconButton, 
-  Checkbox, 
-  Divider,
-  Fade,
-  Grow
-} from '@mui/material';
 
 interface Todo {
   id: string;
@@ -72,161 +58,179 @@ export const TodoListPanel = () => {
   });
 
   return (
-    <Box sx={{ p: 2, height: '100%', display: 'flex', flexDirection: 'column', color: 'var(--text-primary)' }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
-        <Typography variant="subtitle2" sx={{ fontWeight: 600, opacity: 0.8, letterSpacing: '0.5px' }}>
+    <div style={{ padding: '16px', height: '100%', display: 'flex', flexDirection: 'column', color: 'var(--text-primary)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+        <div style={{ fontWeight: 600, opacity: 0.8, letterSpacing: '0.5px', fontSize: '12px' }}>
           TASKS & TO-DO
-        </Typography>
+        </div>
         {todos.some(t => t.completed) && (
-          <Typography 
-            variant="caption" 
+          <div 
             onClick={clearCompleted}
-            sx={{ 
+            style={{ 
               cursor: 'pointer', 
               opacity: 0.5, 
-              '&:hover': { opacity: 0.8, color: 'rgb(239, 68, 68)' },
+              fontSize: '12px',
               transition: 'all 0.2s'
+            }}
+            onMouseEnter={(e) => {
+              (e.currentTarget as HTMLElement).style.opacity = '0.8';
+              (e.currentTarget as HTMLElement).style.color = 'rgb(239, 68, 68)';
+            }}
+            onMouseLeave={(e) => {
+              (e.currentTarget as HTMLElement).style.opacity = '0.5';
+              (e.currentTarget as HTMLElement).style.color = 'inherit';
             }}
           >
             Clear Completed
-          </Typography>
+          </div>
         )}
-      </Box>
+      </div>
       
-      <Box sx={{ display: 'flex', gap: 1, mb: 2 }}>
-        <TextField
-          fullWidth
-          size="small"
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
+        <input
+          type="text"
           placeholder="Add a task..."
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           onKeyDown={handleKeyPress}
-          sx={{
-            '& .MuiOutlinedInput-root': {
-              color: 'inherit',
-              backgroundColor: 'rgba(255, 255, 255, 0.05)',
-              paddingRight: '8px',
-              '& fieldset': { borderColor: 'rgba(255, 255, 255, 0.1)' },
-              '&:hover fieldset': { borderColor: 'rgba(255, 255, 255, 0.2)' },
-              '&.Mui-focused fieldset': { borderColor: 'var(--vscode-focusBorder, #007acc)' },
-            },
-            '& input::placeholder': { color: 'rgba(255, 255, 255, 0.3)' }
+          style={{
+            flex: 1,
+            padding: '8px',
+            backgroundColor: 'rgba(255, 255, 255, 0.05)',
+            border: '1px solid rgba(255, 255, 255, 0.1)',
+            borderRadius: '4px',
+            color: 'inherit',
+            fontSize: '13px'
           }}
         />
-        <IconButton 
+        <button 
           onClick={handleAddTodo} 
           disabled={!inputValue.trim()}
-          sx={{ color: 'var(--vscode-button-background, #007acc)', p: '8px' }}
+          style={{ 
+            padding: '8px 12px',
+            backgroundColor: 'var(--vscode-button-background, #007acc)',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: inputValue.trim() ? 'pointer' : 'not-allowed',
+            opacity: inputValue.trim() ? 1 : 0.5
+          }}
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="12" y1="5" x2="12" y2="19"></line>
-            <line x1="5" y1="12" x2="19" y2="12"></line>
-          </svg>
-        </IconButton>
-      </Box>
+          +
+        </button>
+      </div>
 
       {/* Filter Chips */}
-      <Box sx={{ display: 'flex', gap: 1, mb: 2, overflowX: 'auto', pb: 0.5 }}>
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', overflowX: 'auto', paddingBottom: '4px' }}>
         {['all', 'active', 'completed'].map((f) => (
-          <Box
+          <div
             key={f}
             onClick={() => setFilter(f as any)}
-            sx={{
-              px: 1.5,
-              py: 0.25,
+            style={{
+              padding: '4px 12px',
               borderRadius: '12px',
               fontSize: '11px',
               cursor: 'pointer',
               backgroundColor: filter === f ? 'rgba(0, 122, 204, 0.2)' : 'rgba(255, 255, 255, 0.05)',
-              border: '1px solid',
-              borderColor: filter === f ? '#007acc' : 'transparent',
+              border: '1px solid ' + (filter === f ? '#007acc' : 'transparent'),
               color: filter === f ? '#72b1f1' : 'rgba(255, 255, 255, 0.5)',
               textTransform: 'capitalize',
-              '&:hover': { backgroundColor: filter === f ? 'rgba(0, 122, 204, 0.3)' : 'rgba(255, 255, 255, 0.1)' }
+              whiteSpace: 'nowrap'
+            }}
+            onMouseEnter={(e) => {
+              (e.currentTarget as HTMLElement).style.backgroundColor = filter === f ? 'rgba(0, 122, 204, 0.3)' : 'rgba(255, 255, 255, 0.1)';
+            }}
+            onMouseLeave={(e) => {
+              (e.currentTarget as HTMLElement).style.backgroundColor = filter === f ? 'rgba(0, 122, 204, 0.2)' : 'rgba(255, 255, 255, 0.05)';
             }}
           >
             {f}
-          </Box>
+          </div>
         ))}
-      </Box>
+      </div>
 
-      <Box sx={{ flex: 1, overflowY: 'auto' }}>
+      <div style={{ flex: 1, overflowY: 'auto' }}>
         {filteredTodos.length === 0 ? (
-          <Fade in timeout={800}>
-            <Box sx={{ mt: 4, textAlign: 'center', opacity: 0.4 }}>
-              <Typography variant="body2">
-                {filter === 'all' ? 'No tasks yet.' : filter === 'active' ? 'No active tasks.' : 'No completed tasks.'}
-              </Typography>
-              {filter === 'all' && <Typography variant="caption">Start by adding one above.</Typography>}
-            </Box>
-          </Fade>
+          <div style={{ marginTop: '64px', textAlign: 'center', opacity: 0.4 }}>
+            <div style={{ fontSize: '13px' }}>
+              {filter === 'all' ? 'No tasks yet.' : filter === 'active' ? 'No active tasks.' : 'No completed tasks.'}
+            </div>
+            {filter === 'all' && <div style={{ fontSize: '12px' }}>Start by adding one above.</div>}
+          </div>
         ) : (
-          <List sx={{ pt: 0 }}>
-            {filteredTodos.map((todo: Todo, index: number) => (
-              <Grow in key={todo.id} timeout={300 + index * 50}>
-                <Box>
-                  <ListItem
-                    dense
-                    sx={{
-                      px: 1,
-                      mb: 0.5,
-                      borderRadius: '4px',
-                      '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.03)' }
+          <div style={{ paddingTop: 0 }}>
+            {filteredTodos.map((todo: Todo) => (
+              <div key={todo.id}>
+                <div
+                  style={{
+                    padding: '8px',
+                    marginBottom: '4px',
+                    borderRadius: '4px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                  }}
+                  onMouseEnter={(e) => {
+                    (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255, 255, 255, 0.03)';
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent';
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={todo.completed}
+                    onChange={() => toggleTodo(todo.id)}
+                    style={{ 
+                      cursor: 'pointer',
+                      accentColor: 'var(--vscode-button-background, #007acc)'
+                    }}
+                  />
+                  <span
+                    style={{
+                      fontSize: '13.5px',
+                      textDecoration: todo.completed ? 'line-through' : 'none',
+                      opacity: todo.completed ? 0.4 : 0.9,
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      flex: 1
                     }}
                   >
-                    <Checkbox
-                      edge="start"
-                      checked={todo.completed}
-                      onChange={() => toggleTodo(todo.id)}
-                      size="small"
-                      sx={{ 
-                        color: 'rgba(255, 255, 255, 0.2)',
-                        '&.Mui-checked': { color: 'var(--vscode-button-background, #007acc)' }
-                      }}
-                    />
-                    <ListItemText
-                      primary={todo.text}
-                      sx={{
-                        '& .MuiTypography-root': {
-                          fontSize: '13.5px',
-                          textDecoration: todo.completed ? 'line-through' : 'none',
-                          opacity: todo.completed ? 0.4 : 0.9,
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis'
-                        }
-                      }}
-                    />
-                    <ListItemSecondaryAction>
-                      <IconButton 
-                        edge="end" 
-                        size="small" 
-                        onClick={() => deleteTodo(todo.id)}
-                        sx={{ 
-                          color: 'rgba(239, 68, 68, 0.3)',
-                          '&:hover': { color: 'rgb(239, 68, 68)', backgroundColor: 'rgba(239, 68, 68, 0.1)' }
-                        }}
-                      >
-                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <polyline points="3 6 5 6 21 6"></polyline>
-                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                         </svg>
-                      </IconButton>
-                    </ListItemSecondaryAction>
-                  </ListItem>
-                  <Divider sx={{ opacity: 0.03 }} />
-                </Box>
-              </Grow>
+                    {todo.text}
+                  </span>
+                  <button 
+                    onClick={() => deleteTodo(todo.id)}
+                    style={{ 
+                      background: 'none',
+                      border: 'none',
+                      color: 'rgba(239, 68, 68, 0.3)',
+                      cursor: 'pointer',
+                      padding: '4px',
+                      fontSize: '14px'
+                    }}
+                    onMouseEnter={(e) => {
+                      (e.currentTarget as HTMLElement).style.color = 'rgb(239, 68, 68)';
+                      (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(239, 68, 68, 0.1)';
+                    }}
+                    onMouseLeave={(e) => {
+                      (e.currentTarget as HTMLElement).style.color = 'rgba(239, 68, 68, 0.3)';
+                      (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent';
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.03)' }} />
+              </div>
             ))}
-          </List>
+          </div>
         )}
-      </Box>
+      </div>
       
-      <Box sx={{ mt: 'auto', pt: 2, borderTop: '1px solid rgba(255, 255, 255, 0.05)', opacity: 0.5 }}>
-        <Typography variant="caption" sx={{ display: 'block', textAlign: 'center' }}>
-          {todos.filter((t: Todo) => !t.completed).length} tasks remaining
-        </Typography>
-      </Box>
-    </Box>
+      <div style={{ marginTop: 'auto', paddingTop: '16px', borderTop: '1px solid rgba(255, 255, 255, 0.05)', opacity: 0.5, textAlign: 'center', fontSize: '12px' }}>
+        {todos.filter((t: Todo) => !t.completed).length} tasks remaining
+      </div>
+    </div>
   );
 };

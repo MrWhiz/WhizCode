@@ -21,29 +21,21 @@ class DiagnosticsService {
   /**
    * Check a file for errors using lightweight checks
    */
-  async checkFile(filePath: string, workspacePath: string): Promise<Diagnostic[]> {
+  async checkFile(filePath: string, workspacePath: string, content?: string): Promise<Diagnostic[]> {
     try {
-      // Check cache first
-      const cached = this.cache.get(filePath);
-      if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
-        return cached.errors;
-      }
-
       const ext = filePath.split('.').pop()?.toLowerCase();
       let diagnostics: Diagnostic[] = [];
 
-      // Read file content
-      const content = await fs.readFile(filePath, 'utf-8');
+      // Use provided content or read from file
+      const fileContent = content !== undefined ? content : await fs.readFile(filePath, 'utf-8');
 
       // Check based on file type - lightweight checks only
       if (ext === 'json') {
-        diagnostics = this.checkJSON(filePath, content);
+        diagnostics = this.checkJSON(filePath, fileContent);
       } else if (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx') {
-        diagnostics = this.checkJavaScript(filePath, content);
+        diagnostics = this.checkJavaScript(filePath, fileContent);
       }
 
-      // Cache results
-      this.cache.set(filePath, { errors: diagnostics, timestamp: Date.now() });
       return diagnostics;
     } catch (error) {
       console.error(`[DIAGNOSTICS] Error checking file ${filePath}:`, error);

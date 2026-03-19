@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 
 // Components
 import { TitleBar } from './components/TitleBar'
@@ -387,10 +387,15 @@ function App() {
     }
   }
 
+  const normalizePath = (p: string) => p.replace(/\\/g, '/').toLowerCase().replace(/^[a-z]:/, '').replace(/^\/+/, '');
+
   // Check for errors in a file
   const checkFileErrors = async (filePath: string, content: string): Promise<number> => {
     const ipc = (window as any).ipcRenderer
     if (!ipc || !workspacePath) return 0
+
+    const normFilePath = normalizePath(filePath);
+    const normWorkspacePath = normalizePath(workspacePath);
 
     try {
       // Add timeout to prevent hanging
@@ -399,12 +404,12 @@ function App() {
       );
       
       const diagnostics = await Promise.race([
-        ipc.invoke('diagnostics:check', filePath, workspacePath),
+        ipc.invoke('diagnostics:check', normFilePath, normWorkspacePath, content),
         timeoutPromise
       ]);
       
       const count = Array.isArray(diagnostics) ? diagnostics.length : 0;
-      console.log(`[APP] File ${filePath.split(/[/\\]/).pop()} has ${count} errors`);
+      console.log(`[APP] File ${normFilePath.split('/').pop()} has ${count} errors`);
       return count;
     } catch (error) {
       console.error('Error checking file diagnostics:', error)
@@ -412,34 +417,28 @@ function App() {
     }
   }
 
-  // Update file errors when open files change
-  useEffect(() => {
-    const updateErrors = async () => {
-      console.log(`[APP] Checking errors for ${openFiles.length} open files`);
-      const newErrors: Record<string, number> = {}
-      for (const file of openFiles) {
-        const errorCount = await checkFileErrors(file.path, file.content)
-        if (errorCount > 0) {
-          newErrors[file.path] = errorCount
-        }
+  // Relying on onValidation for all open files
+
+  const handleValidation = useCallback((filePath: string, count: number) => {
+    const normPath = normalizePath(filePath);
+    setFileErrors(prev => {
+      if (prev[normPath] === count) return prev;
+      const next = { ...prev };
+      if (count > 0) {
+        next[normPath] = count;
+      } else {
+        delete next[normPath];
       }
-      console.log(`[APP] Updated fileErrors:`, newErrors);
-      setFileErrors(newErrors)
-    }
+      return next;
+    });
+  }, []);
 
-    // Debounce to avoid too many checks
-    const timer = setTimeout(() => {
-      updateErrors()
-    }, 500)
-
-    return () => clearTimeout(timer)
-  }, [openFiles, workspacePath])
-
-  const handleSend = async () => {
-    if (!input.trim() || isLoading) return
-    const userMsg: Message = { role: 'user', content: input }
+  const handleSend = async (overrideInput?: string) => {
+    const textToSend = overrideInput || input;
+    if (!textToSend.trim() || isLoading) return
+    const userMsg: Message = { role: 'user', content: textToSend }
     setMessages(prev => [...prev, userMsg])
-    setInput('')
+    if (!overrideInput) setInput('')
     setIsLoading(true)
     setAgentSteps([])
 
@@ -585,6 +584,13 @@ function App() {
     }
   }
 
+  const handleFixError = (filePath: string, line: number, message: string) => {
+    const fileName = filePath.split(/[/\\]/).pop() || filePath;
+    const fixPrompt = `I have an error in \`${fileName}\` at line ${line}:\n\n\`\`\`\n${message}\n\`\`\`\n\nPlease help me fix it.`;
+    handleSend(fixPrompt);
+    setIsChatOpen(true);
+  }
+
   const handleCreateNewFile = async () => {
     if (!newFileDialog || !newItemName.trim()) return
     
@@ -607,26 +613,6 @@ function App() {
       alert('Failed to create file: ' + (error as Error).message)
     }
   }
-
-  const handleFixError = (error: { file: string; line: number; message: string; code?: string }) => {
-    // Create a detailed error message for the chat
-    const errorMessage = `Fix this error in ${error.file.split(/[/\\]/).pop()}:
-Line ${error.line}: ${error.message}${error.code ? ` (${error.code})` : ''}
-
-Please analyze and fix this error.`;
-    
-    // Set the input and focus on chat
-    setInput(errorMessage);
-    setIsChatOpen(true);
-    
-    // Scroll to chat panel
-    setTimeout(() => {
-      const chatInput = document.querySelector('.chat-input') as HTMLTextAreaElement;
-      if (chatInput) {
-        chatInput.focus();
-      }
-    }, 100);
-  };
 
   const handleCreateNewFolder = async () => {
     if (!newFolderDialog || !newItemName.trim()) return
@@ -807,11 +793,25 @@ Please analyze and fix this error.`;
 
               {activeView === 'explorer' && (
                 <>
-                  <div className="sidebar-section-header">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="9 18 15 12 9 6" />
-                    </svg>
-                    <strong>{workspacePath ? workspacePath.split(/[/\\]/).pop()?.toUpperCase() : 'WHIZCODE'}</strong>
+                  <div className="sidebar-section-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <polyline points="9 18 15 12 9 6" />
+                      </svg>
+                      <strong>{workspacePath ? workspacePath.split(/[/\\]/).pop()?.toUpperCase() : 'WHIZCODE'}</strong>
+                    </div>
+                    {Object.keys(fileErrors).length > 0 && (
+                      <span style={{ 
+                        backgroundColor: '#ff3333', 
+                        color: 'white', 
+                        borderRadius: '10px', 
+                        padding: '1px 6px', 
+                        fontSize: '11px',
+                        marginRight: '8px'
+                      }}>
+                        {Object.values(fileErrors).reduce((a, b) => a + b, 0)}
+                      </span>
+                    )}
                   </div>
                   {showFileFilter && (
                     <div className="file-filter">
@@ -882,6 +882,7 @@ Please analyze and fix this error.`;
             }}
             fileErrors={fileErrors}
             onFixError={handleFixError}
+            onValidation={handleValidation}
           />
 
           <MultiTerminalPane 

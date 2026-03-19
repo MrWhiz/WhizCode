@@ -6,7 +6,6 @@ import { spawn, exec as exec$1 } from "node:child_process";
 import { promisify as promisify$1 } from "node:util";
 import * as fs from "node:fs/promises";
 import { lstat, stat, readdir, realpath, open } from "node:fs/promises";
-import * as os from "node:os";
 import { type as type$1 } from "node:os";
 import { createRequire } from "node:module";
 import { EventEmitter } from "node:events";
@@ -26,7 +25,7 @@ import { spawn as spawn$1, exec } from "child_process";
 import * as crypto from "crypto";
 import { platform } from "os";
 import { EventEmitter as EventEmitter$1 } from "events";
-import * as pty$1 from "node-pty";
+import * as pty from "node-pty";
 const EntryTypes = {
   FILE_TYPE: "files",
   DIR_TYPE: "directories",
@@ -18263,7 +18262,7 @@ class TerminalManager extends EventEmitter$1 {
     try {
       let childProcess;
       try {
-        childProcess = pty$1.spawn(shell2.command, shell2.args, {
+        childProcess = pty.spawn(shell2.command, shell2.args, {
           name: "xterm-color",
           cols: 80,
           rows: 24,
@@ -18274,7 +18273,7 @@ class TerminalManager extends EventEmitter$1 {
         const currentPlatform = platform();
         if (currentPlatform === "win32" && config.type === "bash") {
           shell2 = { command: "powershell.exe", args: ["-NoExit", "-Command", "Clear-Host"] };
-          childProcess = pty$1.spawn(shell2.command, shell2.args, {
+          childProcess = pty.spawn(shell2.command, shell2.args, {
             name: "xterm-color",
             cols: 80,
             rows: 24,
@@ -18320,8 +18319,8 @@ class TerminalManager extends EventEmitter$1 {
     if (!terminal) {
       throw new Error(`Terminal ${id} not found`);
     }
-    terminal.lastActivity = Date.now();
-    terminal.process.write(data);
+    const sanitizedData = data === "\r\n" ? "\r" : data;
+    terminal.process.write(sanitizedData);
   }
   /**
    * Resize terminal
@@ -18426,20 +18425,20 @@ class TerminalManager extends EventEmitter$1 {
   }
 }
 function setupTerminalHandlers(win2, getWorkspacePath) {
-  const terminalManager = new TerminalManager();
-  terminalManager.on("data", (id, data) => {
+  const terminalManager2 = new TerminalManager();
+  terminalManager2.on("data", (id, data) => {
     win2?.webContents.send("terminal:incomingData", data, id);
   });
-  terminalManager.on("exit", (id, code) => {
+  terminalManager2.on("exit", (id, code) => {
     win2?.webContents.send("terminal:exited", id, code);
   });
-  terminalManager.on("error", (id, err) => {
+  terminalManager2.on("error", (id, err) => {
     win2?.webContents.send("terminal:error", id, err.message);
   });
   ipcMain.on("terminal:create", (_event, { id, type: type2 }) => {
     try {
       const workspacePath = getWorkspacePath?.() || void 0;
-      terminalManager.createTerminal({ type: type2, cwd: workspacePath }, id);
+      terminalManager2.createTerminal({ type: type2, cwd: workspacePath }, id);
       _event.sender.send("terminal:created", id, id);
     } catch (err) {
       console.error(`Failed to create terminal:`, err);
@@ -18448,11 +18447,11 @@ function setupTerminalHandlers(win2, getWorkspacePath) {
   });
   ipcMain.on("terminal:keystroke", (_event, data, terminalId) => {
     try {
-      const terminal = terminalManager.getTerminal(terminalId);
+      const terminal = terminalManager2.getTerminal(terminalId);
       if (!terminal) {
         return;
       }
-      terminalManager.write(terminalId, data);
+      terminalManager2.write(terminalId, data);
     } catch (err) {
       console.error(`Terminal write error for ${terminalId}:`, err);
     }
@@ -18460,7 +18459,7 @@ function setupTerminalHandlers(win2, getWorkspacePath) {
   ipcMain.on("terminal:resize", (_event, cols, rows, terminalId) => {
     try {
       if (cols > 0 && rows > 0) {
-        terminalManager.resize(terminalId, cols, rows);
+        terminalManager2.resize(terminalId, cols, rows);
       }
     } catch (err) {
       console.error("Terminal resize error:", err);
@@ -18468,7 +18467,7 @@ function setupTerminalHandlers(win2, getWorkspacePath) {
   });
   ipcMain.on("terminal:close", (_event, terminalId) => {
     try {
-      terminalManager.kill(terminalId);
+      terminalManager2.kill(terminalId);
     } catch (err) {
       console.error("Terminal close error:", err);
     }
@@ -18482,13 +18481,13 @@ function setupTerminalHandlers(win2, getWorkspacePath) {
     }
   });
   ipcMain.handle("terminal:getAvailableShells", () => {
-    return terminalManager.getAvailableShells();
+    return terminalManager2.getAvailableShells();
   });
   ipcMain.handle("terminal:getDefaultShell", () => {
-    return terminalManager.getDefaultShell();
+    return terminalManager2.getDefaultShell();
   });
   ipcMain.handle("terminal:getAll", () => {
-    return terminalManager.getAllTerminals().map((t) => ({
+    return terminalManager2.getAllTerminals().map((t) => ({
       id: t.id,
       type: t.type,
       cols: t.cols,
@@ -18498,10 +18497,10 @@ function setupTerminalHandlers(win2, getWorkspacePath) {
     }));
   });
   ipcMain.handle("terminal:killAll", () => {
-    terminalManager.clearAll();
+    terminalManager2.clearAll();
     return true;
   });
-  return terminalManager;
+  return terminalManager2;
 }
 class CircularBuffer {
   buffer = [];
@@ -18549,21 +18548,16 @@ class DiagnosticsService {
   /**
    * Check a file for errors using lightweight checks
    */
-  async checkFile(filePath, workspacePath) {
+  async checkFile(filePath, workspacePath, content) {
     try {
-      const cached = this.cache.get(filePath);
-      if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
-        return cached.errors;
-      }
       const ext = filePath.split(".").pop()?.toLowerCase();
       let diagnostics = [];
-      const content = await fs.readFile(filePath, "utf-8");
+      const fileContent = content !== void 0 ? content : await fs.readFile(filePath, "utf-8");
       if (ext === "json") {
-        diagnostics = this.checkJSON(filePath, content);
+        diagnostics = this.checkJSON(filePath, fileContent);
       } else if (ext === "ts" || ext === "tsx" || ext === "js" || ext === "jsx") {
-        diagnostics = this.checkJavaScript(filePath, content);
+        diagnostics = this.checkJavaScript(filePath, fileContent);
       }
-      this.cache.set(filePath, { errors: diagnostics, timestamp: Date.now() });
       return diagnostics;
     } catch (error) {
       console.error(`[DIAGNOSTICS] Error checking file ${filePath}:`, error);
@@ -18691,7 +18685,7 @@ class DiagnosticsService {
 }
 const diagnosticsService = new DiagnosticsService();
 const _require = createRequire(import.meta.url);
-const pty = _require("node-pty");
+_require("node-pty");
 const execAsync = promisify$1(exec$1);
 const __filename$1 = fileURLToPath(import.meta.url);
 const __dirname$1 = dirname(__filename$1);
@@ -18827,7 +18821,7 @@ const MAIN_DIST = join(process.env.APP_ROOT, "dist-electron");
 const RENDERER_DIST = join(process.env.APP_ROOT, "dist");
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? join(process.env.APP_ROOT, "public") : RENDERER_DIST;
 let win;
-let ptyProcess = null;
+let terminalManager = null;
 let indexingService = null;
 let graphService = null;
 const diffService = new DiffService();
@@ -18918,7 +18912,7 @@ async function createWindow() {
     backgroundColor: "#1e1e1e"
   });
   console.log("[WINDOW] Window created, setting up event handlers...");
-  setupTerminalHandlers(win, () => currentWorkspacePath);
+  terminalManager = setupTerminalHandlers(win, () => currentWorkspacePath);
   win.on("resize", () => saveWindowBounds());
   win.on("move", () => saveWindowBounds());
   win.once("ready-to-show", () => {
@@ -20208,10 +20202,13 @@ Stop these processes before starting new one?`
           iteration
         });
         try {
-          if (ptyProcess) {
-            ptyProcess.write(`\r
+          if (terminalManager) {
+            const terminals = terminalManager.getAllTerminals();
+            if (terminals.length > 0) {
+              terminalManager.write(terminals[0].id, `\r
 # Executing agent command: ${command}\r
 `);
+            }
           }
           if ((command.includes("create-vite") || command.includes("create vite")) && command.includes("--template")) {
             const parts = command.split(" ").filter((p) => p.trim());
@@ -20263,7 +20260,10 @@ Stop these processes before starting new one?`
             const handleData = (data) => {
               const str = data.toString();
               processState.output += str;
-              if (ptyProcess) ptyProcess.write(str);
+              if (terminalManager) {
+                const terminals = terminalManager.getAllTerminals();
+                if (terminals.length > 0) terminalManager.write(terminals[0].id, str);
+              }
               const lines = str.split(/\r?\n/).filter((l) => l.trim().length > 0);
               if (lines.length > 0) {
                 logs.push(...lines);
@@ -20362,7 +20362,10 @@ ${trimmedOutput}`);
           return { result: fullOutput, logs };
         } catch (e) {
           const errOutput = `Command failed: ${e.message}`.trim();
-          if (ptyProcess) ptyProcess.write(errOutput + "\r\n");
+          if (terminalManager) {
+            const terminals = terminalManager.getAllTerminals();
+            if (terminals.length > 0) terminalManager.write(terminals[0].id, errOutput + "\r\n");
+          }
           return { result: errOutput, logs };
         }
       }
@@ -21870,9 +21873,9 @@ ipcMain.handle("fs:writeFile", async (_event, filePath, content) => {
     return false;
   }
 });
-ipcMain.handle("diagnostics:check", async (_event, filePath, workspacePath) => {
+ipcMain.handle("diagnostics:check", async (_event, filePath, workspacePath, content) => {
   try {
-    const diagnostics = await diagnosticsService.checkFile(filePath, workspacePath);
+    const diagnostics = await diagnosticsService.checkFile(filePath, workspacePath, content);
     return diagnostics;
   } catch (error) {
     console.error("[DIAGNOSTICS] Error checking file:", error);
@@ -21952,60 +21955,6 @@ ipcMain.handle("agent:permission-response", async (_event, decision) => {
 });
 ipcMain.on("app:exit", () => app.quit());
 ipcMain.handle("app:open-external", (_event, url) => shell.openExternal(url));
-ipcMain.on("terminal:spawn", (_event, terminalId = "default") => {
-  if (ptyProcess) return;
-  const cwd = currentWorkspacePath || os.homedir();
-  let shell2;
-  if (os.platform() === "win32") {
-    try {
-      const { execSync } = require("child_process");
-      execSync("bash --version", { stdio: "ignore" });
-      shell2 = "bash.exe";
-    } catch {
-      shell2 = "powershell.exe";
-    }
-  } else {
-    shell2 = process.env.SHELL || "bash";
-  }
-  console.log(`[TERMINAL] Spawning shell: ${shell2} in ${cwd}`);
-  ptyProcess = pty.spawn(shell2, [], {
-    name: "xterm-color",
-    cols: 80,
-    rows: 30,
-    cwd,
-    env: process.env
-  });
-  ptyProcess.onData((data) => {
-    win?.webContents.send("terminal:incomingData", data, terminalId);
-    const lines = data.split(/\r?\n/);
-    lines.filter((l) => l.trim()).forEach((line) => terminalOutputBuffer.push(line));
-  });
-  ptyProcess.onExit(() => {
-    console.log("[TERMINAL] Process exited");
-    ptyProcess = null;
-  });
-});
-ipcMain.on("terminal:keystroke", (_event, key, _terminalId = "default") => {
-  ptyProcess?.write(key);
-});
-ipcMain.on("terminal:resize", (_event, cols, rows, _terminalId = "default") => {
-  if (ptyProcess && cols > 0 && rows > 0) {
-    try {
-      ptyProcess.resize(cols, rows);
-    } catch (e) {
-    }
-  }
-});
-ipcMain.handle("terminal:reset", () => {
-  if (ptyProcess) {
-    try {
-      ptyProcess.kill();
-    } catch (e) {
-    }
-    ptyProcess = null;
-  }
-  return true;
-});
 ipcMain.handle("ollama:getModels", async () => {
   try {
     console.log("[OLLAMA] Attempting to connect to Ollama at http://127.0.0.1:11434");

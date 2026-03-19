@@ -118,8 +118,9 @@ export class TerminalManager extends EventEmitter {
       throw new Error(`Terminal ${id} not found`);
     }
 
-    terminal.lastActivity = Date.now();
-    terminal.process.write(data);
+    // Normalize line endings for Windows pty
+    const sanitizedData = data === '\r\n' ? '\r' : data;
+    terminal.process.write(sanitizedData);
   }
 
   /**

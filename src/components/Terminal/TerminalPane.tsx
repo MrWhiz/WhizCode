@@ -51,7 +51,7 @@ export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
                 cursorBlink: true,
                 cursorStyle: 'block',
                 allowTransparency: false,
-                convertEol: true,
+                convertEol: false,
                 screenReaderMode: false,
                 disableStdin: false
             })

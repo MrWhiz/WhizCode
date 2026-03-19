@@ -207,7 +207,7 @@ export const RENDERER_DIST = join(process.env.APP_ROOT, 'dist')
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? join(process.env.APP_ROOT, 'public') : RENDERER_DIST
 
 let win: BrowserWindow | null
-let ptyProcess: any = null
+let terminalManager: any = null
 let indexingService: IndexingService | null = null
 let graphService: CodeGraphService | null = null
 const diffService = new DiffService();
@@ -322,7 +322,7 @@ async function createWindow() {
   console.log('[WINDOW] Window created, setting up event handlers...');
 
   // Initialize terminal handlers with a function to get current workspace path
-  setupTerminalHandlers(win, () => currentWorkspacePath);
+  terminalManager = setupTerminalHandlers(win, () => currentWorkspacePath);
 
   // Save window bounds when moved or resized
   win.on('resize', () => saveWindowBounds());
@@ -1860,8 +1860,13 @@ Searched for: "${edit.search.substring(0, 50)}..."`
         });
 
         try {
-          if (ptyProcess) {
-            ptyProcess.write(`\r\n# Executing agent command: ${command}\r\n`);
+          if (terminalManager) {
+            // Write to all terminals or a 'default' one if we had its actual ID
+            // For now, let's try to find an active one or just the first one
+            const terminals = terminalManager.getAllTerminals();
+            if (terminals.length > 0) {
+              terminalManager.write(terminals[0].id, `\r\n# Executing agent command: ${command}\r\n`);
+            }
           }
 
           // Pre-check for directory creation commands (common source of "Operation cancelled" if dir exists)
@@ -1931,7 +1936,10 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             const handleData = (data: any) => {
               const str = data.toString();
               processState.output += str;
-              if (ptyProcess) ptyProcess.write(str);
+              if (terminalManager) {
+                const terminals = terminalManager.getAllTerminals();
+                if (terminals.length > 0) terminalManager.write(terminals[0].id, str);
+              }
 
               const lines = str.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
               if (lines.length > 0) {
@@ -2024,7 +2032,10 @@ Searched for: "${edit.search.substring(0, 50)}..."`
           return { result: fullOutput, logs };
         } catch (e: any) {
           const errOutput = `Command failed: ${e.message}`.trim();
-          if (ptyProcess) ptyProcess.write(errOutput + '\r\n');
+          if (terminalManager) {
+            const terminals = terminalManager.getAllTerminals();
+            if (terminals.length > 0) terminalManager.write(terminals[0].id, errOutput + '\r\n');
+          }
           return { result: errOutput, logs };
         }
       }
@@ -3731,9 +3742,9 @@ ipcMain.handle('fs:writeFile', async (_event, filePath, content) => {
 });
 
 // ------ DIAGNOSTICS HANDLERS ------
-ipcMain.handle('diagnostics:check', async (_event, filePath: string, workspacePath: string) => {
+ipcMain.handle('diagnostics:check', async (_event, filePath: string, workspacePath: string, content?: string) => {
   try {
-    const diagnostics = await diagnosticsService.checkFile(filePath, workspacePath);
+    const diagnostics = await diagnosticsService.checkFile(filePath, workspacePath, content);
     return diagnostics;
   } catch (error: any) {
     console.error('[DIAGNOSTICS] Error checking file:', error);
@@ -3831,72 +3842,7 @@ ipcMain.handle('agent:permission-response', async (_event, decision) => {
 ipcMain.on('app:exit', () => app.quit());
 ipcMain.handle('app:open-external', (_event, url) => shell.openExternal(url));
 
-// ------ TERMINAL HANDLERS ------
-ipcMain.on('terminal:spawn', (_event, terminalId = 'default') => {
-  if (ptyProcess) return;
-
-  // Use workspace path if available, otherwise use home directory
-  const cwd = currentWorkspacePath || os.homedir();
-
-  // Detect shell - prefer bash if available on Windows (Git Bash/WSL)
-  let shell: string;
-  if (os.platform() === 'win32') {
-    // Try to use bash if available (Git Bash), otherwise PowerShell
-    try {
-      const { execSync } = require('child_process');
-      execSync('bash --version', { stdio: 'ignore' });
-      shell = 'bash.exe';
-    } catch {
-      shell = 'powershell.exe';
-    }
-  } else {
-    shell = process.env.SHELL || 'bash';
-  }
-
-  console.log(`[TERMINAL] Spawning shell: ${shell} in ${cwd}`);
-
-  ptyProcess = pty.spawn(shell, [], {
-    name: 'xterm-color',
-    cols: 80,
-    rows: 30,
-    cwd: cwd,
-    env: process.env as any
-  });
-
-  ptyProcess.onData((data: string) => {
-    win?.webContents.send('terminal:incomingData', data, terminalId);
-    // Buffer terminal output for agent context (CircularBuffer handles size limit)
-    const lines = data.split(/\r?\n/);
-    lines.filter(l => l.trim()).forEach(line => terminalOutputBuffer.push(line));
-  });
-
-  ptyProcess.onExit(() => {
-    console.log('[TERMINAL] Process exited');
-    ptyProcess = null;
-  });
-});
-
-ipcMain.on('terminal:keystroke', (_event, key, _terminalId = 'default') => {
-  ptyProcess?.write(key);
-});
-
-ipcMain.on('terminal:resize', (_event, cols, rows, _terminalId = 'default') => {
-  if (ptyProcess && cols > 0 && rows > 0) {
-    try {
-      ptyProcess.resize(cols, rows);
-    } catch (e) { }
-  }
-});
-
-ipcMain.handle('terminal:reset', () => {
-  if (ptyProcess) {
-    try {
-      ptyProcess.kill();
-    } catch (e) { }
-    ptyProcess = null;
-  }
-  return true;
-});
+// Terminal handlers are managed in setupTerminalHandlers
 
 // ------ AI INFRASTRUCTURE ------
 

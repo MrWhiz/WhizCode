@@ -59,6 +59,27 @@ const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu,
         onContextMenu(e, entry)
     }
 
+    const normalize = (p: string) => p.replace(/\\/g, '/').toLowerCase().replace(/^[a-z]:/, '').replace(/^\/+/, '').trim();
+    const normEntryPath = normalize(entry.path);
+
+    // Ultra-robust matching: check if paths match or if entry is a parent of any error file
+    const errorPaths = Object.keys(fileErrors);
+    const hasError = errorPaths.some(p => {
+        const normP = normalize(p);
+        return normP === normEntryPath || 
+               normP.startsWith(normEntryPath + '/') || 
+               (normP.endsWith(normEntryPath) && normP.length > normEntryPath.length && normP[normP.length - normEntryPath.length - 1] === '/');
+    });
+    
+    const totalErrorCountForEntry = errorPaths
+        .filter(p => {
+            const normP = normalize(p);
+            return normP === normEntryPath || normP.startsWith(normEntryPath + '/');
+        })
+        .reduce((sum, p) => sum + (fileErrors[p] || 0), 0);
+
+    const totalErrorCount = totalErrorCountForEntry;
+
     const getFileIcon = (name: string) => {
         const ext = name.split('.').pop()?.toLowerCase();
         const iconColors: Record<string, string> = {
@@ -84,35 +105,38 @@ const FileTreeItem = ({ entry, level = 0, onFileOpen, refreshKey, onContextMenu,
                 onClick={handleClick}
                 onContextMenu={handleContextMenu}>
                 {entry.isDirectory ? (
-                    <svg className="explorer-icon" width="14" height="14" viewBox="0 0 24 24" fill={expanded ? '#dcb67a' : '#c09553'} stroke="none">
+                    <svg className="explorer-icon" width="14" height="14" viewBox="0 0 24 24" fill={hasError ? '#ff3333' : (expanded ? '#dcb67a' : '#c09553')} stroke="none">
                         <path d="M2 6a2 2 0 012-2h5l2 2h9a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
                     </svg>
                 ) : (
-                    <svg className="explorer-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={getFileIcon(entry.name)} strokeWidth="2">
+                    <svg className="explorer-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={hasError ? '#ff3333' : getFileIcon(entry.name)} strokeWidth="2">
                         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
                         <polyline points="14 2 14 8 20 8"></polyline>
                     </svg>
                 )}
                 {entry.isDirectory && (
-                    <svg className="explorer-icon explorer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                    <svg className="explorer-icon explorer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={hasError ? '#ff3333' : "currentColor"} strokeWidth="2"
                         style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)', marginLeft: '2px' }}>
                         <polyline points="9 18 15 12 9 6"></polyline>
                     </svg>
                 )}
-                <span className="explorer-item-name" style={fileErrors[entry.path] && fileErrors[entry.path] > 0 ? { color: '#f48771' } : {}}>
+                <span className="explorer-item-name" style={hasError ? { color: '#ff3333' } : {}}>
                     {entry.name}
                 </span>
-                {!entry.isDirectory && fileErrors[entry.path] && fileErrors[entry.path] > 0 && (
+                {totalErrorCount > 0 && (
                     <span style={{ 
-                        marginLeft: '6px', 
-                        padding: '2px 6px', 
-                        backgroundColor: '#f48771', 
+                        marginLeft: 'auto',
+                        marginRight: '8px', 
+                        padding: '1px 5px', 
+                        backgroundColor: '#ff3333', 
                         color: '#fff', 
-                        borderRadius: '3px', 
-                        fontSize: '10px',
-                        fontWeight: 'bold'
+                        borderRadius: '10px', 
+                        fontSize: '9px',
+                        fontWeight: 'bold',
+                        minWidth: '14px',
+                        textAlign: 'center'
                     }}>
-                        {fileErrors[entry.path]}
+                        {totalErrorCount}
                     </span>
                 )}
             </div>

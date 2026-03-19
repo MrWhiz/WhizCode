@@ -1,4 +1,4 @@
-import Editor from '@monaco-editor/react'
+import Editor, { useMonaco } from '@monaco-editor/react'
 import { useRef, useEffect, useState } from 'react'
 import type { OpenFileProps } from '../../types'
 
@@ -12,7 +12,8 @@ interface EditorAreaProps {
     handleContentChange: (newContent: string | undefined) => void;
     handleMenuAction: (action: string) => void;
     fileErrors?: Record<string, number>;
-    onFixError?: (error: { file: string; line: number; message: string; code?: string }) => void;
+    onFixError?: (filePath: string, line: number, message: string) => void;
+    onValidation?: (filePath: string, count: number) => void;
 }
 
 export const EditorArea = ({
@@ -25,13 +26,21 @@ export const EditorArea = ({
     handleContentChange,
     handleMenuAction,
     fileErrors = {},
-    onFixError
+    onFixError,
+    onValidation
 }: EditorAreaProps) => {
+    const monaco = useMonaco();
     const activeFile = openFiles.find(f => f.path === activeFileId);
     const editorRef = useRef<any>(null);
     const lastContentRef = useRef<string>('');
-    const [markers, setMarkers] = useState<any[]>([]);
     const [diagnostics, setDiagnostics] = useState<any[]>([]);
+    const onFixErrorRef = useRef(onFixError);
+    const [_editorInstance, setEditorInstance] = useState<any>(null);
+
+    // Keep ref in sync
+    useEffect(() => {
+        onFixErrorRef.current = onFixError;
+    }, [onFixError]);
 
     // Update editor content when file changes from backend
     useEffect(() => {
@@ -70,12 +79,11 @@ export const EditorArea = ({
                 );
                 
                 const diags = await Promise.race([
-                    ipc.invoke('diagnostics:check', activeFileId, workspacePath),
+                    ipc.invoke('diagnostics:check', activeFileId, workspacePath, activeFile?.content),
                     timeoutPromise
                 ]);
                 
                 const diagnosticsArray = Array.isArray(diags) ? diags : [];
-                console.log(`[EDITOR] Fetched ${diagnosticsArray.length} diagnostics for ${activeFileId}`);
                 setDiagnostics(diagnosticsArray);
             } catch (error) {
                 console.error('Error fetching diagnostics:', error);
@@ -84,96 +92,129 @@ export const EditorArea = ({
         };
 
         fetchDiagnostics();
-    }, [activeFileId, workspacePath]);
+    }, [activeFileId, workspacePath, activeFile?.content]);
 
     // Update error markers when diagnostics change
     useEffect(() => {
+        if (!monaco || !editorRef.current) return;
+
         try {
-            if (editorRef.current && diagnostics.length > 0) {
-                const editor = editorRef.current;
-                const monaco = editor._domElement?.ownerDocument?.defaultView?.monaco;
-                if (monaco) {
-                    const model = editor.getModel();
-                    if (model) {
-                        const errorMarkers = diagnostics.map((diag: any) => ({
-                            startLineNumber: Math.max(1, diag.line || 1),
-                            startColumn: Math.max(1, diag.column || 1),
-                            endLineNumber: Math.max(1, diag.line || 1),
-                            endColumn: Math.min(Math.max(1, (diag.column || 1) + 50), 200),
-                            message: diag.message || 'Error',
-                            severity: diag.severity === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
-                            code: diag.code,
-                        }));
-                        monaco.editor.setModelMarkers(model, 'owner', errorMarkers);
-                    }
-                }
-            } else if (editorRef.current && diagnostics.length === 0) {
-                const editor = editorRef.current;
-                const monaco = editor._domElement?.ownerDocument?.defaultView?.monaco;
-                if (monaco) {
-                    const model = editor.getModel();
-                    if (model) {
-                        monaco.editor.setModelMarkers(model, 'owner', []);
-                    }
+            const editor = editorRef.current;
+            const model = editor.getModel();
+            if (model) {
+                if (diagnostics.length > 0) {
+                    const errorMarkers = diagnostics.map((diag: any) => ({
+                        startLineNumber: Math.max(1, diag.line || 1),
+                        startColumn: Math.max(1, diag.column || 1),
+                        endLineNumber: Math.max(1, diag.line || 1),
+                        endColumn: Math.min(Math.max(1, (diag.column || 1) + 50), 200),
+                        message: diag.message || 'Error',
+                        severity: diag.severity === 'error' ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+                        code: diag.code,
+                    }));
+                    monaco.editor.setModelMarkers(model, 'owner', errorMarkers);
+                } else {
+                    monaco.editor.setModelMarkers(model, 'owner', []);
                 }
             }
         } catch (error) {
             console.error('Error updating markers:', error);
         }
-    }, [diagnostics]);
+    }, [diagnostics, monaco]);
 
-    // Set up editor context menu for fixing errors
+    // Register provider and commands when monaco is available
     useEffect(() => {
-        if (!editorRef.current) return;
+        if (!monaco) return;
 
-        try {
-            const editor = editorRef.current;
-            const monaco = editor._domElement?.ownerDocument?.defaultView?.monaco;
-            if (!monaco) return;
+        const processedInitialPaths = new Set<string>();
+        monaco.editor.getModels().forEach((model: any) => {
+            const markers = monaco.editor.getModelMarkers({ resource: model.uri });
+            const errorCount = markers.filter((m: any) => m.severity === monaco.MarkerSeverity.Error).length;
+            
+            let rawPath = model.uri.fsPath || model.uri.path || '';
+            if (rawPath.startsWith('/') && rawPath.includes(':')) {
+                rawPath = rawPath.substring(1);
+            }
+            
+            const normPath = rawPath.replace(/\\/g, '/').toLowerCase();
+            if (!processedInitialPaths.has(normPath)) {
+                processedInitialPaths.add(normPath);
+                if (onValidation) {
+                    onValidation(rawPath, errorCount);
+                }
+            }
+        });
 
-            // Register context menu action
-            const disposable = editor.addAction({
-                id: 'whizcode.fixError',
-                label: '🔧 Fix with WhizCode',
-                keybindings: [],
-                precondition: null,
-                keybindingContext: null,
-                contextMenuGroupId: '1_modification',
-                contextMenuOrder: 1.5,
-                run: (ed: any) => {
-                    const position = ed.getPosition();
-                    if (!position) return;
+        // Register the "Fix with WhiZcode" code action provider
+        const provider = monaco.languages.registerCodeActionProvider('*', {
+            provideCodeActions: (model: any, _range: any, context: any) => {
+                const relevantMarkers = (context.markers || [])
+                    .filter((m: any) => m.severity === monaco.MarkerSeverity.Error || m.severity === monaco.MarkerSeverity.Warning);
+                
+                if (relevantMarkers.length === 0) return { actions: [], dispose: () => {} };
 
-                    // Get the line content
-                    const model = ed.getModel();
-                    const lineContent = model.getLineContent(position.lineNumber);
-                    
-                    // Find error at this line
-                    const markers = monaco.editor.getModelMarkers({ resource: model.uri });
-                    const errorAtLine = markers.find((m: any) => m.startLineNumber === position.lineNumber);
-                    
-                    if (errorAtLine && onFixError) {
-                        onFixError({
-                            file: activeFileId || '',
-                            line: position.lineNumber,
-                            message: errorAtLine.message,
-                            code: errorAtLine.code
-                        });
+                // Only show one "Fix with WhiZcode" even if there are multiple errors
+                return {
+                    actions: [{
+                        title: '✨ Fix with WhiZcode',
+                        diagnostics: relevantMarkers,
+                        kind: 'quickfix',
+                        command: {
+                            id: 'whizcode.fixError',
+                            title: 'Fix with WhiZcode',
+                            arguments: [
+                                model.uri.fsPath || model.uri.path || '', 
+                                relevantMarkers[0].startLineNumber, 
+                                relevantMarkers[0].message
+                            ]
+                        },
+                        isPreferred: true
+                    }],
+                    dispose: () => {}
+                };
+            }
+        });
+
+        // Listen for all marker changes to update explorer count for ALL models
+        const markerListener = monaco.editor.onDidChangeMarkers((uris: readonly any[]) => {
+            const processedPaths = new Set<string>();
+            uris.forEach((uri: any) => {
+                const markers = monaco.editor.getModelMarkers({ resource: uri });
+                const errorCount = markers.filter((m: any) => m.severity === monaco.MarkerSeverity.Error).length;
+                
+                // Get path and strip leading slash for Windows
+                let rawPath = uri.fsPath || uri.path || '';
+                if (rawPath.startsWith('/') && rawPath.includes(':')) {
+                    rawPath = rawPath.substring(1);
+                }
+                
+                // Only report each unique path once in this batch
+                const normPath = rawPath.replace(/\\/g, '/').toLowerCase();
+                if (!processedPaths.has(normPath)) {
+                    processedPaths.add(normPath);
+                    if (onValidation) {
+                        onValidation(rawPath, errorCount);
                     }
                 }
             });
+        });
 
-            return () => {
-                try {
-                    disposable.dispose();
-                } catch (e) {
-                    // Ignore disposal errors
-                }
-            };
-        } catch (error) {
-            console.error('Error setting up editor context menu:', error);
-        }
-    }, [activeFileId, onFixError]);
+        // Register the command (globally)
+        const command = (monaco.editor as any).registerCommand('whizcode.fixError', (_accessor: any, ...args: any[]) => {
+            const [filePath, line, message] = args;
+            if (onFixErrorRef.current) {
+                onFixErrorRef.current(filePath, line, message);
+            }
+        });
+
+        return () => {
+            provider.dispose();
+            markerListener.dispose();
+            if (command && typeof command.dispose === 'function') {
+                command.dispose();
+            }
+        };
+    }, [monaco, onValidation]);
 
     const handleEditorChange = (newContent: string | undefined) => {
         if (newContent !== undefined) {
@@ -184,11 +225,12 @@ export const EditorArea = ({
 
     const handleEditorMount = (editor: any) => {
         editorRef.current = editor;
+        setEditorInstance(editor);
         lastContentRef.current = activeFile?.content || '';
     };
 
     return (
-        <main className="main-area" style={{ display: 'flex', flexDirection: 'column' }}>
+        <main className="main-area" style={{ display: 'flex', flexDirection: 'column', position: 'relative' }}>
             {openFiles.length > 0 ? (
                 <>
                     <div className="tabs" style={{ display: 'flex', overflowX: 'auto' }}>
@@ -218,34 +260,6 @@ export const EditorArea = ({
                         <div>
                             WhizCode <span style={{ opacity: 0.5 }}>&gt;</span> {activeFileId?.replace(workspacePath || '', '')}
                         </div>
-                        {diagnostics.length > 0 && (
-                            <button
-                                onClick={() => {
-                                    if (diagnostics.length > 0 && onFixError) {
-                                        const error = diagnostics[0];
-                                        onFixError({
-                                            file: activeFileId || '',
-                                            line: error.line,
-                                            message: error.message,
-                                            code: error.code
-                                        });
-                                    }
-                                }}
-                                style={{
-                                    padding: '4px 12px',
-                                    backgroundColor: '#f48771',
-                                    color: '#fff',
-                                    border: 'none',
-                                    borderRadius: '4px',
-                                    cursor: 'pointer',
-                                    fontSize: '12px',
-                                    fontWeight: 'bold',
-                                    marginRight: '8px'
-                                }}
-                            >
-                                🔧 Fix with WhizCode ({diagnostics.length})
-                            </button>
-                        )}
                     </div>
 
                     <div style={{ flex: 1, overflow: 'hidden', backgroundColor: '#1e1e1e', margin: '0' }}>
@@ -253,6 +267,7 @@ export const EditorArea = ({
                             height="100%"
                             language={getLanguage(activeFile?.name || '')}
                             theme="vs-dark"
+                            path={activeFileId || undefined}
                             value={activeFile?.content || ''}
                             onChange={handleEditorChange}
                             onMount={handleEditorMount}
@@ -260,7 +275,9 @@ export const EditorArea = ({
                                 minimap: { enabled: false },
                                 fontSize: 14,
                                 wordWrap: 'on',
-                                fontFamily: "'Consolas', 'Courier New', monospace"
+                                fontFamily: "'Consolas', 'Courier New', monospace",
+                                hover: { enabled: true },
+                                quickSuggestions: true,
                             }}
                         />
                     </div>

@@ -13,16 +13,15 @@ export default defineConfig({
         entry: 'electron/main.ts',
         vite: {
           build: {
+            minify: 'terser',
             rollupOptions: {
               external: [
                 'electron',
                 ...builtinModules,
                 ...builtinModules.map(m => `node:${m}`),
                 'node-pty',
-                '@lancedb/lancedb',
                 'tree-sitter',
-                'tree-sitter-typescript',
-                'lancedb'
+                'tree-sitter-typescript'
               ],
             },
           },
@@ -32,16 +31,15 @@ export default defineConfig({
         input: path.join(__dirname, 'electron/preload.ts'),
         vite: {
           build: {
+            minify: 'terser',
             rollupOptions: {
               external: [
                 'electron',
                 ...builtinModules,
                 ...builtinModules.map(m => `node:${m}`),
                 'node-pty',
-                '@lancedb/lancedb',
                 'tree-sitter',
-                'tree-sitter-typescript',
-                'lancedb'
+                'tree-sitter-typescript'
               ],
             },
           },
@@ -50,4 +48,21 @@ export default defineConfig({
       renderer: {},
     }),
   ],
+  build: {
+    minify: 'terser',
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'monaco': ['@monaco-editor/react'],
+          'mermaid': ['mermaid'],
+          'xterm': ['@xterm/xterm', '@xterm/addon-fit'],
+          'markdown': ['react-markdown', 'remark-gfm'],
+        },
+        chunkFileNames: 'chunks/[name]-[hash].js',
+        entryFileNames: '[name]-[hash].js',
+      },
+    },
+    chunkSizeWarningLimit: 1000,
+    reportCompressedSize: false,
+  },
 })

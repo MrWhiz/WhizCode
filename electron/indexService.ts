@@ -16,18 +16,16 @@ const _require = createRequire(import.meta.url)
  */
 let treeSitter: any;
 let treeSitterTypeScript: any;
-let lancedb: any;
 
 try {
     treeSitter = _require('tree-sitter');
     treeSitterTypeScript = _require('tree-sitter-typescript');
-    lancedb = _require('@lancedb/lancedb');
 } catch (e) {
     console.error("Failed to load native modules in IndexingService:", e);
 }
 
 // Types for our semantic blocks
-interface SemanticChunk {
+export interface SemanticChunk {
     id: string;
     filePath: string;
     type: 'function' | 'class' | 'constant' | 'method' | 'other';
@@ -36,11 +34,12 @@ interface SemanticChunk {
     startLine: number;
     endLine: number;
     hash: string;
+    vector?: number[];
 }
 
 export class IndexingService {
-    private db: any = null;
-    private table: any = null;
+    private dbPath: string = '';
+    private records: SemanticChunk[] = [];
     private parser: any;
     private voyage: VoyageAIClient | null = null;
     private azureConfig: { loginUrl: string, embeddingUrl: string, username: string, password: string } | null = null;
@@ -68,20 +67,36 @@ export class IndexingService {
         }
     }
 
+    private async loadDb() {
+        if (!this.dbPath) return;
+        try {
+            const data = await fs.readFile(this.dbPath, 'utf-8');
+            this.records = JSON.parse(data);
+        } catch {
+            this.records = []; // File doesn't exist or is invalid
+        }
+    }
+
+    private async saveDb() {
+        if (!this.dbPath) return;
+        try {
+            await fs.writeFile(this.dbPath, JSON.stringify(this.records), 'utf-8');
+        } catch (e) {
+            console.error('Failed to save vector DB:', e);
+        }
+    }
+
     async initialize(workspacePath: string) {
         this.workspacePath = workspacePath;
-        const dbPath = join(app.getPath('userData'), 'vector_db');
-        await fs.mkdir(dbPath, { recursive: true });
+        const dbDir = join(app.getPath('userData'), 'vector_db');
+        await fs.mkdir(dbDir, { recursive: true });
+        
+        // Use a hash of the workspace path to keep a separate JSON DB per project
+        const projectHash = crypto.createHash('md5').update(workspacePath).digest('hex');
+        this.dbPath = join(dbDir, `semantic_chunks_${projectHash}.json`);
 
-        this.db = await lancedb.connect(dbPath);
-
-        // Create or open the table
-        try {
-            this.table = await this.db.openTable('semantic_chunks');
-        } catch {
-            // First time initialization
-            console.log('Creating semantic_chunks table...');
-        }
+        await this.loadDb();
+        console.log(`Loaded ${this.records.length} chunks from Pure TS Vector DB`);
 
         this.setupWatcher();
     }
@@ -108,8 +123,9 @@ export class IndexingService {
 
         const files = await this.getProjectFiles(this.workspacePath);
         for (const file of files) {
-            await this.indexFile(file);
+            await this.indexFile(file, false); // Pass false to delay saving until the end
         }
+        await this.saveDb();
     }
 
     private async getProjectFiles(dir: string): Promise<string[]> {
@@ -138,7 +154,7 @@ export class IndexingService {
         return results;
     }
 
-    async indexFile(filePath: string) {
+    async indexFile(filePath: string, saveImmediately = true) {
         try {
             const content = await fs.readFile(filePath, 'utf-8');
             const fileHash = crypto.createHash('sha256').update(content).digest('hex');
@@ -149,18 +165,11 @@ export class IndexingService {
             }
 
             const chunks = this.parseFile(filePath, content);
+            const normalizedFilePath = filePath.replace(/\\/g, '\\\\');
 
-            // Get existing hashes for this file from the table
-            let existingHashes: Map<string, string> = new Map();
-            if (this.table) {
-                const existingEntries = await this.table
-                    .query()
-                    .where(`filePath = "${filePath.replace(/\\/g, '\\\\')}"`)
-                    .select(['id', 'hash'])
-                    .toArray();
-
-                existingHashes = new Map(existingEntries.map((e: any) => [e.id as string, e.hash as string]));
-            }
+            // Get existing hashes for this file from in-memory records
+            const existingEntries = this.records.filter(r => r.filePath === filePath || r.filePath === normalizedFilePath);
+            const existingHashes = new Map(existingEntries.map((e: SemanticChunk) => [e.id, e.hash]));
 
             // Filter chunks that actually changed
             const changedChunks = chunks.filter(c => existingHashes.get(c.id) !== c.hash);
@@ -169,46 +178,33 @@ export class IndexingService {
                 // Only generate embeddings for changed chunks
                 const embeddings = await this.generateEmbeddings(changedChunks.map(c => c.content));
 
-                const dataToUpsert = changedChunks.map((chunk, i) => ({
-                    vector: embeddings[i],
-                    id: chunk.id,
-                    filePath: chunk.filePath,
-                    type: chunk.type,
-                    name: chunk.name,
-                    content: chunk.content,
-                    startLine: chunk.startLine,
-                    endLine: chunk.endLine,
-                    hash: chunk.hash
+                const newRecords = changedChunks.map((chunk, i) => ({
+                    ...chunk,
+                    vector: embeddings[i]
                 }));
 
-                if (!this.table) {
-                    this.table = await this.db!.createTable('semantic_chunks', dataToUpsert);
-                } else {
-                    // Delete old versions of changed chunks and add new ones
-                    for (const chunk of changedChunks) {
-                        await this.table.delete(`id = "${chunk.id}"`);
-                    }
-                    await this.table.add(dataToUpsert);
-                }
+                // Remove outdated chunks for these specific IDs
+                const changedIds = new Set(changedChunks.map(c => c.id));
+                this.records = this.records.filter(r => !changedIds.has(r.id));
+                
+                // Add new chunk data
+                this.records.push(...newRecords);
             }
 
             // Cleanup chunks that no longer exist in the file
-            if (this.table) {
-                const allCurrentIds = new Set(chunks.map(c => c.id));
-                const entriesInDb = await this.table
-                    .query()
-                    .where(`filePath = "${filePath.replace(/\\/g, '\\\\')}"`)
-                    .select(['id'])
-                    .toArray();
-
-                for (const entry of entriesInDb) {
-                    if (!allCurrentIds.has(entry.id as string)) {
-                        await this.table.delete(`id = "${entry.id}"`);
-                    }
+            const allCurrentIds = new Set(chunks.map(c => c.id));
+            this.records = this.records.filter(r => {
+                if (r.filePath === filePath || r.filePath === normalizedFilePath) {
+                    return allCurrentIds.has(r.id); // Keep only if it still exists in parsed file
                 }
-            }
+                return true; // Keep records from other files
+            });
 
             this.fileHashes.set(filePath, fileHash);
+            
+            if (saveImmediately) {
+                await this.saveDb();
+            }
         } catch (error) {
             console.error(`Error indexing file ${filePath}:`, error);
         }
@@ -283,8 +279,22 @@ export class IndexingService {
         return [];
     }
 
+    private cosineSimilarity(A: number[], B: number[]): number {
+        let dotproduct = 0;
+        let mA = 0;
+        let mB = 0;
+        for (let i = 0; i < A.length; i++) {
+            dotproduct += A[i] * B[i];
+            mA += A[i] * A[i];
+            mB += B[i] * B[i];
+        }
+        mA = Math.sqrt(mA);
+        mB = Math.sqrt(mB);
+        return dotproduct / (mA * mB);
+    }
+
     async search(query: string, limit = 5) {
-        if (!this.table) return [];
+        if (this.records.length === 0) return [];
 
         let queryEmbedding: number[] | null = null;
 
@@ -318,11 +328,18 @@ export class IndexingService {
 
         if (!queryEmbedding) return [];
 
-        const results = await this.table
-            .vectorSearch(queryEmbedding)
-            .limit(limit)
-            .toArray();
+        // Calculate cosine similarity for all records that have a vector
+        const scored = this.records
+            .filter(r => r.vector)
+            .map(r => ({
+                ...r,
+                _distance: 1 - this.cosineSimilarity(queryEmbedding!, r.vector!) // lower distance is better
+            }));
 
-        return results;
+        // Sort by closest (lowest distance) and take the top results
+        scored.sort((a, b) => a._distance - b._distance);
+        
+        // Remove vectors before returning to save memory over IPC/rendering
+        return scored.slice(0, limit).map(({ vector, ...rest }) => rest);
     }
 }

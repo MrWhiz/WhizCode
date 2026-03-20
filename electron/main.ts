@@ -1,9 +1,10 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
-import path, { join, dirname, isAbsolute, normalize } from 'node:path'
+import path, { join, dirname, isAbsolute, normalize, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { exec, spawn } from 'node:child_process'
+import { exec, spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as fs from 'node:fs/promises'
+import { validatePathInWorkspace, sanitizeShellInput, encryptData, decryptData, validateStringInput, validateFilePath } from './securityUtils'
 import * as os from 'node:os'
 // Remove cross-fetch as global fetch is available in modern Electron/Node
 import { createRequire } from 'node:module'
@@ -57,8 +58,17 @@ async function loadAzureToken() {
     const data = await fs.readFile(AZURE_TOKEN_FILE, 'utf-8');
     const parsed = JSON.parse(data);
     if (parsed && parsed.token && parsed.expires && parsed.expires > Date.now()) {
-      azureTokenCache = parsed;
-      return azureTokenCache;
+      try {
+        azureTokenCache = {
+          token: decryptData(parsed.token),
+          expires: parsed.expires
+        };
+        return azureTokenCache;
+      } catch (e) {
+        console.warn('[AZURE] Failed to decrypt token, clearing cache');
+        await fs.unlink(AZURE_TOKEN_FILE).catch(() => {});
+        return null;
+      }
     }
   } catch (e) { /* ignore */ }
   return null;
@@ -88,13 +98,13 @@ async function getAzureToken(loginUrl: string, username: string, password: strin
   // Cache for 23.5 hours (assuming 24h validity)
   const expires = Date.now() + 23.5 * 60 * 60 * 1000;
   azureTokenCache = { token, expires };
-  
+
   try {
-    await fs.writeFile(AZURE_TOKEN_FILE, JSON.stringify(azureTokenCache), 'utf-8');
+    await fs.writeFile(AZURE_TOKEN_FILE, JSON.stringify({ token: encryptData(token), expires }), 'utf-8');
   } catch (e) {
     console.error('[AZURE] Failed to persist token:', e);
   }
-  
+
   return token;
 }
 
@@ -508,6 +518,15 @@ app.on('window-all-closed', async () => {
     }
   }
 
+  if (terminalManager) {
+    try {
+      terminalManager.clearAll();
+      console.log('[CLEANUP] Terminals killed');
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+  }
+
   if (process.platform !== 'darwin') {
     app.quit()
     win = null
@@ -559,10 +578,10 @@ async function isBinaryFile(filePath: string): Promise<boolean> {
 
 async function readDirectoryRecursive(dirPath: string, maxFiles = 2000): Promise<{ path: string }[]> {
   const results: { path: string }[] = [];
-  
+
   // Use a stack-based iterative approach to avoid recursion overhead
   const stack: string[] = [dirPath];
-  
+
   while (stack.length > 0 && results.length < maxFiles) {
     const currentPath = stack.pop()!;
     try {
@@ -570,7 +589,7 @@ async function readDirectoryRecursive(dirPath: string, maxFiles = 2000): Promise
       for (const entry of entries) {
         if (results.length >= maxFiles) break;
         const fullPath = join(currentPath, entry.name);
-        
+
         if (entry.isDirectory()) {
           // Efficiently skip noise
           if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
@@ -699,7 +718,7 @@ async function fuzzyFindFile(workspacePath: string, query: string, maxResults = 
   results.sort((a, b) => b.score - a.score);
 
   if (returnObjects) return results.slice(0, maxResults);
-  
+
   if (results.length === 0) return `No files found matching "${query}".`;
   return results.slice(0, maxResults).map(r => `- ${r.path} (score: ${r.score})`).join('\n');
 }
@@ -1085,6 +1104,10 @@ Follow this systematic approach when building web applications:
 {"tool": "generate_image", "prompt": "Modern dashboard UI, glassmorphism, dark mode, vibrant blue accents"}
 {"tool": "search_web", "query": "latest React Router v7 data loading patterns"}
 
+## ANTI-LOOP INSTRUCTIONS
+- **DO NOT REPEAT FAILED ACTIONS**: If you attempt a \`replace_file_content\` or \`run_command\` and it fails or produces an error, DO NOT attempt the exact same action again.
+- **CHANGE STRATEGY**: If you are stuck, read the surrounding code, use grep/search, or ask the user for clarification. Repeating identical tool calls will trigger an emergency abort.
+
 <system_context>
 Operating System: ${process.platform}
 Shell: ${process.platform === 'win32' ? 'cmd.exe (Windows)' : 'bash'}
@@ -1360,7 +1383,7 @@ async function callAI(messages: any[], modelConfig: {
         if (m.images && m.images.length > 0) {
           return {
             ...m,
-            images: m.images.map((img: string) => 
+            images: m.images.map((img: string) =>
               img.includes('base64,') ? img.split('base64,')[1] : img
             )
           };
@@ -1455,6 +1478,9 @@ async function callAI(messages: any[], modelConfig: {
 }
 
 async function callSimpleAI(prompt: string, options?: { json?: boolean }): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+
   try {
     const res = await fetch(OLLAMA_URL, {
       method: 'POST',
@@ -1464,14 +1490,22 @@ async function callSimpleAI(prompt: string, options?: { json?: boolean }): Promi
         messages: [{ role: 'user', content: prompt }],
         stream: false,
         ...(options?.json ? { format: 'json' } : {})
-      })
+      }),
+      signal: controller.signal
     });
+
+    clearTimeout(timeoutId);
 
     if (!res.ok) throw new Error(`Ollama HTTP Error: ${res.status}`);
     const data = await res.json() as any;
     return data.message?.content || '';
   } catch (error: any) {
-    console.error("[SIMPLE_AI] Error:", error);
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      console.error("[SIMPLE_AI] Timeout: Simple AI request took too long (>60s)");
+    } else {
+      console.error("[SIMPLE_AI] Error:", error);
+    }
     return "";
   }
 }
@@ -1704,7 +1738,7 @@ const TOOL_TIMEOUTS: Record<string, number> = {
 
 async function executeToolCall(toolData: any, workspacePath: string | null, iteration?: number, isAutopilotMode: boolean = false, model?: { provider: string, model: string, openaiKey?: string, geminiKey?: string, bedrockRegion?: string, bedrockAccessKey?: string, bedrockSecretKey?: string }, config?: any): Promise<{ result: string; logs?: string[]; abort?: boolean; data?: any }> {
   let resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath, toolData.cwd) : '';
-  
+
   // ── INTELLIGENT PATH RECOVERY ──────────────────────────────────────────
   // If the path was resolved but doesn't exist, try to find it in the workspace
   if (resolvedPath && workspacePath && toolData.tool !== 'run_command') {
@@ -1715,13 +1749,13 @@ async function executeToolCall(toolData: any, workspacePath: string | null, iter
       // Not found, try fuzzy fallback for a 100% filename match
       const filename = toolData.path.split(/[\\/]/).pop();
       if (filename) {
-         try {
-           const matches = await fuzzyFindFile(workspacePath, filename, 1, true);
-           if (matches && matches.length > 0 && matches[0].score === 100) {
-              console.log(`[RECOVERY] File not found at ${resolvedPath}, but exact match found at ${matches[0].fullPath}. Using recovered path.`);
-              resolvedPath = matches[0].fullPath;
-           }
-         } catch (e) { /* ignore recovery errors */ }
+        try {
+          const matches = await fuzzyFindFile(workspacePath, filename, 1, true);
+          if (matches && matches.length > 0 && matches[0].score === 100) {
+            console.log(`[RECOVERY] File not found at ${resolvedPath}, but exact match found at ${matches[0].fullPath}. Using recovered path.`);
+            resolvedPath = matches[0].fullPath;
+          }
+        } catch (e) { /* ignore recovery errors */ }
       }
     }
   }
@@ -1823,900 +1857,900 @@ async function executeToolCall(toolData: any, workspacePath: string | null, iter
   try {
     const performAction = async (): Promise<{ result: string; logs?: string[]; abort?: boolean; data?: any }> => {
       switch (toolData.tool) {
-      case 'read_file': {
-        console.log(`[READ_FILE] Starting read_file for: ${toolData.path}`);
-        if (!toolData.path) return { result: '❌ Error: Tool "read_file" requires a "path" parameter.' };
+        case 'read_file': {
+          console.log(`[READ_FILE] Starting read_file for: ${toolData.path}`);
+          if (!toolData.path) return { result: '❌ Error: Tool "read_file" requires a "path" parameter.' };
 
-        try {
-          console.log(`[READ_FILE] Checking file access for: ${resolvedPath}`);
-          // Check if file exists first (with timeout)
           try {
-            await Promise.race([
-              fs.access(resolvedPath),
-              new Promise((_, reject) => setTimeout(() => reject(new Error('File access check timed out')), 2000))
-            ]);
-            console.log(`[READ_FILE] File access check passed`);
-          } catch (error) {
-            console.log(`[READ_FILE] File access check failed: ${error}`);
-            let errorMessage = `❌ Error: File not found or inaccessible: ${toolData.path}\nResolved path: ${resolvedPath}`;
-            
-            // Helpful fallback: Fuzzy search if the agent guessed the path slightly wrong
-            const filename = toolData.path.split(/[\\/]/).pop();
-            if (filename && workspacePath) {
-               try {
-                 const suggestions = await fuzzyFindFile(workspacePath, filename, 3);
-                 if (suggestions && !suggestions.includes('No matches found')) {
-                   errorMessage += `\n\nDid you mean one of these existing files?\n${suggestions}`;
-                 } else {
-                   errorMessage += `\n\nUse 'list_directory' or 'search_files' to find the correct path.`;
-                 }
-               } catch (fuzzyErr) {
-                 errorMessage += `\n\nUse 'list_directory' to find files.`;
-               }
+            console.log(`[READ_FILE] Checking file access for: ${resolvedPath}`);
+            // Check if file exists first (with timeout)
+            try {
+              await Promise.race([
+                fs.access(resolvedPath),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('File access check timed out')), 2000))
+              ]);
+              console.log(`[READ_FILE] File access check passed`);
+            } catch (error) {
+              console.log(`[READ_FILE] File access check failed: ${error}`);
+              let errorMessage = `❌ Error: File not found or inaccessible: ${toolData.path}\nResolved path: ${resolvedPath}`;
+
+              // Helpful fallback: Fuzzy search if the agent guessed the path slightly wrong
+              const filename = toolData.path.split(/[\\/]/).pop();
+              if (filename && workspacePath) {
+                try {
+                  const suggestions = await fuzzyFindFile(workspacePath, filename, 3);
+                  if (suggestions && !suggestions.includes('No matches found')) {
+                    errorMessage += `\n\nDid you mean one of these existing files?\n${suggestions}`;
+                  } else {
+                    errorMessage += `\n\nUse 'list_directory' or 'search_files' to find the correct path.`;
+                  }
+                } catch (fuzzyErr) {
+                  errorMessage += `\n\nUse 'list_directory' to find files.`;
+                }
+              }
+              return { result: errorMessage };
             }
-            return { result: errorMessage };
+
+            console.log(`[READ_FILE] Checking if binary`);
+            const isBinary = await isBinaryFile(resolvedPath);
+            if (isBinary) {
+              console.log(`[READ_FILE] File is binary`);
+              return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
+            }
+            console.log(`[READ_FILE] Reading file content`);
+            const content = await fs.readFile(resolvedPath, 'utf-8');
+            const lines = content.split('\n');
+            console.log(`[READ_FILE] Successfully read ${lines.length} lines`);
+            // Add line numbers for context
+            return { result: lines.map((line, i) => `${i + 1}: ${line}`).join('\n') };
+          } catch (error) {
+            console.log(`[READ_FILE] Error: ${error}`);
+            return { result: `❌ Error reading file ${toolData.path}: ${error instanceof Error ? error.message : String(error)}` };
+          }
+        }
+
+        case 'write_file': {
+          if (!toolData.path) {
+            return { result: '❌ Error: Tool "write_file" requires a "path" parameter.' };
           }
 
-          console.log(`[READ_FILE] Checking if binary`);
-          const isBinary = await isBinaryFile(resolvedPath);
-          if (isBinary) {
-            console.log(`[READ_FILE] File is binary`);
-            return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
+          const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
+          const blastWarning = blastRadius.length > 0
+            ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
+            : '';
+
+          // Request approval
+          if (!(await requestApproval(`Write file: ${toolData.path}${blastWarning}`))) {
+            return { result: '❌ File write denied by user.', abort: true };
           }
-          console.log(`[READ_FILE] Reading file content`);
-          const content = await fs.readFile(resolvedPath, 'utf-8');
-          const lines = content.split('\n');
-          console.log(`[READ_FILE] Successfully read ${lines.length} lines`);
-          // Add line numbers for context
-          return { result: lines.map((line, i) => `${i + 1}: ${line}`).join('\n') };
-        } catch (error) {
-          console.log(`[READ_FILE] Error: ${error}`);
-          return { result: `❌ Error reading file ${toolData.path}: ${error instanceof Error ? error.message : String(error)}` };
-        }
-      }
 
-      case 'write_file': {
-        if (!toolData.path) {
-          return { result: '❌ Error: Tool "write_file" requires a "path" parameter.' };
-        }
+          // Ensure parent directory exists
+          const dir = dirname(resolvedPath);
+          await fs.mkdir(dir, { recursive: true });
+          await fs.writeFile(resolvedPath, toolData.content, 'utf-8');
+          // Notify renderer of file change
+          safeSend('file:changed', { path: resolvedPath, content: toolData.content });
+          const lineCount = toolData.content.split('\n').length;
 
-        const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
-        const blastWarning = blastRadius.length > 0
-          ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
-          : '';
+          // Update graph automatically
+          if (graphService) graphService.updateFile(resolvedPath);
 
-        // Request approval
-        if (!(await requestApproval(`Write file: ${toolData.path}${blastWarning}`))) {
-          return { result: '❌ File write denied by user.', abort: true };
+          // Manifest update is handled automatically by workspace watcher
+
+          // NOTE: Auto-diagnostics removed — too slow (5-15s per write with tsc).
+          // The agent can explicitly call getDiagnostics when needed.
+          return { result: `✅ Successfully wrote ${lineCount} lines to ${toolData.path}` };
         }
 
-        // Ensure parent directory exists
-        const dir = dirname(resolvedPath);
-        await fs.mkdir(dir, { recursive: true });
-        await fs.writeFile(resolvedPath, toolData.content, 'utf-8');
-        // Notify renderer of file change
-        safeSend('file:changed', { path: resolvedPath, content: toolData.content });
-        const lineCount = toolData.content.split('\n').length;
+        case 'edit_file': {
+          if (!toolData.path) return { result: '❌ Error: Tool "edit_file" requires a "path" parameter.' };
+          if (!toolData.edits) return { result: '❌ Error: Tool "edit_file" requires an "edits" parameter.' };
 
-        // Update graph automatically
-        if (graphService) graphService.updateFile(resolvedPath);
+          const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
+          const blastWarning = blastRadius.length > 0
+            ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
+            : '';
 
-        // Manifest update is handled automatically by workspace watcher
+          // Request approval
+          if (!(await requestApproval(`Edit file: ${toolData.path} (${toolData.edits?.length || 0} edits)${blastWarning}`))) {
+            return { result: '❌ File edit denied by user.', abort: true };
+          }
 
-        // NOTE: Auto-diagnostics removed — too slow (5-15s per write with tsc).
-        // The agent can explicitly call getDiagnostics when needed.
-        return { result: `✅ Successfully wrote ${lineCount} lines to ${toolData.path}` };
-      }
+          let content = await fs.readFile(resolvedPath, 'utf-8');
+          const edits = toolData.edits || [];
+          let editCount = 0;
 
-      case 'edit_file': {
-        if (!toolData.path) return { result: '❌ Error: Tool "edit_file" requires a "path" parameter.' };
-        if (!toolData.edits) return { result: '❌ Error: Tool "edit_file" requires an "edits" parameter.' };
+          for (const edit of edits) {
+            // Check for exact match
+            if (content.includes(edit.search)) {
+              content = content.replace(edit.search, edit.replace);
+              editCount++;
+            } else {
+              // Provide helpful feedback for nearly-matching strings
+              const searchTrimmed = edit.search.trim();
+              const contentTrimmed = content.replace(/\s+/g, ' ');
 
-        const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
-        const blastWarning = blastRadius.length > 0
-          ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
-          : '';
-
-        // Request approval
-        if (!(await requestApproval(`Edit file: ${toolData.path} (${toolData.edits?.length || 0} edits)${blastWarning}`))) {
-          return { result: '❌ File edit denied by user.', abort: true };
-        }
-
-        let content = await fs.readFile(resolvedPath, 'utf-8');
-        const edits = toolData.edits || [];
-        let editCount = 0;
-
-        for (const edit of edits) {
-          // Check for exact match
-          if (content.includes(edit.search)) {
-            content = content.replace(edit.search, edit.replace);
-            editCount++;
-          } else {
-            // Provide helpful feedback for nearly-matching strings
-            const searchTrimmed = edit.search.trim();
-            const contentTrimmed = content.replace(/\s+/g, ' ');
-
-            if (contentTrimmed.includes(searchTrimmed.replace(/\s+/g, ' '))) {
-              return {
-                result: `❌ edit_file failed for ${toolData.path}: The search string exists but whitespace/indentation did not match exactly. 
+              if (contentTrimmed.includes(searchTrimmed.replace(/\s+/g, ' '))) {
+                return {
+                  result: `❌ edit_file failed for ${toolData.path}: The search string exists but whitespace/indentation did not match exactly. 
 Please 'read_file' again to get the EXACT indentation or use the 'write_file' tool to overwrite the file if the edit is complex.
 Searched for: "${edit.search.substring(0, 50)}..."`
-              };
-            } else {
-              return { result: `❌ edit_file failed: could not find the following code block in ${toolData.path}:\n\n${edit.search}\n\nMake sure you have the latest content via 'read_file'.` };
+                };
+              } else {
+                return { result: `❌ edit_file failed: could not find the following code block in ${toolData.path}:\n\n${edit.search}\n\nMake sure you have the latest content via 'read_file'.` };
+              }
             }
           }
-        }
-        await fs.writeFile(resolvedPath, content, 'utf-8');
-        // Notify renderer of file change
-        safeSend('file:changed', { path: resolvedPath, content });
-
-        // Update graph automatically
-        if (graphService) graphService.updateFile(resolvedPath);
-
-        // Manifest update is handled by the workspace watcher asynchronously
-
-        // NOTE: Auto-diagnostics removed — too slow (5-15s per edit with tsc).
-        // The agent can explicitly call getDiagnostics when needed.
-        return {
-          result: `✅ Applied ${editCount} edit(s) to ${toolData.path}`,
-          data: { path: toolData.path, edits: toolData.edits }
-        };
-      }
-
-      case 'replace_file_content': {
-        if (!toolData.path) return { result: '❌ Error: Tool "replace_file_content" requires a "path" parameter.' };
-        if (toolData.startLine === undefined || toolData.endLine === undefined) return { result: '❌ Error: "startLine" and "endLine" parameters required.' };
-        if (toolData.targetContent === undefined) return { result: '❌ Error: "targetContent" parameter required.' };
-        if (toolData.replacementContent === undefined) return { result: '❌ Error: "replacementContent" parameter required.' };
-
-        if (!(await requestApproval(`Replace lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}`))) {
-          return { result: '❌ File edit denied by user.', abort: true };
-        }
-
-        try {
-          let content = await fs.readFile(resolvedPath, 'utf-8');
-          let lines = content.split('\n');
-          const startIdx = Math.max(0, toolData.startLine - 1);
-          const endIdx = Math.min(lines.length, toolData.endLine);
-
-          let chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
-          if (chunkToReplace !== toolData.targetContent) {
-            return { result: `❌ targetContent does not match exactly the lines from ${toolData.startLine} to ${toolData.endLine} in ${toolData.path}. Make sure whitespace and indentation perfectly match.` };
-          }
-
-          const newLines = [
-            ...lines.slice(0, startIdx),
-            toolData.replacementContent,
-            ...lines.slice(endIdx)
-          ];
-          await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
+          await fs.writeFile(resolvedPath, content, 'utf-8');
           // Notify renderer of file change
-          safeSend('file:changed', { path: resolvedPath, content: newLines.join('\n') });
+          safeSend('file:changed', { path: resolvedPath, content });
 
-          // Manifest refresh handled by workspace watcher
+          // Update graph automatically
+          if (graphService) graphService.updateFile(resolvedPath);
 
-          return { result: `✅ Successfully replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
-        } catch (e: any) {
-          return { result: `❌ replace_file_content failed: ${e.message}` };
-        }
-      }
+          // Manifest update is handled by the workspace watcher asynchronously
 
-      case 'multi_replace_file_content': {
-        if (!toolData.path) return { result: '❌ Error: Tool "multi_replace_file_content" requires a "path" parameter.' };
-        if (!toolData.replacements || !Array.isArray(toolData.replacements)) return { result: '❌ Error: "replacements" array required.' };
-
-        if (!(await requestApproval(`Apply ${toolData.replacements.length} replacements in ${toolData.path}`))) {
-          return { result: '❌ File edit denied by user.', abort: true };
+          // NOTE: Auto-diagnostics removed — too slow (5-15s per edit with tsc).
+          // The agent can explicitly call getDiagnostics when needed.
+          return {
+            result: `✅ Applied ${editCount} edit(s) to ${toolData.path}`,
+            data: { path: toolData.path, edits: toolData.edits }
+          };
         }
 
-        try {
-          let content = await fs.readFile(resolvedPath, 'utf-8');
-          let lines = content.split('\n');
+        case 'replace_file_content': {
+          if (!toolData.path) return { result: '❌ Error: Tool "replace_file_content" requires a "path" parameter.' };
+          if (toolData.startLine === undefined || toolData.endLine === undefined) return { result: '❌ Error: "startLine" and "endLine" parameters required.' };
+          if (toolData.targetContent === undefined) return { result: '❌ Error: "targetContent" parameter required.' };
+          if (toolData.replacementContent === undefined) return { result: '❌ Error: "replacementContent" parameter required.' };
 
-          // Process from bottom to top so line numbering isn't messed up for earlier chunks
-          const sortedReplacements = [...toolData.replacements].sort((a: any, b: any) => b.startLine - a.startLine);
+          if (!(await requestApproval(`Replace lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}`))) {
+            return { result: '❌ File edit denied by user.', abort: true };
+          }
 
-          for (const rep of sortedReplacements) {
-            const startIdx = Math.max(0, rep.startLine - 1);
-            const endIdx = Math.min(lines.length, rep.endLine);
-            const chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
-            if (chunkToReplace !== rep.targetContent) {
-              return { result: `❌ replacement at lines ${rep.startLine}-${rep.endLine} failed. Target content did not match exactly: \\n"${chunkToReplace.substring(0, 50)}..." vs "${rep.targetContent.substring(0, 50)}...".\\nAborting all remaining replacements.` };
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+            let lines = content.split('\n');
+            const startIdx = Math.max(0, toolData.startLine - 1);
+            const endIdx = Math.min(lines.length, toolData.endLine);
+
+            let chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
+            if (chunkToReplace !== toolData.targetContent) {
+              return { result: `❌ targetContent does not match exactly the lines from ${toolData.startLine} to ${toolData.endLine} in ${toolData.path}. Make sure whitespace and indentation perfectly match.` };
             }
-            const replacementLines = rep.replacementContent.split('\\n');
-            lines = [
+
+            const newLines = [
               ...lines.slice(0, startIdx),
-              ...replacementLines,
+              toolData.replacementContent,
               ...lines.slice(endIdx)
             ];
+            await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
+            // Notify renderer of file change
+            safeSend('file:changed', { path: resolvedPath, content: newLines.join('\n') });
+
+            // Manifest refresh handled by workspace watcher
+
+            return { result: `✅ Successfully replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
+          } catch (e: any) {
+            return { result: `❌ replace_file_content failed: ${e.message}` };
           }
-          await fs.writeFile(resolvedPath, lines.join('\n'), 'utf-8');
-          // Notify renderer of file change
-          safeSend('file:changed', { path: resolvedPath, content: lines.join('\n') });
-
-          // Manifest refresh handled by workspace watcher
-
-          return { result: `✅ Successfully applied ${toolData.replacements.length} non-adjacent replacements to ${toolData.path}` };
-        } catch (e: any) {
-          return { result: `❌ multi_replace_file_content failed: ${e.message}` };
-        }
-      }
-
-      case 'list_directory': {
-        return { result: await listDirectory(resolvedPath || workspacePath || '.') };
-      }
-
-      case 'search_files': {
-        const searchRoot = workspacePath || '.';
-        return { result: await searchFiles(searchRoot, toolData.pattern, toolData.include) };
-      }
-
-      case 'run_command': {
-        if (!toolData.command) return { result: '❌ Error: Tool "run_command" requires a "command" parameter.' };
-        const command = toolData.command;
-
-        // Intercept "cd ... &&" patterns — they are often signs of the agent ignoring the "cwd" parameter
-        const cdMatch = command.match(/^"?cd\s+([^&"|;]+)"?\s*(&&|;|\|)/i);
-        if (cdMatch) {
-          const targetDir = cdMatch[1].trim();
-          return {
-            result: `❌ ERROR: Use the "cwd" parameter instead of "cd" within the command string.\n` +
-              `Your command tried to 'cd' into: ${targetDir}\n` +
-              `Please resubmit using: {"tool": "run_command", "command": "${command.replace(cdMatch[0], '').trim()}", "cwd": "${targetDir}"}`
-          };
         }
 
-        // Intercept bare "cd" commands
-        if (/^"?cd\s+/i.test(command.trim()) && !command.includes('&&') && !command.includes(';')) {
-          return {
-            result: `❌ ERROR: "cd" has no effect as a standalone command — each run_command spawns a fresh shell.\n` +
-              `Use the "cwd" parameter instead to set the working directory.\n` +
-              `Example: {"tool": "run_command", "command": "npm install", "cwd": "${command.replace(/^"?cd\s+/i, '').replace(/"/g, '').trim()}"}`
-          };
+        case 'multi_replace_file_content': {
+          if (!toolData.path) return { result: '❌ Error: Tool "multi_replace_file_content" requires a "path" parameter.' };
+          if (!toolData.replacements || !Array.isArray(toolData.replacements)) return { result: '❌ Error: "replacements" array required.' };
+
+          if (!(await requestApproval(`Apply ${toolData.replacements.length} replacements in ${toolData.path}`))) {
+            return { result: '❌ File edit denied by user.', abort: true };
+          }
+
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+            let lines = content.split('\n');
+
+            // Process from bottom to top so line numbering isn't messed up for earlier chunks
+            const sortedReplacements = [...toolData.replacements].sort((a: any, b: any) => b.startLine - a.startLine);
+
+            for (const rep of sortedReplacements) {
+              const startIdx = Math.max(0, rep.startLine - 1);
+              const endIdx = Math.min(lines.length, rep.endLine);
+              const chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
+              if (chunkToReplace !== rep.targetContent) {
+                return { result: `❌ replacement at lines ${rep.startLine}-${rep.endLine} failed. Target content did not match exactly: \\n"${chunkToReplace.substring(0, 50)}..." vs "${rep.targetContent.substring(0, 50)}...".\\nAborting all remaining replacements.` };
+              }
+              const replacementLines = rep.replacementContent.split('\\n');
+              lines = [
+                ...lines.slice(0, startIdx),
+                ...replacementLines,
+                ...lines.slice(endIdx)
+              ];
+            }
+            await fs.writeFile(resolvedPath, lines.join('\n'), 'utf-8');
+            // Notify renderer of file change
+            safeSend('file:changed', { path: resolvedPath, content: lines.join('\n') });
+
+            // Manifest refresh handled by workspace watcher
+
+            return { result: `✅ Successfully applied ${toolData.replacements.length} non-adjacent replacements to ${toolData.path}` };
+          } catch (e: any) {
+            return { result: `❌ multi_replace_file_content failed: ${e.message}` };
+          }
         }
 
-        // Autopilot safety: block dangerous/destructive commands
-        if (isAutopilotMode) {
-          const isDangerous = DANGEROUS_COMMAND_PATTERNS.some(p => p.test(command));
-          if (isDangerous) {
-            console.warn(`[AUTOPILOT SAFETY] Blocked destructive command: ${command}`);
+        case 'list_directory': {
+          return { result: await listDirectory(resolvedPath || workspacePath || '.') };
+        }
+
+        case 'search_files': {
+          const searchRoot = workspacePath || '.';
+          return { result: await searchFiles(searchRoot, toolData.pattern, toolData.include) };
+        }
+
+        case 'run_command': {
+          if (!toolData.command) return { result: '❌ Error: Tool "run_command" requires a "command" parameter.' };
+          const command = toolData.command;
+
+          // Intercept "cd ... &&" patterns — they are often signs of the agent ignoring the "cwd" parameter
+          const cdMatch = command.match(/^"?cd\s+([^&"|;]+)"?\s*(&&|;|\|)/i);
+          if (cdMatch) {
+            const targetDir = cdMatch[1].trim();
             return {
-              result: `❌ Autopilot safety blocked this command as potentially destructive: ${command}\nRequires manual approval.`,
-              abort: true
+              result: `❌ ERROR: Use the "cwd" parameter instead of "cd" within the command string.\n` +
+                `Your command tried to 'cd' into: ${targetDir}\n` +
+                `Please resubmit using: {"tool": "run_command", "command": "${command.replace(cdMatch[0], '').trim()}", "cwd": "${targetDir}"}`
             };
           }
+
+          // Intercept bare "cd" commands
+          if (/^"?cd\s+/i.test(command.trim()) && !command.includes('&&') && !command.includes(';')) {
+            return {
+              result: `❌ ERROR: "cd" has no effect as a standalone command — each run_command spawns a fresh shell.\n` +
+                `Use the "cwd" parameter instead to set the working directory.\n` +
+                `Example: {"tool": "run_command", "command": "npm install", "cwd": "${command.replace(/^"?cd\s+/i, '').replace(/"/g, '').trim()}"}`
+            };
+          }
+
+          // Autopilot safety: block dangerous/destructive commands
+          if (isAutopilotMode) {
+            const isDangerous = DANGEROUS_COMMAND_PATTERNS.some(p => p.test(command));
+            if (isDangerous) {
+              console.warn(`[AUTOPILOT SAFETY] Blocked destructive command: ${command}`);
+              return {
+                result: `❌ Autopilot safety blocked this command as potentially destructive: ${command}\nRequires manual approval.`,
+                abort: true
+              };
+            }
+          }
+
+          // Support optional cwd parameter for running commands in subdirectories
+          // Resolve cwd: if agent gives an absolute path, use it directly; otherwise join with workspace
+          const rawCwd = toolData.cwd || '';
+          const isAbsoluteCwd = /^[A-Za-z]:[\\/]/.test(rawCwd) || rawCwd.startsWith('/');
+          const commandCwd = rawCwd
+            ? (isAbsoluteCwd ? rawCwd : join(workspacePath!, rawCwd))
+            : workspacePath;
+
+          // Request approval
+          if (!(await requestApproval(`Execute: ${command}${toolData.cwd ? ` (in ${toolData.cwd})` : ''}`))) {
+            return { result: '❌ Command denied by user.', abort: true };
+          }
+
+          const logs: string[] = [];
+
+          // Check for running instances before starting development servers
+          if (workspacePath && isDevServerCommand(command)) {
+            const processManager = new ProcessManager(workspacePath);
+            const checkResult = await processManager.checkForRunningInstances(workspacePath);
+
+            if (checkResult.hasRunningInstances) {
+              const summary = formatProcessCheckResult(checkResult);
+
+              // Request approval to stop existing processes
+              const stopApproval = await requestApproval(
+                `Found running instances that may conflict:\n${summary}\n\nStop these processes before starting new one?`
+              );
+
+              if (stopApproval) {
+                const stopResult = await processManager.stopProcesses(checkResult.processes);
+                logs.push(`Stopped ${stopResult.stopped} processes, ${stopResult.failed} failed`);
+                if (stopResult.errors.length > 0) {
+                  logs.push(`Errors: ${stopResult.errors.join(', ')}`);
+                }
+              } else {
+                logs.push('⚠️ Warning: Proceeding with existing processes running - may cause port conflicts');
+              }
+            }
+          }
+
+          // Transition to running if approved
+          safeSend('agent:step', {
+            tool: 'run_command',
+            status: 'running',
+            summary: `Executing: ${command}${toolData.cwd ? ` (in ${toolData.cwd})` : ''}`,
+            logs: logs,
+            iteration: iteration
+          });
+
+          try {
+            if (terminalManager) {
+              // Write to all terminals or a 'default' one if we had its actual ID
+              // For now, let's try to find an active one or just the first one
+              const terminals = terminalManager.getAllTerminals();
+              if (terminals.length > 0) {
+                terminalManager.write(terminals[0].id, `\r\n# Executing agent command: ${command}\r\n`);
+              }
+            }
+
+            // Pre-check for directory creation commands (common source of "Operation cancelled" if dir exists)
+            if ((command.includes('create-vite') || command.includes('create vite')) && command.includes('--template')) {
+              // Try to find the project name - usually the first non-flag argument after create-vite
+              const parts = command.split(' ').filter((p: string) => p.trim());
+              let targetDirName = '';
+              for (let i = 0; i < parts.length; i++) {
+                if (parts[i].includes('create-vite') || (parts[i] === 'create' && parts[i + 1] === 'vite')) {
+                  // Skip the next part if it was 'vite'
+                  const nextIdx = parts[i] === 'create' ? i + 2 : i + 1;
+                  // Find next non-flag argument
+                  for (let j = nextIdx; j < parts.length; j++) {
+                    if (!parts[j].startsWith('-')) {
+                      targetDirName = parts[j];
+                      break;
+                    }
+                  }
+                  break;
+                }
+              }
+
+              if (targetDirName) {
+                const fullTargetDir = isAbsolute(targetDirName) ? targetDirName : join(commandCwd!, targetDirName);
+                try {
+                  await fs.access(fullTargetDir);
+                  const files = await fs.readdir(fullTargetDir);
+                  if (files.length > 0) {
+                    logs.push(`âš ï¸ Warning: Target directory is not empty: ${targetDirName}`);
+                    logs.push(`âš ï¸ This will likely cause an "Operation cancelled" error if not handled.`);
+                  }
+                } catch {
+                  // Directory doesn't exist, perfect
+                }
+              }
+            }
+
+            const fullOutput = await new Promise<string>((resolve, reject) => {
+              const isBackground = !!toolData.is_background;
+              const cmdId = toolData.bg_id || Math.random().toString(36).substring(7);
+
+              // Spawn with CI=1 if strictly non-interactive, but if it is background interactive, allow some color and standard mode
+              const spawnEnv = isBackground
+                ? { ...process.env, FORCE_COLOR: '1' }
+                : { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0' };
+
+              const child = spawn(command, [], { cwd: commandCwd, shell: true, stdio: ['pipe', 'pipe', 'pipe'], env: spawnEnv });
+
+              if (!isBackground) {
+                child.stdin?.end();
+              }
+
+              const processState = { process: child, output: '', status: 'running', logs };
+              backgroundProcesses.set(cmdId, processState);
+
+              let isResolved = false;
+
+              if (isBackground) {
+                setTimeout(() => {
+                  if (!isResolved) {
+                    isResolved = true;
+                    resolve(`Command started in background with ID: ${cmdId}. Use command_status to check it, and send_command_input to interact.`);
+                  }
+                }, 1000);
+              }
+
+              const handleData = (data: any) => {
+                const str = data.toString();
+                processState.output += str;
+                if (terminalManager) {
+                  const terminals = terminalManager.getAllTerminals();
+                  if (terminals.length > 0) terminalManager.write(terminals[0].id, str);
+                }
+
+                const lines = str.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
+                if (lines.length > 0) {
+                  logs.push(...lines);
+                  // Only keep last 100 lines for the UI to avoid lag
+                  if (logs.length > 100) logs.splice(0, logs.length - 100);
+
+                  safeSend('agent:step', {
+                    tool: 'run_command',
+                    status: 'running',
+                    summary: `Executing: ${command}`,
+                    logs: [...logs],
+                    iteration: iteration
+                  });
+
+                  // Early success detection: If it looks like a server started, 
+                  // return early so the agent doesn't stall.
+                  const successMarkers = [
+                    'ready in', 'started on', 'local:', 'network:',
+                    'listening on', 'compiled successfully', 'available at',
+                    'vitedevserver', 'server running', 'ready on', 'successfully compiled',
+                    'process started', 'server started', 'starting project at',
+                    'development server', 'starting compiler', 'starting the dev server',
+                    'running on', 'waiting for connections', 'listening at', 'metro waiting'
+                  ];
+                  const lowerStr = str.toLowerCase();
+                  if (successMarkers.some(marker => lowerStr.includes(marker))) {
+                    if (!isResolved) {
+                      setTimeout(() => { // Small delay to catch a few more lines
+                        if (isResolved) return;
+                        isResolved = true;
+                        clearTimeout(timeout);
+                        resolve(`${processState.output.trim()}\n\n[INFO]: Server/Process detected as READY and running in background.`);
+                      }, 1000);
+                    }
+                  }
+                }
+              };
+
+              child.stdout?.on('data', handleData);
+              child.stderr?.on('data', handleData);
+
+              // Safety timeout: Only kick in for truly stuck/infinite processes (10 min).
+              // Normal commands (npm install, npx create, etc.) must complete fully.
+              // Server processes are handled early via successMarkers above.
+              const timeout = setTimeout(() => {
+                if (isResolved) return;
+                isResolved = true;
+                const resultMsg = processState.output.trim() || '(No output yet)';
+                resolve(`${resultMsg}\n\n[INFO]: Command timed out after 10 minutes. It may still be running in background.`);
+              }, 600000); // 10 minute hard safety timeout
+
+              child.on('close', (code) => {
+                processState.status = 'exited';
+                if (isResolved) return;
+                clearTimeout(timeout);
+                isResolved = true;
+
+                const trimmedOutput = processState.output.trim();
+                if (code === 0) {
+                  // Some tools like create-vite exit with 0 even when cancelled/interrupted
+                  if (trimmedOutput.toLowerCase().includes('operation cancelled')) {
+                    resolve(`Error: Operation cancelled\n${trimmedOutput}`);
+                  } else {
+                    resolve(trimmedOutput || '(command completed with no output)');
+                  }
+                } else {
+                  resolve(`Command exited with code ${code}:\n${trimmedOutput}`);
+                }
+              });
+
+              child.on('error', (err) => {
+                processState.status = 'error';
+                if (isResolved) return;
+                clearTimeout(timeout);
+                isResolved = true;
+                reject(err);
+              });
+            });
+
+            if (abortRequested) return { result: '⚠️ Task stopped by user.', abort: true };
+
+            // Refresh manifest after command execution (might have created files/dirs like venv)
+            // Manifest refresh handled by workspace watcher
+
+            return { result: fullOutput, logs };
+          } catch (e: any) {
+            const errOutput = `Command failed: ${e.message}`.trim();
+            if (terminalManager) {
+              const terminals = terminalManager.getAllTerminals();
+              if (terminals.length > 0) terminalManager.write(terminals[0].id, errOutput + '\r\n');
+            }
+            return { result: errOutput, logs };
+          }
         }
 
-        // Support optional cwd parameter for running commands in subdirectories
-        // Resolve cwd: if agent gives an absolute path, use it directly; otherwise join with workspace
-        const rawCwd = toolData.cwd || '';
-        const isAbsoluteCwd = /^[A-Za-z]:[\\/]/.test(rawCwd) || rawCwd.startsWith('/');
-        const commandCwd = rawCwd
-          ? (isAbsoluteCwd ? rawCwd : join(workspacePath!, rawCwd))
-          : workspacePath;
+        case 'check_processes': {
+          if (!workspacePath) return { result: '❌ Error: No workspace opened.' };
 
-        // Request approval
-        if (!(await requestApproval(`Execute: ${command}${toolData.cwd ? ` (in ${toolData.cwd})` : ''}`))) {
-          return { result: '❌ Command denied by user.', abort: true };
-        }
-
-        const logs: string[] = [];
-
-        // Check for running instances before starting development servers
-        if (workspacePath && isDevServerCommand(command)) {
           const processManager = new ProcessManager(workspacePath);
           const checkResult = await processManager.checkForRunningInstances(workspacePath);
 
-          if (checkResult.hasRunningInstances) {
-            const summary = formatProcessCheckResult(checkResult);
+          if (!checkResult.hasRunningInstances) {
+            return { result: '✅ No conflicting processes found.' };
+          }
 
-            // Request approval to stop existing processes
-            const stopApproval = await requestApproval(
-              `Found running instances that may conflict:\n${summary}\n\nStop these processes before starting new one?`
-            );
+          const summary = formatProcessCheckResult(checkResult);
+          return {
+            result: `Found potentially conflicting processes:\n\n${summary}\n\nUse the run_command tool to start your development server - it will automatically handle these conflicts.`
+          };
+        }
 
-            if (stopApproval) {
-              const stopResult = await processManager.stopProcesses(checkResult.processes);
-              logs.push(`Stopped ${stopResult.stopped} processes, ${stopResult.failed} failed`);
-              if (stopResult.errors.length > 0) {
-                logs.push(`Errors: ${stopResult.errors.join(', ')}`);
-              }
+        case 'command_status': {
+          if (!toolData.CommandId) return { result: '❌ Error: Tool "command_status" requires a "CommandId" parameter.' };
+          const processState = backgroundProcesses.get(toolData.CommandId);
+          if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
+
+          let outputStr = processState.output;
+          if (toolData.OutputCharacterCount) {
+            outputStr = outputStr.slice(-Math.max(0, parseInt(toolData.OutputCharacterCount)));
+          }
+
+          return { result: `[Status: ${processState.status}]\n${outputStr}` };
+        }
+
+        case 'send_command_input': {
+          if (!toolData.CommandId) return { result: '❌ Error: Tool "send_command_input" requires a "CommandId" parameter.' };
+          if (!toolData.Input && !toolData.Terminate) return { result: '❌ Error: Requires "Input" or "Terminate".' };
+
+          const processState = backgroundProcesses.get(toolData.CommandId);
+          if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
+
+          if (toolData.Terminate) {
+            processState.process.kill();
+            processState.status = 'terminated';
+            return { result: `✅ Terminated process ${toolData.CommandId}` };
+          }
+
+          try {
+            processState.process.stdin?.write(toolData.Input);
+
+            if (toolData.WaitMs) {
+              await new Promise(r => setTimeout(r, toolData.WaitMs));
             } else {
-              logs.push('⚠️ Warning: Proceeding with existing processes running - may cause port conflicts');
+              await new Promise(r => setTimeout(r, 1000));
             }
+
+            return { result: `✅ Input sent.\n[Status: ${processState.status}]\n${processState.output}` };
+          } catch (err: any) {
+            return { result: `❌ Error sending input: ${err.message}` };
           }
         }
 
-        // Transition to running if approved
-        safeSend('agent:step', {
-          tool: 'run_command',
-          status: 'running',
-          summary: `Executing: ${command}${toolData.cwd ? ` (in ${toolData.cwd})` : ''}`,
-          logs: logs,
-          iteration: iteration
-        });
+        case 'create_directory': {
+          await fs.mkdir(resolvedPath, { recursive: true });
 
-        try {
-          if (terminalManager) {
-            // Write to all terminals or a 'default' one if we had its actual ID
-            // For now, let's try to find an active one or just the first one
-            const terminals = terminalManager.getAllTerminals();
-            if (terminals.length > 0) {
-              terminalManager.write(terminals[0].id, `\r\n# Executing agent command: ${command}\r\n`);
-            }
-          }
+          // Manifest update is handled by the workspace watcher asynchronously
 
-          // Pre-check for directory creation commands (common source of "Operation cancelled" if dir exists)
-          if ((command.includes('create-vite') || command.includes('create vite')) && command.includes('--template')) {
-            // Try to find the project name - usually the first non-flag argument after create-vite
-            const parts = command.split(' ').filter((p: string) => p.trim());
-            let targetDirName = '';
-            for (let i = 0; i < parts.length; i++) {
-              if (parts[i].includes('create-vite') || (parts[i] === 'create' && parts[i + 1] === 'vite')) {
-                // Skip the next part if it was 'vite'
-                const nextIdx = parts[i] === 'create' ? i + 2 : i + 1;
-                // Find next non-flag argument
-                for (let j = nextIdx; j < parts.length; j++) {
-                  if (!parts[j].startsWith('-')) {
-                    targetDirName = parts[j];
-                    break;
-                  }
-                }
-                break;
-              }
-            }
+          return { result: `✅ Created directory: ${toolData.path}` };
+        }
 
-            if (targetDirName) {
-              const fullTargetDir = isAbsolute(targetDirName) ? targetDirName : join(commandCwd!, targetDirName);
-              try {
-                await fs.access(fullTargetDir);
-                const files = await fs.readdir(fullTargetDir);
-                if (files.length > 0) {
-                  logs.push(`âš ï¸ Warning: Target directory is not empty: ${targetDirName}`);
-                  logs.push(`âš ï¸ This will likely cause an "Operation cancelled" error if not handled.`);
-                }
-              } catch {
-                // Directory doesn't exist, perfect
-              }
-            }
-          }
+        case 'delete_file': {
+          // Request approval if not in autopilot mode
+          if (!isAutopilotMode) {
+            const requestId = `delete_file_${++permissionRequestCounter}`;
 
-          const fullOutput = await new Promise<string>((resolve, reject) => {
-            const isBackground = !!toolData.is_background;
-            const cmdId = toolData.bg_id || Math.random().toString(36).substring(7);
-
-            // Spawn with CI=1 if strictly non-interactive, but if it is background interactive, allow some color and standard mode
-            const spawnEnv = isBackground
-              ? { ...process.env, FORCE_COLOR: '1' }
-              : { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0' };
-
-            const child = spawn(command, [], { cwd: commandCwd, shell: true, stdio: ['pipe', 'pipe', 'pipe'], env: spawnEnv });
-
-            if (!isBackground) {
-              child.stdin?.end();
-            }
-
-            const processState = { process: child, output: '', status: 'running', logs };
-            backgroundProcesses.set(cmdId, processState);
-
-            let isResolved = false;
-
-            if (isBackground) {
-              setTimeout(() => {
-                if (!isResolved) {
-                  isResolved = true;
-                  resolve(`Command started in background with ID: ${cmdId}. Use command_status to check it, and send_command_input to interact.`);
-                }
-              }, 1000);
-            }
-
-            const handleData = (data: any) => {
-              const str = data.toString();
-              processState.output += str;
-              if (terminalManager) {
-                const terminals = terminalManager.getAllTerminals();
-                if (terminals.length > 0) terminalManager.write(terminals[0].id, str);
-              }
-
-              const lines = str.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
-              if (lines.length > 0) {
-                logs.push(...lines);
-                // Only keep last 100 lines for the UI to avoid lag
-                if (logs.length > 100) logs.splice(0, logs.length - 100);
-
-                safeSend('agent:step', {
-                  tool: 'run_command',
-                  status: 'running',
-                  summary: `Executing: ${command}`,
-                  logs: [...logs],
-                  iteration: iteration
-                });
-
-                // Early success detection: If it looks like a server started, 
-                // return early so the agent doesn't stall.
-                const successMarkers = [
-                  'ready in', 'started on', 'local:', 'network:',
-                  'listening on', 'compiled successfully', 'available at',
-                  'vitedevserver', 'server running', 'ready on', 'successfully compiled',
-                  'process started', 'server started', 'starting project at',
-                  'development server', 'starting compiler', 'starting the dev server',
-                  'running on', 'waiting for connections', 'listening at', 'metro waiting'
-                ];
-                const lowerStr = str.toLowerCase();
-                if (successMarkers.some(marker => lowerStr.includes(marker))) {
-                  if (!isResolved) {
-                    setTimeout(() => { // Small delay to catch a few more lines
-                      if (isResolved) return;
-                      isResolved = true;
-                      clearTimeout(timeout);
-                      resolve(`${processState.output.trim()}\n\n[INFO]: Server/Process detected as READY and running in background.`);
-                    }, 1000);
-                  }
-                }
-              }
-            };
-
-            child.stdout?.on('data', handleData);
-            child.stderr?.on('data', handleData);
-
-            // Safety timeout: Only kick in for truly stuck/infinite processes (10 min).
-            // Normal commands (npm install, npx create, etc.) must complete fully.
-            // Server processes are handled early via successMarkers above.
-            const timeout = setTimeout(() => {
-              if (isResolved) return;
-              isResolved = true;
-              const resultMsg = processState.output.trim() || '(No output yet)';
-              resolve(`${resultMsg}\n\n[INFO]: Command timed out after 10 minutes. It may still be running in background.`);
-            }, 600000); // 10 minute hard safety timeout
-
-            child.on('close', (code) => {
-              processState.status = 'exited';
-              if (isResolved) return;
-              clearTimeout(timeout);
-              isResolved = true;
-
-              const trimmedOutput = processState.output.trim();
-              if (code === 0) {
-                // Some tools like create-vite exit with 0 even when cancelled/interrupted
-                if (trimmedOutput.toLowerCase().includes('operation cancelled')) {
-                  resolve(`Error: Operation cancelled\n${trimmedOutput}`);
-                } else {
-                  resolve(trimmedOutput || '(command completed with no output)');
-                }
-              } else {
-                resolve(`Command exited with code ${code}:\n${trimmedOutput}`);
-              }
+            safeSend('agent:step', {
+              tool: 'delete_file',
+              status: 'awaiting_permission',
+              summary: `Delete file: ${toolData.path}`,
+              iteration: iteration,
+              requestId: requestId
             });
 
-            child.on('error', (err) => {
-              processState.status = 'error';
-              if (isResolved) return;
-              clearTimeout(timeout);
-              isResolved = true;
-              reject(err);
+            const decision = await new Promise<{ approved: boolean }>(resolve => {
+              pendingPermissionResolvers.set(requestId, resolve);
             });
-          });
+            pendingPermissionResolvers.delete(requestId);
 
-          if (abortRequested) return { result: '⚠️ Task stopped by user.', abort: true };
-
-          // Refresh manifest after command execution (might have created files/dirs like venv)
-          // Manifest refresh handled by workspace watcher
-
-          return { result: fullOutput, logs };
-        } catch (e: any) {
-          const errOutput = `Command failed: ${e.message}`.trim();
-          if (terminalManager) {
-            const terminals = terminalManager.getAllTerminals();
-            if (terminals.length > 0) terminalManager.write(terminals[0].id, errOutput + '\r\n');
-          }
-          return { result: errOutput, logs };
-        }
-      }
-
-      case 'check_processes': {
-        if (!workspacePath) return { result: '❌ Error: No workspace opened.' };
-
-        const processManager = new ProcessManager(workspacePath);
-        const checkResult = await processManager.checkForRunningInstances(workspacePath);
-
-        if (!checkResult.hasRunningInstances) {
-          return { result: '✅ No conflicting processes found.' };
-        }
-
-        const summary = formatProcessCheckResult(checkResult);
-        return {
-          result: `Found potentially conflicting processes:\n\n${summary}\n\nUse the run_command tool to start your development server - it will automatically handle these conflicts.`
-        };
-      }
-
-      case 'command_status': {
-        if (!toolData.CommandId) return { result: '❌ Error: Tool "command_status" requires a "CommandId" parameter.' };
-        const processState = backgroundProcesses.get(toolData.CommandId);
-        if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
-
-        let outputStr = processState.output;
-        if (toolData.OutputCharacterCount) {
-          outputStr = outputStr.slice(-Math.max(0, parseInt(toolData.OutputCharacterCount)));
-        }
-
-        return { result: `[Status: ${processState.status}]\n${outputStr}` };
-      }
-
-      case 'send_command_input': {
-        if (!toolData.CommandId) return { result: '❌ Error: Tool "send_command_input" requires a "CommandId" parameter.' };
-        if (!toolData.Input && !toolData.Terminate) return { result: '❌ Error: Requires "Input" or "Terminate".' };
-
-        const processState = backgroundProcesses.get(toolData.CommandId);
-        if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
-
-        if (toolData.Terminate) {
-          processState.process.kill();
-          processState.status = 'terminated';
-          return { result: `✅ Terminated process ${toolData.CommandId}` };
-        }
-
-        try {
-          processState.process.stdin?.write(toolData.Input);
-
-          if (toolData.WaitMs) {
-            await new Promise(r => setTimeout(r, toolData.WaitMs));
-          } else {
-            await new Promise(r => setTimeout(r, 1000));
+            if (!decision.approved) {
+              return { result: '❌ File deletion denied by user.', abort: true };
+            }
           }
 
-          return { result: `✅ Input sent.\n[Status: ${processState.status}]\n${processState.output}` };
-        } catch (err: any) {
-          return { result: `❌ Error sending input: ${err.message}` };
-        }
-      }
+          await fs.unlink(resolvedPath);
 
-      case 'create_directory': {
-        await fs.mkdir(resolvedPath, { recursive: true });
+          // Manifest update is handled by the workspace watcher asynchronously
 
-        // Manifest update is handled by the workspace watcher asynchronously
-
-        return { result: `✅ Created directory: ${toolData.path}` };
-      }
-
-      case 'delete_file': {
-        // Request approval if not in autopilot mode
-        if (!isAutopilotMode) {
-          const requestId = `delete_file_${++permissionRequestCounter}`;
-
-          safeSend('agent:step', {
-            tool: 'delete_file',
-            status: 'awaiting_permission',
-            summary: `Delete file: ${toolData.path}`,
-            iteration: iteration,
-            requestId: requestId
-          });
-
-          const decision = await new Promise<{ approved: boolean }>(resolve => {
-            pendingPermissionResolvers.set(requestId, resolve);
-          });
-          pendingPermissionResolvers.delete(requestId);
-
-          if (!decision.approved) {
-            return { result: '❌ File deletion denied by user.', abort: true };
-          }
+          return { result: `✅ Deleted: ${toolData.path}` };
         }
 
-        await fs.unlink(resolvedPath);
-
-        // Manifest update is handled by the workspace watcher asynchronously
-
-        return { result: `✅ Deleted: ${toolData.path}` };
-      }
-
-      case 'replace_lines': {
-        const content = await fs.readFile(resolvedPath, 'utf-8');
-        const lines = content.split('\n');
-        const startIdx = Math.max(0, toolData.startLine - 1);
-        const endIdx = Math.min(lines.length, toolData.endLine);
-
-        const newLines = [
-          ...lines.slice(0, startIdx),
-          toolData.content,
-          ...lines.slice(endIdx)
-        ];
-
-        await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
-
-        // Manifest update is handled by the workspace watcher asynchronously
-
-        return { result: `✅ Replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
-      }
-
-      case 'insert_code': {
-        const content = await fs.readFile(resolvedPath, 'utf-8');
-        const lines = content.split('\n');
-        const insertIdx = Math.min(lines.length, toolData.line);
-
-        const newLines = [
-          ...lines.slice(0, insertIdx),
-          toolData.content,
-          ...lines.slice(insertIdx)
-        ];
-
-        await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
-
-        // Manifest update is handled by the workspace watcher asynchronously
-
-        return { result: `✅ Inserted code after line ${toolData.line} in ${toolData.path}` };
-      }
-
-      case 'apply_diffs': {
-        const changes: FileChange[] = toolData.changes.map((c: any) => ({
-          path: resolvePath(c.path, workspacePath),
-          blocks: DiffService.parseDiffBlocks(c.diff)
-        }));
-
-        if (changes.some(c => c.blocks.length === 0)) {
-          return { result: '❌ Failed to parse one or more diff blocks. Ensure you use the exact format:\n<<<< SEARCH\n...\n====\n...\n>>>> REPLACE' };
-        }
-
-        const result = await diffService.applyTransaction(changes);
-        if (result.success) {
-          // Refresh manifest after applying diffs
-          // Manifest refresh handled by workspace watcher
-          return {
-            result: `✅ Successfully applied diffs to ${result.appliedCount} files.`,
-            data: { changes: toolData.changes }
-          };
-        } else {
-          return { result: `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).` };
-        }
-      }
-
-      case 'validate_project': {
-        const cwd = workspacePath || process.cwd();
-        try {
-          // Check for tsconfig.json to see if we should run tsc
-          await fs.access(join(cwd, 'tsconfig.json'));
-          const { stdout } = await execAsync('npx tsc --noEmit', { cwd });
-          return { result: `Validation (tsc) passed! No type errors found.\n${stdout}` };
-        } catch (e: any) {
-          if (e.code === 'ENOENT') return { result: 'No tsconfig.json found. Skipping tsc validation.' };
-          return { result: `Validation failed with errors:\n${e.stdout || ''}\n${e.stderr || ''}` };
-        }
-      }
-
-      case 'run_tests': {
-        const cwd = workspacePath || process.cwd();
-        try {
-          const { stdout } = await execAsync('npm test', { cwd });
-          return { result: `Tests passed!\n${stdout}` };
-        } catch (e: any) {
-          return { result: `Tests failed:\n${e.stdout || ''}\n${e.stderr || ''}` };
-        }
-      }
-
-      case 'get_blast_radius': {
-        if (!graphService) return { result: '❌ Code graph not initialized.' };
-        const resolved = resolvePath(toolData.path, workspacePath);
-        const affected = graphService.getBlastRadius(resolved);
-        if (affected.length === 0) return { result: `No external files depend on ${toolData.path}.` };
-        return { result: `Files affected by changing ${toolData.path}:\n` + affected.map(f => `- ${f.replace(workspacePath || '', '').replace(/^[\\/]/, '')}`).join('\n') };
-      }
-
-      case 'semantic_search': {
-        if (!indexingService) return { result: '❌ Indexing service not initialized.' };
-        const results = await indexingService.search(toolData.query);
-        if (results.length === 0) return { result: 'No relevant code found.' };
-        return { result: results.map((r: any) => `--- ${r.filePath}:${r.startLine}-${r.endLine} (Score: ${r._distance}) ---\n${r.content}`).join('\n\n') };
-      }
-
-      case 'readCode': {
-        if (!toolData.path) return { result: '❌ Error: Tool "readCode" requires a "path" parameter.' };
-        const resolvedPath = resolvePath(toolData.path, workspacePath);
-        const isBinary = await isBinaryFile(resolvedPath);
-        if (isBinary) return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
-
-        try {
+        case 'replace_lines': {
           const content = await fs.readFile(resolvedPath, 'utf-8');
-          // Parse AST to extract structure
           const lines = content.split('\n');
-          const structure: { type: string; name: string; startLine: number; endLine: number }[] = [];
+          const startIdx = Math.max(0, toolData.startLine - 1);
+          const endIdx = Math.min(lines.length, toolData.endLine);
 
-          // Simple AST-like extraction for common patterns
-          const classRegex = /^export?\s*class\s+(\w+)/m;
-          const funcRegex = /^export?\s*(async\s+)?function\s+(\w+)/m;
-          const arrowRegex = /^export?\s*const\s+(\w+)\s*=\s*(async\s+)?\(/m;
+          const newLines = [
+            ...lines.slice(0, startIdx),
+            toolData.content,
+            ...lines.slice(endIdx)
+          ];
 
-          for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const classMatch = line.match(classRegex);
-            if (classMatch) structure.push({ type: 'class', name: classMatch[1], startLine: i + 1, endLine: i + 1 });
+          await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
 
-            const funcMatch = line.match(funcRegex);
-            if (funcMatch) structure.push({ type: 'function', name: funcMatch[2], startLine: i + 1, endLine: i + 1 });
+          // Manifest update is handled by the workspace watcher asynchronously
 
-            const arrowMatch = line.match(arrowRegex);
-            if (arrowMatch) structure.push({ type: 'arrow', name: arrowMatch[1], startLine: i + 1, endLine: i + 1 });
-          }
-
-          return {
-            result: `File: ${toolData.path}\n\n${lines.map((line, i) => `${i + 1}: ${line}`).join('\n')}\n\n--- STRUCTURE ---\n${structure.map(s => `${s.type}: ${s.name} (lines ${s.startLine}-${s.endLine})`).join('\n')}`,
-            data: { structure }
-          };
-        } catch (e: any) {
-          let errorMessage = `❌ Error reading file: ${e.message}\nResolved path: ${resolvedPath}`;
-          const filename = toolData.path.split(/[\\/]/).pop();
-          if (filename && workspacePath) {
-             try {
-               const suggestions = await fuzzyFindFile(workspacePath, filename, 3);
-               if (suggestions && !suggestions.includes('No matches found')) {
-                 errorMessage += `\n\nDid you mean one of these existing files?\n${suggestions}`;
-               }
-             } catch (err) {}
-          }
-          return { result: errorMessage };
+          return { result: `✅ Replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
         }
-      }
 
-      case 'editCode': {
-        if (!toolData.path) return { result: '❌ Error: Tool "editCode" requires a "path" parameter.' };
-        if (!toolData.search) return { result: '❌ Error: Tool "editCode" requires a "search" parameter.' };
-        if (!toolData.replace) return { result: '❌ Error: Tool "editCode" requires a "replace" parameter.' };
+        case 'insert_code': {
+          const content = await fs.readFile(resolvedPath, 'utf-8');
+          const lines = content.split('\n');
+          const insertIdx = Math.min(lines.length, toolData.line);
 
-        const resolvedPath = resolvePath(toolData.path, workspacePath);
-        const isBinary = await isBinaryFile(resolvedPath);
-        if (isBinary) return { result: `❌ Cannot edit ${toolData.path}: This appears to be a binary file.` };
+          const newLines = [
+            ...lines.slice(0, insertIdx),
+            toolData.content,
+            ...lines.slice(insertIdx)
+          ];
 
-        try {
-          let content = await fs.readFile(resolvedPath, 'utf-8');
+          await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
 
-          // Use AST-aware replacement if possible
-          const escapedSearch = toolData.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const searchRegex = new RegExp(`\\b${escapedSearch}\\b`, 'g');
-          if (searchRegex.test(content)) {
-            const newContent = content.replace(searchRegex, toolData.replace);
-            await fs.writeFile(resolvedPath, newContent, 'utf-8');
-            // Notify renderer of file change
-            safeSend('file:changed', { path: resolvedPath, content: newContent });
+          // Manifest update is handled by the workspace watcher asynchronously
+
+          return { result: `✅ Inserted code after line ${toolData.line} in ${toolData.path}` };
+        }
+
+        case 'apply_diffs': {
+          const changes: FileChange[] = toolData.changes.map((c: any) => ({
+            path: resolvePath(c.path, workspacePath),
+            blocks: DiffService.parseDiffBlocks(c.diff)
+          }));
+
+          if (changes.some(c => c.blocks.length === 0)) {
+            return { result: '❌ Failed to parse one or more diff blocks. Ensure you use the exact format:\n<<<< SEARCH\n...\n====\n...\n>>>> REPLACE' };
+          }
+
+          const result = await diffService.applyTransaction(changes);
+          if (result.success) {
+            // Refresh manifest after applying diffs
+            // Manifest refresh handled by workspace watcher
             return {
-              result: `✅ Successfully replaced "${toolData.search}" with "${toolData.replace}" in ${toolData.path}`,
-              data: { path: toolData.path, search: toolData.search, replace: toolData.replace }
+              result: `✅ Successfully applied diffs to ${result.appliedCount} files.`,
+              data: { changes: toolData.changes }
             };
+          } else {
+            return { result: `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).` };
           }
-
-          return { result: `❌ Could not find "${toolData.search}" in ${toolData.path}. Use readCode first to see the exact content.` };
-        } catch (e: any) {
-          return { result: `❌ Error editing file: ${e.message}` };
         }
-      }
 
-      case 'getDiagnostics': {
-        if (!toolData.path) return { result: '❌ Error: Tool "getDiagnostics" requires a "path" parameter.' };
-        return { result: await getDiagnostics(toolData.path, workspacePath) };
-      }
-
-      case 'grepSearch': {
-        if (!toolData.pattern) return { result: '❌ Error: Tool "grepSearch" requires a "pattern" parameter.' };
-        const searchRoot = workspacePath || '.';
-        return { result: await grepSearch(searchRoot, toolData.pattern, toolData.include, toolData.maxResults || 50) };
-      }
-
-      case 'fileSearch': {
-        if (!toolData.query) return { result: '❌ Error: Tool "fileSearch" requires a "query" parameter.' };
-        const searchRoot = workspacePath || '.';
-        return { result: await fuzzyFindFile(searchRoot, toolData.query, toolData.maxResults || 10) };
-      }
-
-      case 'readMultipleFiles': {
-        if (!toolData.files || !Array.isArray(toolData.files) || toolData.files.length === 0) {
-          return { result: '❌ Error: Tool "readMultipleFiles" requires a "files" array parameter.' };
-        }
-        return { result: await readMultipleFiles(toolData.files, workspacePath) };
-      }
-
-      case 'semanticRename': {
-        if (!toolData.path) return { result: '❌ Error: Tool "semanticRename" requires a "path" parameter.' };
-        if (!toolData.oldName) return { result: '❌ Error: Tool "semanticRename" requires an "oldName" parameter.' };
-        if (!toolData.newName) return { result: '❌ Error: Tool "semanticRename" requires a "newName" parameter.' };
-        return { result: await semanticRename(toolData.path, toolData.oldName, toolData.newName, workspacePath) };
-      }
-
-      case 'smartRelocate': {
-        if (!toolData.sourcePath) return { result: '❌ Error: Tool "smartRelocate" requires a "sourcePath" parameter.' };
-        if (!toolData.destinationPath) return { result: '❌ Error: Tool "smartRelocate" requires a "destinationPath" parameter.' };
-        return { result: await smartRelocate(toolData.sourcePath, toolData.destinationPath, workspacePath) };
-      }
-
-      case 'strReplace': {
-        if (!toolData.path) return { result: '❌ Error: Tool "strReplace" requires a "path" parameter.' };
-        if (!toolData.oldStr) return { result: '❌ Error: Tool "strReplace" requires an "oldStr" parameter.' };
-        if (!toolData.newStr) return { result: '❌ Error: Tool "strReplace" requires a "newStr" parameter.' };
-
-        const resolvedPath = resolvePath(toolData.path, workspacePath);
-        const isBinary = await isBinaryFile(resolvedPath);
-        if (isBinary) return { result: `❌ Cannot replace in ${toolData.path}: This appears to be a binary file.` };
-
-        const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
-        const blastWarning = blastRadius.length > 0
-          ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
-          : '';
-
-        try {
-          let content = await fs.readFile(resolvedPath, 'utf-8');
-          if (content.includes(toolData.oldStr)) {
-            const newContent = content.replace(toolData.oldStr, toolData.newStr);
-            await fs.writeFile(resolvedPath, newContent, 'utf-8');
-            // Notify renderer of file change
-            safeSend('file:changed', { path: resolvedPath, content: newContent });
-            
-            // Update graph automatically
-            if (graphService) graphService.updateFile(resolvedPath);
-            
-            return {
-              result: `✅ Successfully replaced in ${toolData.path}${blastWarning}`,
-              data: { path: toolData.path, oldStr: toolData.oldStr, newStr: toolData.newStr }
-            };
+        case 'validate_project': {
+          const cwd = workspacePath || process.cwd();
+          try {
+            // Check for tsconfig.json to see if we should run tsc
+            await fs.access(join(cwd, 'tsconfig.json'));
+            const { stdout } = await execAsync('npx tsc --noEmit', { cwd });
+            return { result: `Validation (tsc) passed! No type errors found.\n${stdout}` };
+          } catch (e: any) {
+            if (e.code === 'ENOENT') return { result: 'No tsconfig.json found. Skipping tsc validation.' };
+            return { result: `Validation failed with errors:\n${e.stdout || ''}\n${e.stderr || ''}` };
           }
-          return { result: `❌ Could not find the exact string in ${toolData.path}. Use read_file first.` };
-        } catch (e: any) {
-          return { result: `❌ Error: ${e.message}` };
-        }
-      }
-
-      case 'invokeSubAgent': {
-        if (!toolData.agentName) return { result: '❌ Error: Tool "invokeSubAgent" requires an "agentName" parameter.' };
-        if (!toolData.task) return { result: '❌ Error: Tool "invokeSubAgent" requires a "task" parameter.' };
-
-        const agentConfig = getSubAgentConfig(toolData.agentName);
-        if (!agentConfig) {
-          const available = listSubAgents().map(a => a.name).join(', ');
-          return { result: `❌ Unknown sub-agent: "${toolData.agentName}". Available: ${available}` };
         }
 
-        console.log(`\n[SUB-AGENT] Invoking ${toolData.agentName} for task: ${toolData.task.substring(0, 100)}...`);
+        case 'run_tests': {
+          const cwd = workspacePath || process.cwd();
+          try {
+            const { stdout } = await execAsync('npm test', { cwd });
+            return { result: `Tests passed!\n${stdout}` };
+          } catch (e: any) {
+            return { result: `Tests failed:\n${e.stdout || ''}\n${e.stderr || ''}` };
+          }
+        }
 
-        // Run the sub-agent with its own system prompt and iteration limit
-        const subAgentResult = await runSubAgent(
-          toolData.task,
-          agentConfig,
-          model || { provider: 'ollama', model: 'qwen2.5-coder:latest' },
-          config || { openaiKey: '', geminiKey: '' },
-          workspacePath,
-          isAutopilotMode
-        );
+        case 'get_blast_radius': {
+          if (!graphService) return { result: '❌ Code graph not initialized.' };
+          const resolved = resolvePath(toolData.path, workspacePath);
+          const affected = graphService.getBlastRadius(resolved);
+          if (affected.length === 0) return { result: `No external files depend on ${toolData.path}.` };
+          return { result: `Files affected by changing ${toolData.path}:\n` + affected.map(f => `- ${f.replace(workspacePath || '', '').replace(/^[\\/]/, '')}`).join('\n') };
+        }
 
-        return { result: subAgentResult.finalResponse };
-      }
+        case 'semantic_search': {
+          if (!indexingService) return { result: '❌ Indexing service not initialized.' };
+          const results = await indexingService.search(toolData.query);
+          if (results.length === 0) return { result: 'No relevant code found.' };
+          return { result: results.map((r: any) => `--- ${r.filePath}:${r.startLine}-${r.endLine} (Score: ${r._distance}) ---\n${r.content}`).join('\n\n') };
+        }
 
-      case 'listSubAgents': {
-        const agents = listSubAgents();
-        const agentList = agents.map(a => `- ${a.name}: ${a.description}`).join('\n');
-        return { result: `Available sub-agents:\n${agentList}` };
-      }
+        case 'readCode': {
+          if (!toolData.path) return { result: '❌ Error: Tool "readCode" requires a "path" parameter.' };
+          const resolvedPath = resolvePath(toolData.path, workspacePath);
+          const isBinary = await isBinaryFile(resolvedPath);
+          if (isBinary) return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
 
-      case 'browser_subagent': {
-        if (!toolData.Task) return { result: '❌ Error: Tool "browser_subagent" requires a "Task" parameter.' };
-        if (!toolData.TaskName) return { result: '❌ Error: Tool "browser_subagent" requires a "TaskName" parameter.' };
+          try {
+            const content = await fs.readFile(resolvedPath, 'utf-8');
+            // Parse AST to extract structure
+            const lines = content.split('\n');
+            const structure: { type: string; name: string; startLine: number; endLine: number }[] = [];
 
-        try {
-          // Offscreen headless execution
-          const browserWin = new BrowserWindow({
-            show: false,
-            webPreferences: {
-              offscreen: true,
-              nodeIntegration: false,
-              contextIsolation: true
+            // Simple AST-like extraction for common patterns
+            const classRegex = /^export?\s*class\s+(\w+)/m;
+            const funcRegex = /^export?\s*(async\s+)?function\s+(\w+)/m;
+            const arrowRegex = /^export?\s*const\s+(\w+)\s*=\s*(async\s+)?\(/m;
+
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              const classMatch = line.match(classRegex);
+              if (classMatch) structure.push({ type: 'class', name: classMatch[1], startLine: i + 1, endLine: i + 1 });
+
+              const funcMatch = line.match(funcRegex);
+              if (funcMatch) structure.push({ type: 'function', name: funcMatch[2], startLine: i + 1, endLine: i + 1 });
+
+              const arrowMatch = line.match(arrowRegex);
+              if (arrowMatch) structure.push({ type: 'arrow', name: arrowMatch[1], startLine: i + 1, endLine: i + 1 });
             }
-          });
 
-          let output = `✅ Browser Subagent Task: ${toolData.TaskName}\nTask received: ${toolData.Task}\n\n`;
-          let targetUrl = "http://localhost:5173"; // default local vite port
+            return {
+              result: `File: ${toolData.path}\n\n${lines.map((line, i) => `${i + 1}: ${line}`).join('\n')}\n\n--- STRUCTURE ---\n${structure.map(s => `${s.type}: ${s.name} (lines ${s.startLine}-${s.endLine})`).join('\n')}`,
+              data: { structure }
+            };
+          } catch (e: any) {
+            let errorMessage = `❌ Error reading file: ${e.message}\nResolved path: ${resolvedPath}`;
+            const filename = toolData.path.split(/[\\/]/).pop();
+            if (filename && workspacePath) {
+              try {
+                const suggestions = await fuzzyFindFile(workspacePath, filename, 3);
+                if (suggestions && !suggestions.includes('No matches found')) {
+                  errorMessage += `\n\nDid you mean one of these existing files?\n${suggestions}`;
+                }
+              } catch (err) { }
+            }
+            return { result: errorMessage };
+          }
+        }
 
-          const urlMatch = toolData.Task.match(/https?:\/\/[^\s"']+/);
-          if (urlMatch) targetUrl = urlMatch[0];
+        case 'editCode': {
+          if (!toolData.path) return { result: '❌ Error: Tool "editCode" requires a "path" parameter.' };
+          if (!toolData.search) return { result: '❌ Error: Tool "editCode" requires a "search" parameter.' };
+          if (!toolData.replace) return { result: '❌ Error: Tool "editCode" requires a "replace" parameter.' };
 
-          await browserWin.loadURL(targetUrl);
-          // Wait briefly for hydration
-          await new Promise(r => setTimeout(r, 2000));
+          const resolvedPath = resolvePath(toolData.path, workspacePath);
+          const isBinary = await isBinaryFile(resolvedPath);
+          if (isBinary) return { result: `❌ Cannot edit ${toolData.path}: This appears to be a binary file.` };
 
-          const domState = await browserWin.webContents.executeJavaScript(`
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+
+            // Use AST-aware replacement if possible
+            const escapedSearch = toolData.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const searchRegex = new RegExp(`\\b${escapedSearch}\\b`, 'g');
+            if (searchRegex.test(content)) {
+              const newContent = content.replace(searchRegex, toolData.replace);
+              await fs.writeFile(resolvedPath, newContent, 'utf-8');
+              // Notify renderer of file change
+              safeSend('file:changed', { path: resolvedPath, content: newContent });
+              return {
+                result: `✅ Successfully replaced "${toolData.search}" with "${toolData.replace}" in ${toolData.path}`,
+                data: { path: toolData.path, search: toolData.search, replace: toolData.replace }
+              };
+            }
+
+            return { result: `❌ Could not find "${toolData.search}" in ${toolData.path}. Use readCode first to see the exact content.` };
+          } catch (e: any) {
+            return { result: `❌ Error editing file: ${e.message}` };
+          }
+        }
+
+        case 'getDiagnostics': {
+          if (!toolData.path) return { result: '❌ Error: Tool "getDiagnostics" requires a "path" parameter.' };
+          return { result: await getDiagnostics(toolData.path, workspacePath) };
+        }
+
+        case 'grepSearch': {
+          if (!toolData.pattern) return { result: '❌ Error: Tool "grepSearch" requires a "pattern" parameter.' };
+          const searchRoot = workspacePath || '.';
+          return { result: await grepSearch(searchRoot, toolData.pattern, toolData.include, toolData.maxResults || 50) };
+        }
+
+        case 'fileSearch': {
+          if (!toolData.query) return { result: '❌ Error: Tool "fileSearch" requires a "query" parameter.' };
+          const searchRoot = workspacePath || '.';
+          return { result: await fuzzyFindFile(searchRoot, toolData.query, toolData.maxResults || 10) };
+        }
+
+        case 'readMultipleFiles': {
+          if (!toolData.files || !Array.isArray(toolData.files) || toolData.files.length === 0) {
+            return { result: '❌ Error: Tool "readMultipleFiles" requires a "files" array parameter.' };
+          }
+          return { result: await readMultipleFiles(toolData.files, workspacePath) };
+        }
+
+        case 'semanticRename': {
+          if (!toolData.path) return { result: '❌ Error: Tool "semanticRename" requires a "path" parameter.' };
+          if (!toolData.oldName) return { result: '❌ Error: Tool "semanticRename" requires an "oldName" parameter.' };
+          if (!toolData.newName) return { result: '❌ Error: Tool "semanticRename" requires a "newName" parameter.' };
+          return { result: await semanticRename(toolData.path, toolData.oldName, toolData.newName, workspacePath) };
+        }
+
+        case 'smartRelocate': {
+          if (!toolData.sourcePath) return { result: '❌ Error: Tool "smartRelocate" requires a "sourcePath" parameter.' };
+          if (!toolData.destinationPath) return { result: '❌ Error: Tool "smartRelocate" requires a "destinationPath" parameter.' };
+          return { result: await smartRelocate(toolData.sourcePath, toolData.destinationPath, workspacePath) };
+        }
+
+        case 'strReplace': {
+          if (!toolData.path) return { result: '❌ Error: Tool "strReplace" requires a "path" parameter.' };
+          if (!toolData.oldStr) return { result: '❌ Error: Tool "strReplace" requires an "oldStr" parameter.' };
+          if (!toolData.newStr) return { result: '❌ Error: Tool "strReplace" requires a "newStr" parameter.' };
+
+          const resolvedPath = resolvePath(toolData.path, workspacePath);
+          const isBinary = await isBinaryFile(resolvedPath);
+          if (isBinary) return { result: `❌ Cannot replace in ${toolData.path}: This appears to be a binary file.` };
+
+          const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
+          const blastWarning = blastRadius.length > 0
+            ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
+            : '';
+
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+            if (content.includes(toolData.oldStr)) {
+              const newContent = content.replace(toolData.oldStr, toolData.newStr);
+              await fs.writeFile(resolvedPath, newContent, 'utf-8');
+              // Notify renderer of file change
+              safeSend('file:changed', { path: resolvedPath, content: newContent });
+
+              // Update graph automatically
+              if (graphService) graphService.updateFile(resolvedPath);
+
+              return {
+                result: `✅ Successfully replaced in ${toolData.path}${blastWarning}`,
+                data: { path: toolData.path, oldStr: toolData.oldStr, newStr: toolData.newStr }
+              };
+            }
+            return { result: `❌ Could not find the exact string in ${toolData.path}. Use read_file first.` };
+          } catch (e: any) {
+            return { result: `❌ Error: ${e.message}` };
+          }
+        }
+
+        case 'invokeSubAgent': {
+          if (!toolData.agentName) return { result: '❌ Error: Tool "invokeSubAgent" requires an "agentName" parameter.' };
+          if (!toolData.task) return { result: '❌ Error: Tool "invokeSubAgent" requires a "task" parameter.' };
+
+          const agentConfig = getSubAgentConfig(toolData.agentName);
+          if (!agentConfig) {
+            const available = listSubAgents().map(a => a.name).join(', ');
+            return { result: `❌ Unknown sub-agent: "${toolData.agentName}". Available: ${available}` };
+          }
+
+          console.log(`\n[SUB-AGENT] Invoking ${toolData.agentName} for task: ${toolData.task.substring(0, 100)}...`);
+
+          // Run the sub-agent with its own system prompt and iteration limit
+          const subAgentResult = await runSubAgent(
+            toolData.task,
+            agentConfig,
+            model || { provider: 'ollama', model: 'qwen2.5-coder:latest' },
+            config || { openaiKey: '', geminiKey: '' },
+            workspacePath,
+            isAutopilotMode
+          );
+
+          return { result: subAgentResult.finalResponse };
+        }
+
+        case 'listSubAgents': {
+          const agents = listSubAgents();
+          const agentList = agents.map(a => `- ${a.name}: ${a.description}`).join('\n');
+          return { result: `Available sub-agents:\n${agentList}` };
+        }
+
+        case 'browser_subagent': {
+          if (!toolData.Task) return { result: '❌ Error: Tool "browser_subagent" requires a "Task" parameter.' };
+          if (!toolData.TaskName) return { result: '❌ Error: Tool "browser_subagent" requires a "TaskName" parameter.' };
+
+          try {
+            // Offscreen headless execution
+            const browserWin = new BrowserWindow({
+              show: false,
+              webPreferences: {
+                offscreen: true,
+                nodeIntegration: false,
+                contextIsolation: true
+              }
+            });
+
+            let output = `✅ Browser Subagent Task: ${toolData.TaskName}\nTask received: ${toolData.Task}\n\n`;
+            let targetUrl = "http://localhost:5173"; // default local vite port
+
+            const urlMatch = toolData.Task.match(/https?:\/\/[^\s"']+/);
+            if (urlMatch) targetUrl = urlMatch[0];
+
+            await browserWin.loadURL(targetUrl);
+            // Wait briefly for hydration
+            await new Promise(r => setTimeout(r, 2000));
+
+            const domState = await browserWin.webContents.executeJavaScript(`
             (() => {
               const text = document.body.innerText.substring(0, 1000);
               const consoleErrors = [];
@@ -2725,269 +2759,269 @@ Searched for: "${edit.search.substring(0, 50)}..."`
             })();
           `);
 
-          output += `[URL Loaded]: ${targetUrl}\n`;
-          output += `[DOM Text Snapshot]:\n${domState.text}\n\n`;
-          output += `[Recording]: Saved session recording as ${toolData.RecordingName || 'browser_session'}.webp in the artifact directory.\n`;
+            output += `[URL Loaded]: ${targetUrl}\n`;
+            output += `[DOM Text Snapshot]:\n${domState.text}\n\n`;
+            output += `[Recording]: Saved session recording as ${toolData.RecordingName || 'browser_session'}.webp in the artifact directory.\n`;
 
-          browserWin.destroy();
-          return { result: output };
-        } catch (e: any) {
-          return { result: `❌ browser_subagent failed: ${e.message}` };
-        }
-      }
-
-      // ====== TIER 1: WEB TOOLS ======
-
-      case 'webFetch': {
-        if (!toolData.url) return { result: '❌ Error: Tool "webFetch" requires a "url" parameter.' };
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15000);
-          const res = await fetch(toolData.url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 WhizCode/1.0' },
-            signal: controller.signal
-          });
-          clearTimeout(timeout);
-          const html = await res.text();
-          // Strip HTML tags, collapse whitespace, limit size
-          const text = html
-            .replace(/<style[\s\S]*?<\/style>/gi, '')
-            .replace(/<script[\s\S]*?<\/script>/gi, '')
-            .replace(/<[^>]+>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 24000);
-          return { result: `📄 Content from ${toolData.url}:\n\n${text}` };
-        } catch (e: any) {
-          return { result: `❌ webFetch failed: ${e.message}` };
-        }
-      }
-
-      case 'web_search':
-      case 'search_web': {
-        const query = toolData.query || toolData.prompt;
-        if (!query) return { result: '❌ Error: Tool "search_web" requires a "query" parameter.' };
-        try {
-          // DuckDuckGo HTML search
-          const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15000);
-          const res = await fetch(searchUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 WhizCode/1.0' },
-            signal: controller.signal
-          });
-          clearTimeout(timeout);
-          const html = await res.text();
-          const resultRegex = /<a class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
-          const results: string[] = [];
-          let m;
-          let count = 0;
-          while ((m = resultRegex.exec(html)) !== null && count < 8) {
-            const url = m[1].replace(/\/\/duckduckgo\.com\/l\/\?uddg=/, '').split('&')[0];
-            const title = m[2].replace(/<[^>]+>/g, '').trim();
-            const snippet = m[3].replace(/<[^>]+>/g, '').trim();
-            results.push(`**${title}**\n${decodeURIComponent(url)}\n${snippet}`);
-            count++;
+            browserWin.destroy();
+            return { result: output };
+          } catch (e: any) {
+            return { result: `❌ browser_subagent failed: ${e.message}` };
           }
-          if (results.length === 0) {
-            const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 8000);
-            return { result: `🔍 Search results for "${query}":\n\n${text}` };
+        }
+
+        // ====== TIER 1: WEB TOOLS ======
+
+        case 'webFetch': {
+          if (!toolData.url) return { result: '❌ Error: Tool "webFetch" requires a "url" parameter.' };
+          try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch(toolData.url, {
+              headers: { 'User-Agent': 'Mozilla/5.0 WhizCode/1.0' },
+              signal: controller.signal
+            });
+            clearTimeout(timeout);
+            const html = await res.text();
+            // Strip HTML tags, collapse whitespace, limit size
+            const text = html
+              .replace(/<style[\s\S]*?<\/style>/gi, '')
+              .replace(/<script[\s\S]*?<\/script>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 24000);
+            return { result: `📄 Content from ${toolData.url}:\n\n${text}` };
+          } catch (e: any) {
+            return { result: `❌ webFetch failed: ${e.message}` };
           }
-          return { result: `🔍 Search results for "${query}":\n\n${results.join('\n\n')}` };
-        } catch (e: any) {
-          return { result: `❌ search_web failed: ${e.message}` };
         }
-      }
 
-      case 'generate_image': {
-        const prompt = toolData.prompt || toolData.description;
-        if (!prompt) return { result: '❌ Error: Tool "generate_image" requires a "prompt" parameter.' };
-        if (!workspacePath) return { result: '❌ Error: No workspace opened.' };
-
-        try {
-          console.log(`[CREATIVE] Generating image for: ${prompt}`);
-          const seed = Math.floor(Math.random() * 1000000);
-          const width = toolData.width || 1024;
-          const height = toolData.height || 1024;
-          const imageUrl = `https://pollinations.ai/p/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
-          
-          const response = await fetch(imageUrl);
-          if (!response.ok) throw new Error(`Generation failed: ${response.statusText}`);
-          
-          const buffer = await response.arrayBuffer();
-          const fileName = `gen_${Date.now()}.png`;
-          const imageDir = path.join(workspacePath, '.whizcode', 'images');
-          await fs.mkdir(imageDir, { recursive: true });
-          const filePath = path.join(imageDir, fileName);
-          await fs.writeFile(filePath, Buffer.from(buffer));
-
-          // Notify UI of new asset
-          safeSend('asset:new', { type: 'image', path: filePath, prompt });
-
-          return { 
-            result: `✅ Image generated successfully and saved to: .whizcode/images/${fileName}\n\n![Generated Image](file://${filePath})\n\nPrompt: ${prompt}`,
-            data: { path: filePath, url: imageUrl }
-          };
-        } catch (e: any) {
-          return { result: `❌ generate_image failed: ${e.message}` };
+        case 'web_search':
+        case 'search_web': {
+          const query = toolData.query || toolData.prompt;
+          if (!query) return { result: '❌ Error: Tool "search_web" requires a "query" parameter.' };
+          try {
+            // DuckDuckGo HTML search
+            const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch(searchUrl, {
+              headers: { 'User-Agent': 'Mozilla/5.0 WhizCode/1.0' },
+              signal: controller.signal
+            });
+            clearTimeout(timeout);
+            const html = await res.text();
+            const resultRegex = /<a class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+            const results: string[] = [];
+            let m;
+            let count = 0;
+            while ((m = resultRegex.exec(html)) !== null && count < 8) {
+              const url = m[1].replace(/\/\/duckduckgo\.com\/l\/\?uddg=/, '').split('&')[0];
+              const title = m[2].replace(/<[^>]+>/g, '').trim();
+              const snippet = m[3].replace(/<[^>]+>/g, '').trim();
+              results.push(`**${title}**\n${decodeURIComponent(url)}\n${snippet}`);
+              count++;
+            }
+            if (results.length === 0) {
+              const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 8000);
+              return { result: `🔍 Search results for "${query}":\n\n${text}` };
+            }
+            return { result: `🔍 Search results for "${query}":\n\n${results.join('\n\n')}` };
+          } catch (e: any) {
+            return { result: `❌ search_web failed: ${e.message}` };
+          }
         }
-      }
 
-      // ====== TIER 1: MCP TOOL CALL ======
+        case 'generate_image': {
+          const prompt = toolData.prompt || toolData.description;
+          if (!prompt) return { result: '❌ Error: Tool "generate_image" requires a "prompt" parameter.' };
+          if (!workspacePath) return { result: '❌ Error: No workspace opened.' };
 
-      case 'mcp_call': {
-        if (!toolData.toolName) return { result: '❌ Error: Tool "mcp_call" requires a "toolName" parameter.' };
-        if (!mcpManager) return { result: '❌ MCP manager not initialized. Open a workspace first.' };
-        const connectedServers = mcpManager.getConnectedServers();
-        if (connectedServers.length === 0) {
-          return { result: '❌ No MCP servers connected. Create .whizcode/mcp-servers.json to configure servers.' };
+          try {
+            console.log(`[CREATIVE] Generating image for: ${prompt}`);
+            const seed = Math.floor(Math.random() * 1000000);
+            const width = toolData.width || 1024;
+            const height = toolData.height || 1024;
+            const imageUrl = `https://pollinations.ai/p/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
+
+            const response = await fetch(imageUrl);
+            if (!response.ok) throw new Error(`Generation failed: ${response.statusText}`);
+
+            const buffer = await response.arrayBuffer();
+            const fileName = `gen_${Date.now()}.png`;
+            const imageDir = path.join(workspacePath, '.whizcode', 'images');
+            await fs.mkdir(imageDir, { recursive: true });
+            const filePath = path.join(imageDir, fileName);
+            await fs.writeFile(filePath, Buffer.from(buffer));
+
+            // Notify UI of new asset
+            safeSend('asset:new', { type: 'image', path: filePath, prompt });
+
+            return {
+              result: `✅ Image generated successfully and saved to: .whizcode/images/${fileName}\n\n![Generated Image](file://${filePath})\n\nPrompt: ${prompt}`,
+              data: { path: filePath, url: imageUrl }
+            };
+          } catch (e: any) {
+            return { result: `❌ generate_image failed: ${e.message}` };
+          }
         }
-        try {
-          const result = await mcpManager.callTool(toolData.toolName, toolData.args || {});
-          return { result: `✅ MCP [${toolData.toolName}]:\n${result}` };
-        } catch (e: any) {
-          return { result: `❌ MCP tool "${toolData.toolName}" failed: ${e.message}` };
+
+        // ====== TIER 1: MCP TOOL CALL ======
+
+        case 'mcp_call': {
+          if (!toolData.toolName) return { result: '❌ Error: Tool "mcp_call" requires a "toolName" parameter.' };
+          if (!mcpManager) return { result: '❌ MCP manager not initialized. Open a workspace first.' };
+          const connectedServers = mcpManager.getConnectedServers();
+          if (connectedServers.length === 0) {
+            return { result: '❌ No MCP servers connected. Create .whizcode/mcp-servers.json to configure servers.' };
+          }
+          try {
+            const result = await mcpManager.callTool(toolData.toolName, toolData.args || {});
+            return { result: `✅ MCP [${toolData.toolName}]:\n${result}` };
+          } catch (e: any) {
+            return { result: `❌ MCP tool "${toolData.toolName}" failed: ${e.message}` };
+          }
         }
-      }
 
-      // ====== TIER 1: SPECS SYSTEM ======
+        // ====== TIER 1: SPECS SYSTEM ======
 
-      case 'createSpec': {
-        if (!toolData.name) return { result: '❌ Error: Tool "createSpec" requires a "name" parameter.' };
-        if (!specsManager) return { result: '❌ Specs manager not initialized. Open a workspace first.' };
-        try {
-          const spec = await specsManager.createSpec(toolData.name, toolData.requirements || '');
-          return { result: `✅ Created spec "${spec.name}" (slug: ${spec.slug})\nPath: ${spec.path}\n\nThe spec has 3 documents:\n- requirements.md — What to build\n- design.md — How to build it\n- tasks.md — Implementation checklist\n\nEdit these files or use updateSpec to fill them in.` };
-        } catch (e: any) {
-          return { result: `❌ createSpec failed: ${e.message}` };
+        case 'createSpec': {
+          if (!toolData.name) return { result: '❌ Error: Tool "createSpec" requires a "name" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized. Open a workspace first.' };
+          try {
+            const spec = await specsManager.createSpec(toolData.name, toolData.requirements || '');
+            return { result: `✅ Created spec "${spec.name}" (slug: ${spec.slug})\nPath: ${spec.path}\n\nThe spec has 3 documents:\n- requirements.md — What to build\n- design.md — How to build it\n- tasks.md — Implementation checklist\n\nEdit these files or use updateSpec to fill them in.` };
+          } catch (e: any) {
+            return { result: `❌ createSpec failed: ${e.message}` };
+          }
         }
-      }
 
-      case 'readSpec': {
-        if (!toolData.slug) return { result: '❌ Error: Tool "readSpec" requires a "slug" parameter.' };
-        if (!specsManager) return { result: '❌ Specs manager not initialized.' };
-        const spec = await specsManager.getSpec(toolData.slug);
-        if (!spec) return { result: `❌ Spec "${toolData.slug}" not found. Use listSpecs to see available specs.` };
-        return { result: specsManager.buildSpecContext(spec) };
-      }
+        case 'readSpec': {
+          if (!toolData.slug) return { result: '❌ Error: Tool "readSpec" requires a "slug" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const spec = await specsManager.getSpec(toolData.slug);
+          if (!spec) return { result: `❌ Spec "${toolData.slug}" not found. Use listSpecs to see available specs.` };
+          return { result: specsManager.buildSpecContext(spec) };
+        }
 
-      case 'updateSpec': {
-        if (!toolData.slug) return { result: '❌ Error: Tool "updateSpec" requires a "slug" parameter.' };
-        if (!toolData.docType) return { result: '❌ Error: Tool "updateSpec" requires a "docType" parameter (requirements|design|tasks).' };
-        if (!toolData.content) return { result: '❌ Error: Tool "updateSpec" requires a "content" parameter.' };
-        if (!specsManager) return { result: '❌ Specs manager not initialized.' };
-        const ok = await specsManager.updateSpecDocument(toolData.slug, toolData.docType, toolData.content);
-        return { result: ok ? `✅ Updated ${toolData.docType}.md for spec "${toolData.slug}"` : `❌ Failed to update spec "${toolData.slug}"` };
-      }
+        case 'updateSpec': {
+          if (!toolData.slug) return { result: '❌ Error: Tool "updateSpec" requires a "slug" parameter.' };
+          if (!toolData.docType) return { result: '❌ Error: Tool "updateSpec" requires a "docType" parameter (requirements|design|tasks).' };
+          if (!toolData.content) return { result: '❌ Error: Tool "updateSpec" requires a "content" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const ok = await specsManager.updateSpecDocument(toolData.slug, toolData.docType, toolData.content);
+          return { result: ok ? `✅ Updated ${toolData.docType}.md for spec "${toolData.slug}"` : `❌ Failed to update spec "${toolData.slug}"` };
+        }
 
-      case 'listSpecs': {
-        if (!specsManager) return { result: '❌ Specs manager not initialized.' };
-        const specs = await specsManager.listSpecs();
-        if (specs.length === 0) return { result: 'No specs found. Use createSpec to create one.' };
-        const list = specs.map(s =>
-          `- **${s.name}** (${s.slug}) — ${s.completedTasks}/${s.totalTasks} tasks (${s.progress}%)`
-        ).join('\n');
-        return { result: `📋 Specs:\n${list}` };
-      }
+        case 'listSpecs': {
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const specs = await specsManager.listSpecs();
+          if (specs.length === 0) return { result: 'No specs found. Use createSpec to create one.' };
+          const list = specs.map(s =>
+            `- **${s.name}** (${s.slug}) — ${s.completedTasks}/${s.totalTasks} tasks (${s.progress}%)`
+          ).join('\n');
+          return { result: `📋 Specs:\n${list}` };
+        }
 
-      case 'completeTask': {
-        if (!toolData.slug) return { result: '❌ Error: Tool "completeTask" requires a "slug" parameter.' };
-        if (!toolData.taskDescription) return { result: '❌ Error: Tool "completeTask" requires a "taskDescription" parameter.' };
-        if (!specsManager) return { result: '❌ Specs manager not initialized.' };
-        const res = await specsManager.completeTask(toolData.slug, toolData.taskDescription);
-        return { result: res.message };
-      }
+        case 'completeTask': {
+          if (!toolData.slug) return { result: '❌ Error: Tool "completeTask" requires a "slug" parameter.' };
+          if (!toolData.taskDescription) return { result: '❌ Error: Tool "completeTask" requires a "taskDescription" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const res = await specsManager.completeTask(toolData.slug, toolData.taskDescription);
+          return { result: res.message };
+        }
 
-      case 'learn_fact': {
-        if (!toolData.topic) return { result: '❌ Error: Tool "learn_fact" requires a "topic" parameter.' };
-        if (!toolData.content) return { result: '❌ Error: Tool "learn_fact" requires a "content" parameter.' };
-        if (knowledgeService) {
+        case 'learn_fact': {
+          if (!toolData.topic) return { result: '❌ Error: Tool "learn_fact" requires a "topic" parameter.' };
+          if (!toolData.content) return { result: '❌ Error: Tool "learn_fact" requires a "content" parameter.' };
+          if (knowledgeService) {
+            await knowledgeService.saveKnowledgeItem({
+              title: toolData.topic,
+              summary: toolData.summary || 'Learned fact',
+              content: toolData.content,
+              tags: toolData.tags || [],
+              relatedFiles: toolData.relatedFiles || []
+            });
+            return { result: `✅ Knowledge Item saved to .knowledge: ${toolData.topic}` };
+          }
+          if (!memoryManager) return { result: '❌ Memory manager not initialized.' };
+          const ok = await memoryManager.learnFact(toolData.topic, toolData.content);
+          return { result: ok ? `✅ Learned fact and saved to .whizcode/memory: ${toolData.topic}` : `❌ Failed to save to memory` };
+        }
+
+        case 'save_knowledge_item': {
+          if (!toolData.title || !toolData.content) return { result: '❌ Error: "title" and "content" are required.' };
+          if (!knowledgeService) return { result: '❌ Knowledge service not initialized.' };
           await knowledgeService.saveKnowledgeItem({
-            title: toolData.topic,
-            summary: toolData.summary || 'Learned fact',
+            title: toolData.title,
+            summary: toolData.summary || '',
             content: toolData.content,
             tags: toolData.tags || [],
             relatedFiles: toolData.relatedFiles || []
           });
-          return { result: `✅ Knowledge Item saved to .knowledge: ${toolData.topic}` };
+          return { result: `✅ Knowledge Item saved: ${toolData.title}` };
         }
-        if (!memoryManager) return { result: '❌ Memory manager not initialized.' };
-        const ok = await memoryManager.learnFact(toolData.topic, toolData.content);
-        return { result: ok ? `✅ Learned fact and saved to .whizcode/memory: ${toolData.topic}` : `❌ Failed to save to memory` };
-      }
 
-      case 'save_knowledge_item': {
-        if (!toolData.title || !toolData.content) return { result: '❌ Error: "title" and "content" are required.' };
-        if (!knowledgeService) return { result: '❌ Knowledge service not initialized.' };
-        await knowledgeService.saveKnowledgeItem({
-          title: toolData.title,
-          summary: toolData.summary || '',
-          content: toolData.content,
-          tags: toolData.tags || [],
-          relatedFiles: toolData.relatedFiles || []
-        });
-        return { result: `✅ Knowledge Item saved: ${toolData.title}` };
-      }
-
-      case 'search_knowledge': {
-        if (!toolData.query) return { result: '❌ Error: "query" is required.' };
-        if (!knowledgeService) return { result: '❌ Knowledge service not initialized.' };
-        const results = await knowledgeService.searchKnowledge(toolData.query, toolData.maxResults || 5);
-        if (results.length === 0) return { result: 'No matching Knowledge Items found.' };
-        return { result: results.map(ki => `--- KI: ${ki.title} ---\nSummary: ${ki.summary}\nTags: ${ki.tags.join(', ')}\n\n${ki.content}`).join('\n\n') };
-      }
-
-      case 'generate_diagram': {
-        if (!toolData.mermaidCode) return { result: '❌ Error: Tool "generate_diagram" requires "mermaidCode".' };
-        if (!toolData.title) return { result: '❌ Error: Tool "generate_diagram" requires a "title".' };
-        
-        try {
-          const artifactName = `${toolData.title.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}.md`;
-          const artifactContent = `# ${toolData.title}\n\n\`\`\`mermaid\n${toolData.mermaidCode}\n\`\`\``;
-          
-          if (!workspacePath) return { result: '❌ No workspace open.' };
-          const artifactDir = path.join(workspacePath, '.whizcode', 'artifacts');
-          await fs.mkdir(artifactDir, { recursive: true });
-          const artifactPath = path.join(artifactDir, artifactName);
-          await fs.writeFile(artifactPath, artifactContent);
-          
-          safeSend('asset:new', { type: 'artifact', path: artifactPath, title: toolData.title });
-          
-          return { 
-            result: `✅ Diagram "${toolData.title}" generated successfully.\n\n[View Diagram](file://${artifactPath})`,
-            data: { path: artifactPath, title: toolData.title } 
-          };
-        } catch (e: any) {
-          return { result: `❌ generate_diagram failed: ${e.message}` };
+        case 'search_knowledge': {
+          if (!toolData.query) return { result: '❌ Error: "query" is required.' };
+          if (!knowledgeService) return { result: '❌ Knowledge service not initialized.' };
+          const results = await knowledgeService.searchKnowledge(toolData.query, toolData.maxResults || 5);
+          if (results.length === 0) return { result: 'No matching Knowledge Items found.' };
+          return { result: results.map(ki => `--- KI: ${ki.title} ---\nSummary: ${ki.summary}\nTags: ${ki.tags.join(', ')}\n\n${ki.content}`).join('\n\n') };
         }
-      }
 
-      default:
-        // ── ENHANCED MCP INTEGRATION ─────────────────────────────────────
-        // Try enhanced MCP system for unknown tools
-        if (enhancedMCPSystem) {
+        case 'generate_diagram': {
+          if (!toolData.mermaidCode) return { result: '❌ Error: Tool "generate_diagram" requires "mermaidCode".' };
+          if (!toolData.title) return { result: '❌ Error: Tool "generate_diagram" requires a "title".' };
+
           try {
-            const availableTools = enhancedMCPSystem.getAvailableTools();
-            const mcpTool = availableTools.find(tool => tool.name === toolData.tool);
+            const artifactName = `${toolData.title.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}.md`;
+            const artifactContent = `# ${toolData.title}\n\n\`\`\`mermaid\n${toolData.mermaidCode}\n\`\`\``;
 
-            if (mcpTool) {
-              console.log(`[MCP] Executing tool ${toolData.tool} via enhanced MCP system`);
-              const mcpResult = await enhancedMCPSystem.executePowerTool(
-                mcpTool.category, // Use category as power ID for now
-                toolData.tool,
-                toolData
-              );
+            if (!workspacePath) return { result: '❌ No workspace open.' };
+            const artifactDir = path.join(workspacePath, '.whizcode', 'artifacts');
+            await fs.mkdir(artifactDir, { recursive: true });
+            const artifactPath = path.join(artifactDir, artifactName);
+            await fs.writeFile(artifactPath, artifactContent);
 
-              toolResult = { result: `✅ MCP [${toolData.tool}]:\n${JSON.stringify(mcpResult, null, 2)}` };
-              break;
-            }
-          } catch (mcpError) {
-            console.warn(`[MCP] Failed to execute ${toolData.tool}:`, mcpError);
-            // Fall through to default error
+            safeSend('asset:new', { type: 'artifact', path: artifactPath, title: toolData.title });
+
+            return {
+              result: `✅ Diagram "${toolData.title}" generated successfully.\n\n[View Diagram](file://${artifactPath})`,
+              data: { path: artifactPath, title: toolData.title }
+            };
+          } catch (e: any) {
+            return { result: `❌ generate_diagram failed: ${e.message}` };
           }
         }
 
-        toolResult = { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, replace_file_content, multi_replace_file_content, edit_file, list_directory, search_files, run_command, command_status, send_command_input, browser_subagent, readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace, invokeSubAgent, listSubAgents, webFetch, web_search, mcp_call, createSpec, readSpec, updateSpec, listSpecs, completeTask, generate_diagram` };
+        default:
+          // ── ENHANCED MCP INTEGRATION ─────────────────────────────────────
+          // Try enhanced MCP system for unknown tools
+          if (enhancedMCPSystem) {
+            try {
+              const availableTools = enhancedMCPSystem.getAvailableTools();
+              const mcpTool = availableTools.find(tool => tool.name === toolData.tool);
+
+              if (mcpTool) {
+                console.log(`[MCP] Executing tool ${toolData.tool} via enhanced MCP system`);
+                const mcpResult = await enhancedMCPSystem.executePowerTool(
+                  mcpTool.category, // Use category as power ID for now
+                  toolData.tool,
+                  toolData
+                );
+
+                toolResult = { result: `✅ MCP [${toolData.tool}]:\n${JSON.stringify(mcpResult, null, 2)}` };
+                break;
+              }
+            } catch (mcpError) {
+              console.warn(`[MCP] Failed to execute ${toolData.tool}:`, mcpError);
+              // Fall through to default error
+            }
+          }
+
+          toolResult = { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, replace_file_content, multi_replace_file_content, edit_file, list_directory, search_files, run_command, command_status, send_command_input, browser_subagent, readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace, invokeSubAgent, listSubAgents, webFetch, web_search, mcp_call, createSpec, readSpec, updateSpec, listSpecs, completeTask, generate_diagram` };
       }
       return toolResult;
     };
@@ -3282,13 +3316,13 @@ async function buildAdaptiveContext(workspacePath: string, userMessage: string):
     try {
       const taskType = classifyUserRequest(userMessage);
       const recommendations = await learningSystem.generateRecommendations(taskType, { workspacePath, userMessage });
-      
+
       if (recommendations.length > 0) {
         context += '\n<learned_patterns_and_recommendations>\n';
         context += recommendations.map(r => `- ${r}`).join('\n');
         context += '\n</learned_patterns_and_recommendations>\n';
       }
-      
+
       const insights = learningSystem.getLearningInsights();
       const topInsights = insights.filter(i => i.confidence > 0.8).slice(0, 3);
       if (topInsights.length > 0) {
@@ -3358,22 +3392,22 @@ async function runAgentLoop(
       const codebaseSize = await estimateCodebaseSize(workspacePath);
       researchFindings = '';
       if (codebaseSize === 'large' || userMessage.toLowerCase().includes('understand this project')) {
-        safeSend('agent:step', { 
-          tool: 'research', 
-          status: 'running', 
-          summary: '🕵️‍♂️ Large codebase detected. Spawning Researcher sub-agent to explore repository structure...' 
+        safeSend('agent:step', {
+          tool: 'research',
+          status: 'running',
+          summary: '🕵️‍♂️ Large codebase detected. Spawning Researcher sub-agent to explore repository structure...'
         });
-        
+
         try {
           const researcherConfig = getSubAgentConfig('context-gatherer')!;
           const researchTask = `Your task is to explore this large repository and build a context map to help solve this user request: "${userMessage}". Identify core architectural patterns, main logic files, and relevant modules. Provide a summary suitable for planning.`;
-          
+
           const researchResult = await runSubAgent(
-            researchTask, 
-            researcherConfig, 
-            model, 
-            config, 
-            workspacePath, 
+            researchTask,
+            researcherConfig,
+            model,
+            config,
+            workspacePath,
             isAutopilotMode
           );
           researchFindings = researchResult.finalResponse;
@@ -3646,7 +3680,7 @@ async function runAgentLoop(
     const extensions = Array.from(new Set(workspaceManifest.match(/\.[0-9a-z]+$/gm) || []))
       .map(ext => ext.substring(1));
     const paths = workspaceManifest.split('\n');
-    
+
     customSuffix = promptManager.getRelevantFragments({
       userMessage,
       workspaceExtensions: extensions,
@@ -3752,7 +3786,7 @@ async function runAgentLoop(
     const eagerToolExecutionPromises: Promise<any>[] = [];
     const eagerToolResults: Map<string, { result: string; logs?: string[] }> = new Map();
     let turnResults: string[] = [];
-    
+
     // ── PROACTIVE SEMANTIC RETRIEVAL ───────────────────────────────────
     if (vectorSearchSystem && workspacePath) {
       try {
@@ -3761,14 +3795,14 @@ async function runAgentLoop(
         if (semanticContext && semanticContext.length > 0) {
           console.log(`[PROACTIVE_RETRIEVAL] Found ${semanticContext.length} relevant chunks`);
           const proactiveContext = `\n\n<proactive_context>\n${semanticContext.map((r: any) => `File: ${r.chunk.filePath}\nContent:\n${r.chunk.content}`).join('\n---\n')}\n</proactive_context>`;
-          
+
           // Inject into the next message pair
           currentMessages[currentMessages.length - 1].content += proactiveContext;
-          
-          safeSend('agent:step', { 
-            tool: 'thinking', 
-            status: 'done', 
-            summary: `Retrieved ${semanticContext.length} relevant code sections...`, 
+
+          safeSend('agent:step', {
+            tool: 'thinking',
+            status: 'done',
+            summary: `Retrieved ${semanticContext.length} relevant code sections...`,
             iteration: iteration + 1,
             requestId: `thinking_${iteration + 1}`
           });
@@ -3790,7 +3824,7 @@ async function runAgentLoop(
         console.log(`[EAGER_TOOL] Detected live tool: ${toolCall.tool}`);
         const toolId = JSON.stringify(toolCall);
         liveTools.push(toolCall);
-        
+
         // Parallelize eager execution for compatible tools (like reads, or distinct file writes)
         const eagerExecution = async () => {
           const stepIndex = steps.length;
@@ -3801,11 +3835,11 @@ async function runAgentLoop(
           try {
             const toolResult = await executeToolCall(toolCall, workspacePath, iteration + 1, isAutopilotMode, selectedModel, config);
             eagerToolResults.set(toolId, toolResult);
-            
+
             const isError = toolResult.abort || (typeof toolResult.result === 'string' && toolResult.result.startsWith('❌'));
             let finalSummary = steps[stepIndex].summary;
             let finalLogs = toolResult.logs || [];
-            
+
             if (isError) {
               finalSummary += ` (Failed)`;
               finalLogs = [toolResult.result, ...finalLogs];
@@ -3996,12 +4030,12 @@ async function runAgentLoop(
           const isError = execution.abort || (typeof execution.result === 'string' && execution.result.startsWith('❌'));
           let finalSummary = steps[stepIndex].summary;
           let finalLogs = execution.logs || [];
-          
+
           if (isError) {
-             finalSummary += ` (Failed)`;
-             finalLogs = [execution.result, ...finalLogs];
+            finalSummary += ` (Failed)`;
+            finalLogs = [execution.result, ...finalLogs];
           } else if (execution.result && execution.result.length > 0 && toolName !== 'read_file' && toolName !== 'readMultipleFiles') {
-             finalSummary += ` (${execution.result.substring(0, 30).replace(/\n/g, ' ')}...)`;
+            finalSummary += ` (${execution.result.substring(0, 30).replace(/\n/g, ' ')}...)`;
           }
 
           steps[stepIndex].status = isError ? 'failed' : 'done';
@@ -4009,7 +4043,7 @@ async function runAgentLoop(
           steps[stepIndex].result = truncatedResult.substring(0, 500);
           steps[stepIndex].logs = finalLogs;
           if (execution.data) steps[stepIndex].data = execution.data;
-          
+
           safeSend('agent:step', { ...steps[stepIndex], status: steps[stepIndex].status });
 
           let enhancedResult = truncatedResult;
@@ -4141,7 +4175,7 @@ let refreshTimeout: NodeJS.Timeout | null = null;
 async function refreshManifest(workspacePath: string) {
   // Debounce to prevent thrashing during large file operations
   if (refreshTimeout) clearTimeout(refreshTimeout);
-  
+
   refreshTimeout = setTimeout(async () => {
     const files = await readDirectoryRecursive(workspacePath, 3000);
     if (files.length > 0) {
@@ -4366,25 +4400,34 @@ ipcMain.handle('dialog:saveFile', async (_event, content) => {
   return result;
 });
 
-ipcMain.handle('fs:readFile', async (_event, filePath) => {
+ipcMain.handle('fs:readFile', async (_event, filePath, workspacePath) => {
   try {
-    return await fs.readFile(filePath, 'utf-8');
+    const validPath = validateFilePath(filePath);
+    if (workspacePath) {
+      validatePathInWorkspace(validPath, workspacePath);
+    }
+    return await fs.readFile(validPath, 'utf-8');
   } catch (e: any) {
-    console.error(e);
+    console.error('[SECURITY] fs:readFile error:', e.message);
     return null;
   }
 });
 
-ipcMain.handle('fs:writeFile', async (_event, filePath, content) => {
+ipcMain.handle('fs:writeFile', async (_event, filePath, content, workspacePath) => {
   try {
-    await fs.writeFile(filePath, content, 'utf-8');
+    const validPath = validateFilePath(filePath);
+    const validContent = validateStringInput(content, 50000000); // 50MB max
+    if (workspacePath) {
+      validatePathInWorkspace(validPath, workspacePath);
+    }
+    await fs.writeFile(validPath, validContent, 'utf-8');
     // Notify renderer that file has changed
-    safeSend('file:changed', { path: filePath, content });
+    safeSend('file:changed', { path: validPath, content: validContent });
     // Clear diagnostics cache for this file
-    diagnosticsService.clearCache(filePath);
+    diagnosticsService.clearCache(validPath);
     return true;
   } catch (e: any) {
-    console.error(e);
+    console.error('[SECURITY] fs:writeFile error:', e.message);
     return false;
   }
 });
@@ -4427,9 +4470,9 @@ ipcMain.handle('azure:generateToken', async (_event, { loginUrl, username, passw
 ipcMain.handle('azure:getTokenStatus', async () => {
   const cached = await loadAzureToken();
   if (cached && cached.expires > Date.now()) {
-    return { 
-      hasToken: true, 
-      expires: cached.expires, 
+    return {
+      hasToken: true,
+      expires: cached.expires,
       timeLeft: Math.round((cached.expires - Date.now()) / (60 * 60 * 1000)) // Hours
     };
   }
@@ -4537,7 +4580,7 @@ ipcMain.handle('ollama:getModels', async () => {
     }
 
     const data: any = await res.json();
-    console.log('[OLLAMA] Response received:', data);
+    /*console.log('[OLLAMA] Response received:', data);*/
 
     if (!data.models || !Array.isArray(data.models)) {
       console.error('[OLLAMA] Invalid response format:', data);
@@ -4832,12 +4875,15 @@ ipcMain.handle('search:files', async (_event, { path, query, include, exclude })
 // ------ GIT HANDLERS ------
 ipcMain.handle('git:status', async (_event, workspacePath) => {
   try {
+    const validPath = validateFilePath(workspacePath);
+    const execFileAsync = promisify(execFile);
+    
     // Check if git is available
-    const { stdout: branchOut } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: workspacePath });
+    const { stdout: branchOut } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: validPath });
     const branch = branchOut.trim();
 
     // Get status
-    const { stdout: statusOut } = await execAsync('git status --porcelain', { cwd: workspacePath });
+    const { stdout: statusOut } = await execFileAsync('git', ['status', '--porcelain'], { cwd: validPath });
     const changes = statusOut.split(/\r?\n/)
       .filter(line => line.trim())
       .map(line => {
@@ -4845,56 +4891,72 @@ ipcMain.handle('git:status', async (_event, workspacePath) => {
         const file = line.substring(3).trim();
         return { file, status: status || 'M' };
       });
-    
+
     console.log(`[GIT_STATUS] Branch: ${branch}, changes: ${changes.length}`);
     return { branch, changes };
   } catch (err) {
-    console.error('Git status error:', err);
+    console.error('[SECURITY] Git status error:', err);
     return null;
   }
 });
 
 ipcMain.handle('git:stage', async (_event, { path, file }) => {
   try {
-    await execAsync(`git add "${file}"`, { cwd: path });
+    const validPath = validateFilePath(path);
+    const validFile = validateFilePath(file);
+    const execFileAsync = promisify(execFile);
+    await execFileAsync('git', ['add', validFile], { cwd: validPath });
     return true;
   } catch (err) {
-    console.error('Git stage error:', err);
+    console.error('[SECURITY] Git stage error:', err);
     return false;
   }
 });
 
 ipcMain.handle('git:commit', async (_event, { path, message }) => {
   try {
-    await execAsync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: path });
+    const validPath = validateFilePath(path);
+    const validMessage = validateStringInput(message, 1000);
+    const execFileAsync = promisify(execFile);
+    await execFileAsync('git', ['commit', '-m', validMessage], { cwd: validPath });
     return true;
   } catch (err) {
-    console.error('Git commit error:', err);
+    console.error('[SECURITY] Git commit error:', err);
     throw err;
   }
 });
 // ------ FILE OPERATION HANDLERS ------
-ipcMain.handle('fs:rename', async (_event, oldPath: string, newPath: string) => {
+ipcMain.handle('fs:rename', async (_event, oldPath: string, newPath: string, workspacePath?: string) => {
   try {
-    await fs.rename(oldPath, newPath);
+    const validOldPath = validateFilePath(oldPath);
+    const validNewPath = validateFilePath(newPath);
+    if (workspacePath) {
+      validatePathInWorkspace(validOldPath, workspacePath);
+      validatePathInWorkspace(validNewPath, workspacePath);
+    }
+    await fs.rename(validOldPath, validNewPath);
     return { success: true };
-  } catch (error) {
-    console.error('Rename failed:', error);
+  } catch (error: any) {
+    console.error('[SECURITY] Rename failed:', error.message);
     throw error;
   }
 });
 
-ipcMain.handle('fs:delete', async (_event, filePath: string) => {
+ipcMain.handle('fs:delete', async (_event, filePath: string, workspacePath?: string) => {
   try {
-    const stats = await fs.stat(filePath);
+    const validPath = validateFilePath(filePath);
+    if (workspacePath) {
+      validatePathInWorkspace(validPath, workspacePath);
+    }
+    const stats = await fs.stat(validPath);
     if (stats.isDirectory()) {
-      await fs.rmdir(filePath, { recursive: true });
+      await fs.rmdir(validPath, { recursive: true });
     } else {
-      await fs.unlink(filePath);
+      await fs.unlink(validPath);
     }
     return { success: true };
-  } catch (error) {
-    console.error('Delete failed:', error);
+  } catch (error: any) {
+    console.error('[SECURITY] Delete failed:', error.message);
     throw error;
   }
 });
@@ -5360,4 +5422,15 @@ ipcMain.handle('cache:cleanup', async () => {
     console.error('Failed to cleanup cache:', error);
     return 0;
   }
+});
+
+// Handle shutdown signals for faster cleanup in dev environment
+process.on('SIGTERM', () => {
+  console.log('[SYSTEM] SIGTERM received, quitting app...');
+  app.quit();
+});
+
+process.on('SIGINT', () => {
+  console.log('[SYSTEM] SIGINT received, quitting app...');
+  app.quit();
 });

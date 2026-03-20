@@ -1,0 +1,79 @@
+GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
+
+Copyright (C) 2026 WhizCode Contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+ADDITIONAL TERMS - COMMONS CLAUSE + TRADEMARK
+
+1. COMMONS CLAUSE - NON-COMMERCIAL USE ONLY
+
+The Software is provided to you by the Licensor under the License, as defined
+below, subject to the following condition.
+
+Without limiting other conditions in the License, the grant of rights under the
+License will not include, and the License does not grant to you, the right to
+Sell the Software.
+
+For purposes of the foregoing, "Sell" means practicing any or all of the rights
+granted to you under the License to provide to third parties, for a fee or other
+consideration (including without limitation fees for hosting or consulting/
+support services related to the Software), a product or service whose value
+derives, entirely or substantially, from the functionality of the Software.
+
+Any license notice or attribution required by the License must also include
+this Commons Clause License Condition notice.
+
+2. TRADEMARK CLAUSE
+
+The name "WhizCode" and the WhizCode logo are trademarks of the WhizCode project.
+
+You may NOT:
+1. Use the name "WhizCode" or any confusingly similar name for derivative works
+2. Use the WhizCode logo or any similar branding for derivative works
+3. Claim that your derivative work is endorsed by or affiliated with WhizCode
+4. Redistribute WhizCode under a different name as if it were your own product
+5. Sell WhizCode or any derivative work
+
+You MAY:
+1. Modify the source code and use it internally
+2. Distribute modified versions for non-commercial purposes (with attribution)
+3. Use WhizCode as a component in your project (with proper attribution)
+4. Create forks for development purposes (clearly labeled as forks)
+5. Contribute improvements back to the project
+
+EXAMPLES OF NOT ALLOWED:
+- Selling WhizCode or modified versions
+- Offering WhizCode as a service for a fee
+- Charging for WhizCode hosting or support
+- Creating "WhizCode Pro" or "WhizCode Enterprise"
+- Rebranding and selling as your own product
+
+EXAMPLES OF ALLOWED:
+- Using WhizCode internally in your company
+- Modifying WhizCode for your own use
+- Sharing modifications with the community
+- Contributing to the WhizCode project
+- Using WhizCode as a free tool for your users
+
+---
+
+For the full AGPL-3.0 license text, see:
+https://www.gnu.org/licenses/agpl-3.0.html
+
+For Commons Clause information, see:
+https://commonsclause.com/

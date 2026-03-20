@@ -13,7 +13,7 @@
 //   ]
 // }
 
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -86,7 +86,7 @@ class MCPClient {
       console.warn(`[MCP:${name}] stderr:`, data.toString().trim());
     });
 
-    this.process.on('exit', (code) => {
+    this.process.on('exit', (code: number | null) => {
       console.log(`[MCP:${name}] process exited with code ${code}`);
       this.ready = false;
       // Reject any pending requests

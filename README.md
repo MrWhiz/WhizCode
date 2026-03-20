@@ -262,6 +262,15 @@ WhizCode/
 │   ├── subAgents.ts       # Sub-agent system
 │   ├── hooksSystem.ts     # Event automation
 │   └── steeringSystem.ts  # Custom instructions
+├── docs/                  # Documentation
+│   ├── SECURITY.md        # Security implementation
+│   ├── BUILD_OPTIMIZATION.md
+│   ├── DISTRIBUTION_GUIDE.md
+│   └── FINAL_SIZE_REPORT.md
+├── scripts/               # Utility scripts
+│   ├── split-installer.ps1
+│   ├── join-installer.ps1
+│   └── analyze-bundle.js
 ├── public/                # Static assets
 └── package.json           # Dependencies & scripts
 ```
@@ -282,6 +291,31 @@ npm run dev
 ```bash
 npm run lint
 ```
+
+### Packaging & Distribution
+
+**Build installer:**
+```bash
+npm run package
+```
+
+**Split for email distribution (20MB limit):**
+```bash
+.\scripts\split-installer.ps1
+```
+
+**Rejoin split parts:**
+```bash
+.\scripts\join-installer.ps1
+```
+
+See [docs/DISTRIBUTION_GUIDE.md](docs/DISTRIBUTION_GUIDE.md) for detailed instructions.
+
+**Build Information:**
+- Installer Size: 99MB (compressed)
+- Installed Size: ~390MB
+- Build Time: ~2-3 minutes
+- Supported OS: Windows 10+
 
 ## 🔍 Troubleshooting
 
@@ -329,7 +363,32 @@ ollama pull <model-name>
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** with **Commons Clause** and **Trademark Protection**.
+
+**What this means:**
+- ✅ **Open Source** - Anyone can view, modify, and use the code
+- ✅ **Community Contributions** - Improvements must be shared back
+- ✅ **Free to Use** - No cost for personal or internal use
+- ❌ **No Commercial Sale** - Cannot sell WhizCode or derivatives
+- ❌ **No Rebranding** - Cannot rebrand as "WhizCode Pro" or similar
+- ❌ **No Proprietary Forks** - Cannot create closed-source versions
+
+**You can:**
+- Use WhizCode for any purpose (free)
+- Modify the code for your needs
+- Use it in your projects (non-commercially)
+- Distribute modified versions (non-commercially, with attribution)
+- Contribute improvements back to the project
+
+**You cannot:**
+- Sell WhizCode or any derivative
+- Offer WhizCode as a paid service
+- Charge for hosting or support
+- Rebrand it as your own product
+- Create proprietary versions
+- Remove attribution or license notices
+
+See [LICENSE](LICENSE) file for full details.
 
 ## 🙏 Acknowledgments
 

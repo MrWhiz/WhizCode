@@ -1,6 +1,8 @@
 import Editor, { useMonaco } from '@monaco-editor/react'
 import { useRef, useEffect, useState } from 'react'
 import type { OpenFileProps } from '../../types'
+import { WhizLogo } from '../Branding/WhizLogo'
+
 
 interface EditorAreaProps {
     openFiles: OpenFileProps[];
@@ -285,9 +287,11 @@ export const EditorArea = ({
             ) : (
                 <div className="welcome-screen">
                     <div className="welcome-content">
-                        <div className="welcome-icon">⚡</div>
-                        <h1 className="welcome-title">WhizCode</h1>
-                        <p className="welcome-subtitle">Ollama-powered code editor</p>
+                <div className="welcome-icon">
+                    <WhizLogo size={32} showText={true} centered={true} style={{ marginBottom: '10px' }} />
+                </div>
+                <h1 className="welcome-title" style={{ display: 'none' }}>WhizCode</h1>
+                <p className="welcome-subtitle">A powerful local-first AI coding IDE</p>
                         <div className="welcome-actions">
                             <button className="welcome-btn" onClick={() => handleMenuAction('open-folder')}>
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>

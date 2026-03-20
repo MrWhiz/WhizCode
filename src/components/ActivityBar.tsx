@@ -1,8 +1,7 @@
 
-
 interface ActivityBarProps {
-    activeView: 'explorer' | 'search' | 'source-control' | 'ai-insights' | null
-    setActiveView: (view: 'explorer' | 'search' | 'source-control' | 'ai-insights' | null) => void
+    activeView: 'explorer' | 'search' | 'source-control' | 'brain-health' | 'specs' | null
+    setActiveView: (view: 'explorer' | 'search' | 'source-control' | 'brain-health' | 'specs' | null) => void
     isChatOpen: boolean
     setIsChatOpen: (open: boolean) => void
 }
@@ -40,12 +39,21 @@ export const ActivityBar = ({ activeView, setActiveView, isChatOpen, setIsChatOp
                 </svg>
             </div>
             <div
-                className={`activity-item ${activeView === 'ai-insights' ? 'active' : ''}`}
-                onClick={() => setActiveView(activeView === 'ai-insights' ? null : 'ai-insights')}
-                title="AI Insights"
+                className={`activity-item ${activeView === 'brain-health' ? 'active' : ''}`}
+                onClick={() => setActiveView(activeView === 'brain-health' ? null : 'brain-health')}
+                title="Brain Health"
             >
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <path d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+            </div>
+            <div
+                className={`activity-item ${activeView === 'specs' ? 'active' : ''}`}
+                onClick={() => setActiveView(activeView === 'specs' ? null : 'specs')}
+                title="Feature Specs"
+            >
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" strokeLinecap="round" strokeLinejoin="round"/>
                 </svg>
             </div>
             <div

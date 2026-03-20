@@ -26,6 +26,9 @@ interface ChatPanelProps {
     handleStop: () => void;
     // Settings props
     settingsProps: any;
+    liveStreamingContent?: string;
+    selectedImages: string[];
+    setSelectedImages: React.Dispatch<React.SetStateAction<string[]>>;
 }
 
 const LogContainer = ({ logs }: { logs: string[] }) => {
@@ -49,9 +52,9 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
     const hasLogs = step.logs && step.logs.length > 0;
     const canOpenLogs = step.tool === 'run_command' || hasLogs;
 
-    // Auto-open logs if the step is a running command
+    // Auto-open logs if the step is a running command or if it fails
     React.useEffect(() => {
-        if (isLive && step.status === 'running' && step.tool === 'run_command') {
+        if ((isLive && step.status === 'running' && step.tool === 'run_command') || step.status === 'failed') {
             setLogsOpen(true);
         }
     }, [isLive, step.status, step.tool]);
@@ -255,19 +258,43 @@ const EditDetails = ({ data }: { data: any }) => {
 const MessageContent = ({ content, role }: { content: string, role: string }) => {
     if (role !== 'assistant') return <>{content}</>;
 
-    // 1. Extract and clean thought blocks
-    const thoughtRegex = /<THOUGHT>([\s\S]*?)<\/THOUGHT>/gi;
-    const thoughts: string[] = [];
-    let match;
+    let thoughts: string[] = [];
     let cleanContent = content;
 
-    while ((match = thoughtRegex.exec(content)) !== null) {
-        thoughts.push(match[1].trim());
+    const extractThoughts = (match: string, p1: string) => {
+        const t = p1.trim();
+        if (t && !thoughts.includes(t)) {
+            thoughts.push(t);
+        }
+        return ''; // Remove the matched thought from the clean content
+    };
+
+    // 1. Extract and perfectly strip CLOSED thought blocks first
+    const closedPatterns = [
+        /<thought>([\s\S]*?)<\/thought>/gi,
+        /<think>([\s\S]*?)<\/think>/gi,
+        /\[thought\]([\s\S]*?)\[\/thought\]/gi,
+        /\[think\]([\s\S]*?)\[\/think\]/gi,
+    ];
+
+    for (const pattern of closedPatterns) {
+        cleanContent = cleanContent.replace(pattern, extractThoughts);
+    }
+
+    // 2. Handle UNCLOSED thought blocks (crucial for streaming)
+    const unclosedPatterns = [
+        /<thought>([\s\S]*?)(?=\n```|\n\{|$)/gi,
+        /<think>([\s\S]*?)(?=\n```|\n\{|$)/gi,
+        /\[thought\]([\s\S]*?)(?=\n```|\n\{|$)/gi,
+        /\[think\]([\s\S]*?)(?=\n```|\n\{|$)/gi,
+    ];
+
+    for (const pattern of unclosedPatterns) {
+        cleanContent = cleanContent.replace(pattern, extractThoughts);
     }
 
     // Normalize and strip all possible internal control tags
-    cleanContent = content
-        .replace(thoughtRegex, '')
+    cleanContent = cleanContent
         .replace(/<IDENTITY>[\s\S]*?<\/IDENTITY>/gi, '')
         .replace(/<PRIME_DIRECTIVE>[\s\S]*?<\/PRIME_DIRECTIVE>/gi, '')
         .replace(/<PLAN>[\s\S]*?<\/PLAN>/gi, '')
@@ -275,31 +302,36 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
         .replace(/<OUTPUT_FORMAT>[\s\S]*?<\/OUTPUT_FORMAT>/gi, '')
         .trim();
 
-    // 2. Hide tool call JSONs - detect if content contains any tool call JSON patterns
-    const toolCallPatterns = [
-        '"tool":',
-        '"file_path":',
-        '"content":',
-        '"function_calls"',
-        '"invoke"',
-        '"antml:function_calls"',
-        '"write_file"',
-        '"read_file"',
-        '"edit_file"',
-        '"run_command"',
-        '"list_directory"'
-    ];
+    // 2. Extract and hide tool call JSONs - only hide the JSON blocks, not the whole message
+    const jsonBlockRegex = /```json\s*\{[\s\S]*?\}\s*```/g;
+    const rawJsonRegex = /(?:\n|^)\s*\{[\s\S]*?\}\s*(?:\n|$)/g;
     
-    const hasToolCallJson = toolCallPatterns.some(pattern => cleanContent.includes(pattern)) ||
-                           (cleanContent.includes('{') && cleanContent.includes('"tool"'));
+    // Support hiding partial/streaming JSON blocks
+    const streamingJsonBlockRegex = /```json\s*\{[\s\S]*$/g;
+    const streamingRawJsonRegex = /(?:\n|^)\s*\{[\s\S]*$/g;
     
-    if (hasToolCallJson) {
-        return null; // Hide tool call JSONs completely
+    // Check if the content is JUST a tool call (no other text or thoughts)
+    const hasToolCallJson = cleanContent.includes('"tool":') || (cleanContent.includes('{') && cleanContent.includes('"tool"'));
+    
+    // Strip JSON blocks (complete and partial)
+    let strippedContent = cleanContent
+        .replace(jsonBlockRegex, '')
+        .replace(rawJsonRegex, '')
+        .replace(streamingJsonBlockRegex, '')
+        .replace(streamingRawJsonRegex, '')
+        .trim();
+    
+    // If there's literally nothing left but a tool call and no thoughts, hide the message body
+    if (hasToolCallJson && !strippedContent && thoughts.length === 0) {
+        return null; 
     }
+
+    // Otherwise, show the stripped content (the explanation/reasoning) but hide the JSON blocks
+    const finalDisplayContent = strippedContent;
 
     // 3. Detect if the remaining content is just a JSON-like completion summary
     let isJsonSummary = false;
-    if (cleanContent.startsWith('{') && cleanContent.endsWith('}') && cleanContent.includes('"status"')) {
+    if (finalDisplayContent.startsWith('{') && finalDisplayContent.endsWith('}') && finalDisplayContent.includes('"status"')) {
         try {
             isJsonSummary = true;
         } catch (e) { }
@@ -308,9 +340,8 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
     return (
         <div className="assistant-content-wrapper">
             {thoughts.length > 0 && (
-                <div className="thought-process" style={{
+                <div className="thought-process glass" style={{
                     marginBottom: '12px',
-                    background: 'rgba(0, 0, 0, 0.2)',
                     borderRadius: '6px',
                     borderLeft: '3px solid var(--accent-primary)',
                     padding: '8px 10px'
@@ -352,7 +383,7 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
                             background: 'rgba(0,0,0,0.3)'
                         }}
                     >
-                        {cleanContent}
+                        {finalDisplayContent}
                     </SyntaxHighlighter>
                 ) : (
                     <ReactMarkdown
@@ -386,7 +417,7 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
                             },
                         }}
                     >
-                        {cleanContent}
+                        {finalDisplayContent}
                     </ReactMarkdown>
                 )}
             </div>
@@ -412,7 +443,10 @@ export const ChatPanel = ({
     messagesEndRef,
     handlePermissionResponse,
     handleStop,
-    settingsProps
+    settingsProps,
+    liveStreamingContent = '',
+    selectedImages,
+    setSelectedImages
 }: ChatPanelProps) => {
     const [respondedSteps, setRespondedSteps] = React.useState<Record<number, boolean>>({});
     const [alwaysRun, setAlwaysRun] = React.useState(false);
@@ -431,6 +465,20 @@ export const ChatPanel = ({
         setRespondedSteps(prev => ({ ...prev, [idx]: true }));
         setCountdown(null);
         handlePermissionResponse(approved, idx);
+    };
+
+    const imageInputRef = React.useRef<HTMLInputElement>(null);
+    const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (!e.target.files) return;
+        Array.from(e.target.files).forEach(file => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const base64 = reader.result as string;
+                setSelectedImages(prev => [...prev, base64]);
+            };
+            reader.readAsDataURL(file);
+        });
+        e.target.value = ''; // Reset for next selection
     };
 
     const pendingPermissionStepIdx = agentSteps.findIndex((s, i) => 
@@ -455,12 +503,54 @@ export const ChatPanel = ({
         }
     }, [countdown, pendingPermissionStepIdx]);
 
+    const getCurrentThought = (content: string) => {
+        if (!content) return null;
+        
+        // Multi-pattern search for thought blocks including common model behaviors
+        const patterns = [
+            /\[THOUGHT\]([\s\S]*?)(?:\[\/THOUGHT\]|```|\{|$)/i,
+            /<think>([\s\S]*?)(?:<\/think>|```|\{|$)/i,
+            /\[REASONING\]([\s\S]*?)(?:\[\/REASONING\]|```|\{|$)/i,
+            /REASONING:([\s\S]*?)(?:```|\{|$)/i,
+            /EXPECTATION:([\s\S]*?)(?:```|\{|$)/i,
+            /THOUGHT:([\s\S]*?)(?:```|\{|$)/i,
+        ];
+
+        // 1. If we have finished a thinking block and started another phase (tool/content), 
+        // we should return null to let the tool status take over.
+        if (content.match(/\[\/THOUGHT\]|<\/think>|\[\/REASONING\]/i) && (content.includes('{') || content.includes('```'))) {
+            return null;
+        }
+
+        for (const pattern of patterns) {
+            const match = content.match(pattern);
+            if (match && match[1].trim()) {
+                const thought = match[1].trim();
+                // Return only the most recent snippet if it's huge, focusing on the latest tokens
+                return thought.length > 200 ? '...' + thought.slice(-200) : thought;
+            }
+        }
+
+        // Broad fallback: if the content is being typed and no tools/code are yet present, it's reasoning
+        if (content.length > 0 && !content.includes('"tool":') && !content.includes('```')) {
+            const cleanText = content.replace(/\[\/THOUGHT\]|<\/think>|\[THOUGHT\]|<think>/gi, '').trim();
+            // Show only the last two sentences or last 15 words to keep it "live"
+            const words = cleanText.split(/\s+/);
+            if (words.length > 15) return '...' + words.slice(-15).join(' ');
+            return cleanText;
+        }
+        
+        return null;
+    };
+
+    const activeThought = getCurrentThought(liveStreamingContent);
+
     if (!isChatOpen) return null;
 
     return (
         <>
             <div className="chat-resize-handle" onMouseDown={handleChatResize} />
-            <div className="chat-panel" style={{ width: `${chatWidth}px` }}>
+            <div className="chat-panel glass" style={{ width: `${chatWidth}px` }}>
                 <div className="chat-panel-header">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-primary)" strokeWidth="2">
@@ -505,6 +595,13 @@ export const ChatPanel = ({
                                 </div>
                             )}
                             <div className="chat-msg-content">
+                                {msg.images && msg.images.length > 0 && (
+                                    <div className="msg-images" style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '8px' }}>
+                                        {msg.images.map((img, i) => (
+                                            <img key={i} src={img} style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.1)' }} />
+                                        ))}
+                                    </div>
+                                )}
                                 <MessageContent content={msg.content} role={msg.role} />
                             </div>
                         </div>
@@ -514,13 +611,21 @@ export const ChatPanel = ({
                         <div className="chat-msg assistant">
                             <div className="chat-msg-sender">WHIZCODE</div>
                             <div className="chat-msg-content">
-                                {agentSteps.length > 0 ? (
+                                {liveStreamingContent && (
+                                    <div className="reasoning-stream" style={{ marginBottom: '12px', opacity: 0.9 }}>
+                                        <MessageContent content={liveStreamingContent} role="assistant" />
+                                    </div>
+                                )}
+                                
+                                {agentSteps.length > 0 && (
                                     <div className="agent-steps live">
                                         {agentSteps.map((step, si) => (
                                             <StepBlock key={si} step={step} getToolIcon={getToolIcon} isLive={true} />
                                         ))}
                                     </div>
-                                ) : (
+                                )}
+
+                                {!liveStreamingContent && agentSteps.length === 0 && (
                                     <div className="thinking-indicator">
                                         <div className="thinking-dot"></div>
                                         <div className="thinking-dot"></div>
@@ -535,27 +640,39 @@ export const ChatPanel = ({
 
                 <div className="chat-input-area">
                     {isLoading && (
-                        <div className="agent-status-indicator" style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '8px',
-                            padding: '8px 12px',
-                            background: 'rgba(0, 122, 204, 0.1)',
-                            border: '1px solid rgba(0, 122, 204, 0.3)',
-                            borderRadius: '4px',
+                        <div className="thought-stream-container" style={{
                             marginBottom: '10px',
-                            fontSize: '11px',
-                            color: 'var(--accent-primary)',
-                            fontWeight: 500
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '4px'
                         }}>
-                            <div className="spinner" style={{ width: 10, height: 10 }}></div>
-                            <span>
-                                {agentSteps.length > 0 && agentSteps[agentSteps.length - 1].status === 'running'
-                                    ? agentSteps[agentSteps.length - 1].summary
-                                    : agentSteps.length > 0 && agentSteps[agentSteps.length - 1].status === 'awaiting_permission'
-                                    ? 'Waiting for permission...'
-                                    : 'Thinking...'}
-                            </span>
+                            <div className="dynamic-thought-bar glass" style={{
+                                border: '1px solid rgba(0, 122, 204, 0.2)',
+                                borderRadius: '4px',
+                                padding: '6px 12px',
+                                fontSize: '11px',
+                                color: 'var(--text-secondary)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px',
+                                minHeight: '28px',
+                                overflow: 'hidden'
+                            }}>
+                                <div className="thought-pulse" style={{
+                                    width: '8px',
+                                    height: '8px',
+                                    borderRadius: '50%',
+                                    background: 'var(--accent-primary)',
+                                    boxShadow: '0 0 8px var(--accent-primary)',
+                                    flexShrink: 0
+                                }}></div>
+                                <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    <span style={{ fontWeight: 600, color: 'var(--accent-primary)', marginRight: '6px' }}>THINKING:</span>
+                                    <span className="live-thought-text" style={{ fontStyle: 'italic', opacity: 1, maxWidth: 'none' }}>
+                                        {activeThought || (agentSteps.length > 0 ? (agentSteps[agentSteps.length - 1].summary || 'Processing...') : (agentSteps.length > 0 && agentSteps[agentSteps.length-1].status === 'awaiting_permission' ? 'Awaiting your permission' : 'Analyzing context...'))}
+                                    </span>
+                                </div>
+                            </div>
                         </div>
                     )}
                     {pendingPermissionStepIdx >= 0 && (
@@ -620,14 +737,50 @@ export const ChatPanel = ({
                             </div>
                         </div>
                     )}
+                    {selectedImages.length > 0 && (
+                        <div className="image-previews" style={{ display: 'flex', gap: '8px', marginBottom: '8px', overflowX: 'auto', padding: '4px' }}>
+                            {selectedImages.map((img, i) => (
+                                <div key={i} style={{ position: 'relative', width: '60px', height: '60px', flexShrink: 0 }}>
+                                    <img src={img} style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '4px', border: '1px solid var(--border-color)' }} />
+                                    <button 
+                                        onClick={() => setSelectedImages(prev => prev.filter((_, idx) => idx !== i))}
+                                        style={{ position: 'absolute', top: '-6px', right: '-6px', background: '#e74c3c', color: 'white', border: 'none', borderRadius: '50%', width: '16px', height: '16px', fontSize: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
+                                    >×</button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
                     <div className="chat-input-box">
+                        <input 
+                            type="file" 
+                            ref={imageInputRef} 
+                            style={{ display: 'none' }} 
+                            accept="image/*" 
+                            multiple 
+                            onChange={handleImageChange} 
+                        />
+                        <button 
+                          onClick={() => imageInputRef.current?.click()}
+                          disabled={isLoading}
+                          style={{
+                              background: 'transparent',
+                              border: 'none',
+                              fontSize: '18px',
+                              cursor: 'pointer',
+                              padding: '0 8px',
+                              opacity: isLoading ? 0.3 : 0.7,
+                              transition: 'opacity 0.2s'
+                          }}
+                          onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
+                          onMouseLeave={(e) => e.currentTarget.style.opacity = '0.7'}
+                        >🖼️</button>
                         <textarea
                             className="chat-input"
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
                             placeholder={workspacePath ? "Ask about your code..." : "Open a folder first..."}
-                            rows={1}
+                            rows={3}
                             disabled={isLoading}
                         />
                         {!isLoading ? (

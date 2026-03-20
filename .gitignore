@@ -7,10 +7,23 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Builds
 node_modules
 dist
 dist-ssr
+dist-electron
+out
+release
+build
+
+# Project Context & Local Config
 *.local
+.whizcode
+.gemini
+
+# Temp / Scratch
+tmp
+temp_test
 
 # Editor directories and files
 .vscode/*

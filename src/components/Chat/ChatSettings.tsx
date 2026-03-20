@@ -23,6 +23,18 @@ interface ChatSettingsProps {
     setBedrockSecretKey: (key: string) => void;
     isAutopilotMode: boolean;
     setIsAutopilotMode: (mode: boolean) => void;
+    azureLoginUrl: string;
+    setAzureLoginUrl: (url: string) => void;
+    azureEmbeddingUrl: string;
+    setAzureEmbeddingUrl: (url: string) => void;
+    azureCompletionUrl: string;
+    setAzureCompletionUrl: (url: string) => void;
+    azureUsername: string;
+    setAzureUsername: (name: string) => void;
+    azurePassword: string;
+    setAzurePassword: (pass: string) => void;
+    azureTokenStatus: { hasToken: boolean; timeLeft?: number; expires?: number };
+    onGenerateAzureToken: () => void;
 }
 
 export const ChatSettings = ({
@@ -47,14 +59,27 @@ export const ChatSettings = ({
     bedrockSecretKey,
     setBedrockSecretKey,
     isAutopilotMode,
-    setIsAutopilotMode
+    setIsAutopilotMode,
+    azureLoginUrl,
+    setAzureLoginUrl,
+    azureEmbeddingUrl,
+    setAzureEmbeddingUrl,
+    azureCompletionUrl,
+    setAzureCompletionUrl,
+    azureUsername,
+    setAzureUsername,
+    azurePassword,
+    setAzurePassword,
+    azureTokenStatus,
+    onGenerateAzureToken
 }: ChatSettingsProps) => {
 
     const providers = [
         { id: 'ollama' as const, name: 'Ollama', icon: '🦙', description: 'Local models' },
         { id: 'openai' as const, name: 'OpenAI', icon: '🤖', description: 'GPT models' },
         { id: 'gemini' as const, name: 'Gemini', icon: '✨', description: 'Google AI' },
-        { id: 'bedrock' as const, name: 'AWS Bedrock', icon: '☁️', description: 'AWS managed models' }
+        { id: 'bedrock' as const, name: 'AWS Bedrock', icon: '☁️', description: 'AWS managed models' },
+        { id: 'azure-gateway' as const, name: 'Azure Gateway', icon: '🌐', description: 'Enterprise LLM Gateway' }
     ];
 
     const openaiModels = [
@@ -107,6 +132,8 @@ export const ChatSettings = ({
                 return geminiModels;
             case 'bedrock':
                 return bedrockModels;
+            case 'azure-gateway':
+                return ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo'];
             default:
                 return [];
         }
@@ -437,6 +464,101 @@ export const ChatSettings = ({
                             </div>
                             <div className="settings-field-description">
                                 Configure AWS credentials with Bedrock access. See <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_service-with-iam.html" target="_blank" rel="noopener noreferrer">AWS documentation</a>
+                            </div>
+                            <div className="settings-separator" />
+                        </>
+                    )}
+                    
+                    {modelProvider === 'azure-gateway' && (
+                        <>
+                            <div className="settings-section-title">Azure Gateway Configuration</div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Login URL</label>
+                                <input
+                                    type="text"
+                                    className="settings-input"
+                                    value={azureLoginUrl}
+                                    onChange={e => setAzureLoginUrl(e.target.value)}
+                                    placeholder="https://..."
+                                />
+                            </div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Embedding URL</label>
+                                <input
+                                    type="text"
+                                    className="settings-input"
+                                    value={azureEmbeddingUrl}
+                                    onChange={e => setAzureEmbeddingUrl(e.target.value)}
+                                    placeholder="https://..."
+                                />
+                            </div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Chat Completion URL</label>
+                                <input
+                                    type="text"
+                                    className="settings-input"
+                                    value={azureCompletionUrl}
+                                    onChange={e => setAzureCompletionUrl(e.target.value)}
+                                    placeholder="https://..."
+                                />
+                            </div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Username</label>
+                                <input
+                                    type="text"
+                                    className="settings-input"
+                                    value={azureUsername}
+                                    onChange={e => setAzureUsername(e.target.value)}
+                                    placeholder="Domain\Username"
+                                />
+                            </div>
+                            <div className="settings-field">
+                                <label className="settings-field-label">Password</label>
+                                <input
+                                    type="password"
+                                    className="settings-input"
+                                    value={azurePassword}
+                                    onChange={e => setAzurePassword(e.target.value)}
+                                    placeholder="..."
+                                />
+                            </div>
+                            <div className="settings-field">
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+                                    <button 
+                                        className={`settings-btn ${!azureLoginUrl || !azureUsername || !azurePassword ? 'disabled' : ''}`}
+                                        onClick={onGenerateAzureToken}
+                                        disabled={!azureLoginUrl || !azureUsername || !azurePassword}
+                                        style={{
+                                            padding: '8px 16px',
+                                            borderRadius: '6px',
+                                            background: 'var(--accent-primary)',
+                                            color: 'white',
+                                            border: 'none',
+                                            cursor: 'pointer',
+                                            fontWeight: 600,
+                                            fontSize: '11px',
+                                            letterSpacing: '0.5px'
+                                        }}
+                                    >
+                                        GENERATE SESSION TOKEN
+                                    </button>
+
+                                    <div className="azure-token-status">
+                                        {azureTokenStatus.hasToken ? (
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '11px' }}>
+                                                <span style={{ color: '#89d185' }}>● Valid</span>
+                                                <span style={{ opacity: 0.6 }}>(Exp: ~{azureTokenStatus.timeLeft}h)</span>
+                                            </div>
+                                        ) : (
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '11px', opacity: 0.7 }}>
+                                                <span style={{ color: '#cca700' }}>● No Active Token</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="settings-field-description">
+                                The login URL will be used to generate a session token valid for ~24 hours. The token is stored securely for all future requests.
                             </div>
                             <div className="settings-separator" />
                         </>

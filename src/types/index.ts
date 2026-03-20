@@ -1,6 +1,6 @@
 export interface AgentStep {
     tool: string;
-    status: 'running' | 'done' | 'error' | 'awaiting_permission';
+    status: 'running' | 'done' | 'error' | 'failed' | 'awaiting_permission';
     summary: string;
     result?: string;
     iteration?: number;
@@ -15,6 +15,7 @@ export interface Message {
     role: 'user' | 'assistant';
     content: string;
     steps?: AgentStep[];
+    images?: string[];
 }
 
 export interface FileEntry {
@@ -29,7 +30,7 @@ export interface OpenFileProps {
     content: string;
 }
 
-export type AIProvider = 'ollama' | 'openai' | 'gemini' | 'bedrock';
+export type AIProvider = 'ollama' | 'openai' | 'gemini' | 'bedrock' | 'azure-gateway';
 
 export type TerminalType = 'bash' | 'cmd' | 'powershell' | 'zsh' | 'sh';
 

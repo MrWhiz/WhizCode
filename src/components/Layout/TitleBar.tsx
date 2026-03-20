@@ -1,3 +1,5 @@
+import { WhizLogo } from '../Branding/WhizLogo';
+
 interface MenuItem {
     label?: string;
     action?: string;
@@ -9,6 +11,7 @@ interface Menu {
     name: string;
     items: MenuItem[];
 }
+
 
 interface TitleBarProps {
     menus: Menu[];
@@ -28,9 +31,7 @@ export const TitleBar = ({
     return (
         <div className="title-bar">
             <div className="title-bar-left">
-                <svg viewBox="0 0 100 100" width="16" height="16" style={{ margin: '0 10px', fill: 'var(--accent-primary)', WebkitAppRegion: 'no-drag' } as any}>
-                    <path d="M20,20 L80,20 L80,80 L20,80 Z" />
-                </svg>
+                <WhizLogo size={32} />
                 <div className="menu-bar">
                     {menus.map(menu => (
                         <div

@@ -21,7 +21,7 @@ interface TitleBarProps {
 
 export const TitleBar = ({ menus, activeMenu, toggleMenu, handleMenuHover, handleMenuAction }: TitleBarProps) => {
     return (
-        <div className="title-bar">
+        <div className="title-bar glass">
             <div className="title-bar-left">
                 <div className="logo">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#007acc" strokeWidth="2">

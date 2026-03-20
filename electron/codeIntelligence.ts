@@ -68,6 +68,7 @@ export class CodeIntelligence {
   private relationshipGraph: Map<string, CodeRelationship[]> = new Map();
   private patternLibrary: CodePattern[] = [];
   private workspaceContext: Map<string, SemanticContext> = new Map();
+  private fileCache: Map<string, string> = new Map();
 
   constructor() {
     this.initializePatternLibrary();
@@ -124,6 +125,9 @@ export class CodeIntelligence {
     };
 
     try {
+      // Clear cache for new analysis
+      this.fileCache.clear();
+      
       await this.indexWorkspaceSymbols(workspacePath, context);
       await this.analyzeRelationships(workspacePath, context);
       await this.detectPatterns(workspacePath, context);
@@ -140,18 +144,26 @@ export class CodeIntelligence {
   private async indexWorkspaceSymbols(workspacePath: string, context: SemanticContext) {
     const files = await this.findCodeFiles(workspacePath);
     
-    for (const file of files) {
-      try {
-        const content = fs.readFileSync(file, 'utf8');
-        const symbols = await this.extractSymbols(file, content);
-        
-        symbols.forEach(symbol => {
-          context.symbols.set(`${file}:${symbol.name}`, symbol);
-          this.symbolIndex.set(`${file}:${symbol.name}`, symbol);
-        });
-      } catch (error) {
-        console.warn(`Failed to index symbols in ${file}:`, error);
-      }
+    // Process files in parallel chunks to avoid overwhelming the system
+    const CHUNK_SIZE = 20;
+    for (let i = 0; i < files.length; i += CHUNK_SIZE) {
+      const chunk = files.slice(i, i + CHUNK_SIZE);
+      await Promise.all(chunk.map(async (file) => {
+        try {
+          // Use async reading
+          const content = await fs.promises.readFile(file, 'utf8');
+          this.fileCache.set(file, content); // Cache for later stages
+          
+          const symbols = await this.extractSymbols(file, content);
+          
+          symbols.forEach(symbol => {
+            context.symbols.set(`${file}:${symbol.name}`, symbol);
+            this.symbolIndex.set(`${file}:${symbol.name}`, symbol);
+          });
+        } catch (error) {
+          console.warn(`Failed to index symbols in ${file}:`, error);
+        }
+      }));
     }
   }
 
@@ -326,7 +338,8 @@ export class CodeIntelligence {
     context.symbols.forEach((otherSymbol, key) => {
       if (otherSymbol.location.file !== symbol.location.file) {
         try {
-          const content = fs.readFileSync(otherSymbol.location.file, 'utf8');
+          // Use cache if available
+          const content = this.fileCache.get(otherSymbol.location.file) || fs.readFileSync(otherSymbol.location.file, 'utf8');
           const escapedSymbolName = symbol.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           const regex = new RegExp(`\\b${escapedSymbolName}\\b`, 'g');
           let match;
@@ -361,7 +374,7 @@ export class CodeIntelligence {
     
     for (const file of files) {
       try {
-        const content = fs.readFileSync(file, 'utf8');
+        const content = this.fileCache.get(file) || fs.readFileSync(file, 'utf8');
         
         for (const pattern of this.patternLibrary) {
           const matches = content.match(pattern.pattern);
@@ -400,7 +413,7 @@ export class CodeIntelligence {
     
     for (const file of files) {
       try {
-        const content = fs.readFileSync(file, 'utf8');
+        const content = this.fileCache.get(file) || fs.readFileSync(file, 'utf8');
         const lines = content.split('\n').length;
         totalLines += lines;
         
@@ -596,7 +609,7 @@ export class CodeIntelligence {
     for (const symbol of fileSymbols) {
       if (symbol.type === 'function') {
         try {
-          const content = fs.readFileSync(filePath, 'utf8');
+          const content = this.fileCache.get(filePath) || fs.readFileSync(filePath, 'utf8');
           const complexity = this.calculateCyclomaticComplexity(content);
           
           if (complexity > 10) {

@@ -8,7 +8,8 @@
     "dev": "cross-env NODE_NO_WARNINGS=1 vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "package": "npm run build && electron-builder build --windows"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.705.0",
@@ -46,6 +47,7 @@
     "@vitejs/plugin-react": "^5.1.1",
     "cross-env": "^10.1.0",
     "electron": "^40.6.1",
+    "electron-builder": "^26.8.1",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
@@ -55,5 +57,46 @@
     "vite": "^7.3.1",
     "vite-plugin-electron": "^0.29.0",
     "vite-plugin-electron-renderer": "^0.14.6"
+  },
+  "build": {
+    "appId": "com.mrwhiz.whizcode",
+    "productName": "WhizCode",
+    "copyright": "Copyright © 2026 MrWhiz",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release/${version}"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "public/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "public/icon.ico",
+      "uninstallerIcon": "public/icon.ico",
+      "installerHeaderIcon": "public/icon.ico"
+    },
+    "npmRebuild": true,
+    "asar": true,
+    "extraResources": [
+      {
+        "from": "node_modules/node-pty/build/Release",
+        "to": "build/Release",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ]
   }
 }

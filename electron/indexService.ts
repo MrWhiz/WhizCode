@@ -42,19 +42,30 @@ export class IndexingService {
     private db: any = null;
     private table: any = null;
     private parser: any;
-    private voyage: VoyageAIClient;
+    private voyage: VoyageAIClient | null = null;
+    private azureConfig: { loginUrl: string, embeddingUrl: string, username: string, password: string } | null = null;
+    private getAzureToken: ((loginUrl: string, username: string, password: string) => Promise<string>) | null = null;
     private watcher: chokidar.FSWatcher | null = null;
     private workspacePath: string | null = null;
     private fileHashes: Map<string, string> = new Map(); // Merkle-like watcher
     private onChange: ((path: string) => void) | null = null;
 
-    constructor(apiKey: string, onChange?: (path: string) => void) {
+    constructor(
+        config: { voyageKey?: string, azure?: { loginUrl: string, embeddingUrl: string, username: string, password: string }, getToken?: (loginUrl: string, username: string, password: string) => Promise<string> }, 
+        onChange?: (path: string) => void
+    ) {
         this.parser = new treeSitter();
         this.onChange = onChange || null;
         // Default to TypeScript TSX for most React/TS projects
         this.parser.setLanguage(treeSitterTypeScript.tsx);
 
-        this.voyage = new VoyageAIClient({ apiKey });
+        if (config.voyageKey) {
+            this.voyage = new VoyageAIClient({ apiKey: config.voyageKey });
+        }
+        if (config.azure) {
+            this.azureConfig = config.azure;
+            this.getAzureToken = config.getToken || null;
+        }
     }
 
     async initialize(workspacePath: string) {
@@ -240,22 +251,71 @@ export class IndexingService {
     }
 
     private async generateEmbeddings(texts: string[]): Promise<number[][]> {
-        const response = await this.voyage.embed({
-            input: texts,
-            model: 'voyage-code-2'
-        });
-        return response.data?.map((d: any) => d.embedding).filter((e: any): e is number[] => !!e) || [];
+        if (this.azureConfig && this.getAzureToken && this.azureConfig.embeddingUrl) {
+            try {
+                const token = await this.getAzureToken(this.azureConfig.loginUrl, this.azureConfig.username, this.azureConfig.password);
+                const response = await fetch(this.azureConfig.embeddingUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ input: texts })
+                });
+                
+                if (response.ok) {
+                    const data: any = await response.json();
+                    return data.data?.map((d: any) => d.embedding).filter((e: any): e is number[] => !!e) || [];
+                }
+            } catch (e) {
+                console.error('[AZURE_EMBEDDING] Failed:', e);
+            }
+        }
+
+        if (this.voyage) {
+            const response = await this.voyage.embed({
+                input: texts,
+                model: 'voyage-code-2'
+            });
+            return response.data?.map((d: any) => d.embedding).filter((e: any): e is number[] => !!e) || [];
+        }
+
+        return [];
     }
 
     async search(query: string, limit = 5) {
         if (!this.table) return [];
 
-        const queryEmbeddingResponse = await this.voyage.embed({
-            input: [query],
-            model: 'voyage-code-2'
-        });
+        let queryEmbedding: number[] | null = null;
 
-        const queryEmbedding = queryEmbeddingResponse.data?.[0].embedding;
+        if (this.azureConfig && this.getAzureToken && this.azureConfig.embeddingUrl) {
+            try {
+                const token = await this.getAzureToken(this.azureConfig.loginUrl, this.azureConfig.username, this.azureConfig.password);
+                const response = await fetch(this.azureConfig.embeddingUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ input: [query] })
+                });
+                if (response.ok) {
+                    const data: any = await response.json();
+                    queryEmbedding = data.data?.[0]?.embedding || null;
+                }
+            } catch (e) {
+                console.error('[AZURE_SEARCH_EMBEDDING] Failed:', e);
+            }
+        }
+
+        if (!queryEmbedding && this.voyage) {
+            const queryEmbeddingResponse = await this.voyage.embed({
+                input: [query],
+                model: 'voyage-code-2'
+            });
+            queryEmbedding = queryEmbeddingResponse.data?.[0].embedding || null;
+        }
+
         if (!queryEmbedding) return [];
 
         const results = await this.table

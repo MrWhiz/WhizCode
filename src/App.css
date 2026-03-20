@@ -2092,3 +2092,86 @@ body {
 .empty-state { text-align: center; padding: 30px; opacity: 0.6; }
 .empty-state .hint { font-size: 11px; font-style: italic; margin-top: 8px; }
 .loading { text-align: center; padding: 20px; opacity: 0.6; font-size: 12px; }
+.system-performance {
+  margin-top: auto;
+  padding: 12px 16px;
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  font-size: 11px;
+}
+
+.system-performance-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--text-tertiary);
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.system-performance-header svg {
+  stroke: var(--text-tertiary);
+}
+
+.system-stats-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.system-stat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stat-main {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.stat-label {
+  color: var(--text-secondary);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 70%;
+}
+
+.stat-value {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.stat-bar-container {
+  height: 4px;
+  background-color: var(--bg-tertiary);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.stat-bar {
+  height: 100%;
+  transition: width 0.5s ease;
+}
+
+.stat-extra {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+}
+
+.stat-temp {
+  color: #fb923c;
+  font-size: 10px;
+}
+
+.stat-sub {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}

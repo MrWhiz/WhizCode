@@ -12,6 +12,7 @@ import { MultiTerminalPane } from './components/Terminal/MultiTerminalPane'
 import { ChatPanel } from './components/Chat/ChatPanel'
 import { BrainDashboard } from './components/Brain/BrainDashboard'
 import { SpecsPanel } from './components/Specs/SpecsPanel'
+import SystemPerformance from './components/Explorer/SystemPerformance'
 
 // Types
 import type { Message, AgentStep, OpenFileProps, AIProvider } from './types'
@@ -952,6 +953,7 @@ function App() {
                       <div className="empty-state">No folder opened.</div>
                     )}
                   </div>
+                  <SystemPerformance />
                 </>
               )}
 

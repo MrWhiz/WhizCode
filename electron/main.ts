@@ -34,6 +34,7 @@ import { ProcessManager } from './processManager'
 import { setupTerminalHandlers } from './terminalHandlers'
 import { KnowledgeService, type KnowledgeItem } from './knowledgeService'
 import { PromptManager } from './promptManager'
+import { SystemStatusService } from './systemStatus'
 
 const execAsync = promisify(exec)
 
@@ -376,7 +377,9 @@ async function createWindow() {
       preload: join(__dirname, 'preload.mjs'),
       nodeIntegration: false,
       contextIsolation: true,
-      webviewTag: true
+      sandbox: true,
+      webviewTag: true,
+      spellcheck: true
     },
     titleBarStyle: 'hidden',
     titleBarOverlay: {
@@ -387,7 +390,42 @@ async function createWindow() {
     backgroundColor: '#1e1e1e'
   })
 
-  console.log('[WINDOW] Window created, setting up event handlers...');
+  console.log('[WINDOW] Window created, setting up event handlers and security hooks...');
+
+  // ── SECURITY HARDENING ───────────────────────────────────────────────────
+
+  // Prevent navigation to untrusted sites
+  win.webContents.on('will-navigate', (event, navigationUrl) => {
+    const parsedUrl = new URL(navigationUrl);
+    // Allow only local files and authorized API endpoints if strictly necessary
+    if (parsedUrl.protocol !== 'file:' && !navigationUrl.startsWith('http://localhost')) {
+      event.preventDefault();
+      console.warn(`[SECURITY] Blocked unauthorized navigation to: ${navigationUrl}`);
+    }
+  });
+
+  // Restrict opening new windows to verified protocols only
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      // Open in system browser instead of a new Electron window 
+      shell.openExternal(url);
+    } else {
+      console.warn(`[SECURITY] Blocked unauthorized window open request: ${url}`);
+    }
+    return { action: 'deny' };
+  });
+
+  // Lock down webview sessions
+  win.webContents.on('will-attach-webview', (_event, webPreferences, _params) => {
+    // Strip node integration from any webview
+    delete (webPreferences as any).nodeIntegration;
+    delete (webPreferences as any).nodeIntegrationInSubFrames;
+    // Enable isolation and sandboxing
+    (webPreferences as any).contextIsolation = true;
+    (webPreferences as any).sandbox = true;
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   // Initialize terminal handlers with a function to get current workspace path
   terminalManager = setupTerminalHandlers(win, () => currentWorkspacePath);
@@ -428,6 +466,14 @@ async function createWindow() {
         console.log('Last workspace no longer exists:', lastWorkspace);
       }
     }
+  });
+
+  // Initialize and start system status service
+  const systemStatusService = new SystemStatusService(win.webContents);
+  systemStatusService.start(3000);
+
+  win.on('closed', () => {
+    systemStatusService.stop();
   });
 }
 
@@ -616,16 +662,15 @@ async function searchFiles(rootDir: string, pattern: string, includeGlob?: strin
 // ====== HELPER FUNCTIONS FOR NEW TOOLS ======
 
 // Fast fuzzy file search
-async function fuzzyFindFile(workspacePath: string, query: string, maxResults = 10): Promise<string> {
-  const results: { path: string; score: number }[] = [];
-  const queryLower = query.toLowerCase();
+async function fuzzyFindFile(workspacePath: string, query: string, maxResults = 10, returnObjects = false): Promise<any> {
+  const results: { path: string; score: number; fullPath: string }[] = [];
+  const queryLower = query.toLowerCase().replace(/^[\\/]/, '');
 
   async function walk(currentPath: string) {
-    if (results.length >= maxResults) return;
+    if (results.length >= (maxResults * 2)) return; // Search a bit more than requested
     try {
       const entries = await fs.readdir(currentPath, { withFileTypes: true });
       for (const entry of entries) {
-        if (results.length >= maxResults) break;
         const fullPath = join(currentPath, entry.name);
         if (entry.isDirectory()) {
           if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
@@ -643,7 +688,7 @@ async function fuzzyFindFile(workspacePath: string, query: string, maxResults = 
           else if (relPath.toLowerCase().includes(queryLower)) score = 30; // Path contains match
 
           if (score > 0) {
-            results.push({ path: relPath, score });
+            results.push({ path: relPath, score, fullPath });
           }
         }
       }
@@ -653,8 +698,10 @@ async function fuzzyFindFile(workspacePath: string, query: string, maxResults = 
   await walk(workspacePath);
   results.sort((a, b) => b.score - a.score);
 
+  if (returnObjects) return results.slice(0, maxResults);
+  
   if (results.length === 0) return `No files found matching "${query}".`;
-  return results.map(r => `- ${r.path} (score: ${r.score})`).join('\n');
+  return results.slice(0, maxResults).map(r => `- ${r.path} (score: ${r.score})`).join('\n');
 }
 
 // Get TypeScript/ESLint diagnostics
@@ -931,8 +978,9 @@ async function smartRelocate(
 function resolvePath(agentPath: string, workspacePath: string | null, cwd?: string): string {
   if (!agentPath) return agentPath;
   // If already absolute, use as-is
-  if (agentPath.match(/^[A-Za-z]:[\\/]/) || agentPath.startsWith('/')) {
-    return agentPath;
+  const normalizedAgentPath = agentPath.trim();
+  if (normalizedAgentPath.match(/^[A-Za-z]:[\\/]/) || normalizedAgentPath.startsWith('/') || normalizedAgentPath.startsWith('\\')) {
+    return normalizedAgentPath;
   }
 
   const baseDir = cwd && workspacePath ? join(workspacePath, cwd) : workspacePath;
@@ -1308,12 +1356,24 @@ async function callAI(messages: any[], modelConfig: {
       return responseBody.completion || responseBody.text || '';
     } else {
       // ── Ollama — Streaming mode ─────────────────────────────────────
+      const formattedOllamaMessages = messages.map(m => {
+        if (m.images && m.images.length > 0) {
+          return {
+            ...m,
+            images: m.images.map((img: string) => 
+              img.includes('base64,') ? img.split('base64,')[1] : img
+            )
+          };
+        }
+        return m;
+      });
+
       response = await fetch(OLLAMA_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: model || MODEL_NAME,
-          messages: messages,
+          messages: formattedOllamaMessages,
           stream: true,
           options: {
             temperature: temperature || 0,
@@ -1323,7 +1383,10 @@ async function callAI(messages: any[], modelConfig: {
         }),
         signal
       });
-      if (!response.ok) throw new Error(`Ollama HTTP Error: ${response.status}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Ollama HTTP Error: ${response.status} - ${errorText}`);
+      }
 
       // Read the NDJSON stream and accumulate content
       const reader = response.body?.getReader();
@@ -1640,7 +1703,29 @@ const TOOL_TIMEOUTS: Record<string, number> = {
 };
 
 async function executeToolCall(toolData: any, workspacePath: string | null, iteration?: number, isAutopilotMode: boolean = false, model?: { provider: string, model: string, openaiKey?: string, geminiKey?: string, bedrockRegion?: string, bedrockAccessKey?: string, bedrockSecretKey?: string }, config?: any): Promise<{ result: string; logs?: string[]; abort?: boolean; data?: any }> {
-  const resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath, toolData.cwd) : '';
+  let resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath, toolData.cwd) : '';
+  
+  // ── INTELLIGENT PATH RECOVERY ──────────────────────────────────────────
+  // If the path was resolved but doesn't exist, try to find it in the workspace
+  if (resolvedPath && workspacePath && toolData.tool !== 'run_command') {
+    try {
+      // Check if it exists natively
+      await fs.access(resolvedPath);
+    } catch {
+      // Not found, try fuzzy fallback for a 100% filename match
+      const filename = toolData.path.split(/[\\/]/).pop();
+      if (filename) {
+         try {
+           const matches = await fuzzyFindFile(workspacePath, filename, 1, true);
+           if (matches && matches.length > 0 && matches[0].score === 100) {
+              console.log(`[RECOVERY] File not found at ${resolvedPath}, but exact match found at ${matches[0].fullPath}. Using recovered path.`);
+              resolvedPath = matches[0].fullPath;
+           }
+         } catch (e) { /* ignore recovery errors */ }
+      }
+    }
+  }
+
   console.log(`\n[TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ''}`);
 
   // ── TOOL RESULT CACHING ──────────────────────────────────────────────

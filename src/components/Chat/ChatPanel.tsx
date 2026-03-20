@@ -779,6 +779,22 @@ export const ChatPanel = ({
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
+                            onPaste={(e) => {
+                                const items = e.clipboardData.items;
+                                for (let i = 0; i < items.length; i++) {
+                                    if (items[i].type.indexOf('image') !== -1) {
+                                        const file = items[i].getAsFile();
+                                        if (file) {
+                                            const reader = new FileReader();
+                                            reader.onloadend = () => {
+                                                const base64 = reader.result as string;
+                                                setSelectedImages(prev => [...prev, base64]);
+                                            };
+                                            reader.readAsDataURL(file);
+                                        }
+                                    }
+                                }
+                            }}
                             placeholder={workspacePath ? "Ask about your code..." : "Open a folder first..."}
                             rows={3}
                             disabled={isLoading}

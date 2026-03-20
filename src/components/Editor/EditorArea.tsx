@@ -2,6 +2,8 @@ import Editor, { useMonaco } from '@monaco-editor/react'
 import { useRef, useEffect, useState } from 'react'
 import type { OpenFileProps } from '../../types'
 import { WhizLogo } from '../Branding/WhizLogo'
+import { MarkdownRenderer } from './MarkdownRenderer'
+
 
 
 interface EditorAreaProps {
@@ -38,6 +40,17 @@ export const EditorArea = ({
     const [diagnostics, setDiagnostics] = useState<any[]>([]);
     const onFixErrorRef = useRef(onFixError);
     const [_editorInstance, setEditorInstance] = useState<any>(null);
+    const [isPreviewEnabled, setIsPreviewEnabled] = useState(false);
+
+    const isMarkdown = activeFile?.name.toLowerCase().endsWith('.md');
+
+    // Reset preview when active file changes and it's not markdown
+    useEffect(() => {
+        if (!isMarkdown) {
+            setIsPreviewEnabled(false);
+        }
+    }, [activeFileId, isMarkdown]);
+
 
     // Keep ref in sync
     useEffect(() => {
@@ -259,29 +272,62 @@ export const EditorArea = ({
                     </div>
 
                     <div className="breadcrumbs" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <div>
-                            WhizCode <span style={{ opacity: 0.5 }}>&gt;</span> {activeFileId?.replace(workspacePath || '', '')}
+                        <div style={{ display: 'flex', alignItems: 'center' }}>
+                            <span style={{ opacity: 0.6 }}>WhizCode</span> 
+                            <span style={{ opacity: 0.3, margin: '0 8px' }}>/</span> 
+                            <span style={{ color: 'var(--accent-primary)', fontWeight: 500 }}>{activeFile?.name}</span>
+                            <span style={{ opacity: 0.5, marginLeft: '8px', fontSize: '11px' }}>
+                                {activeFileId?.replace(workspacePath || '', '').replace(activeFile?.name || '', '')}
+                            </span>
                         </div>
+                        
+                        {isMarkdown && (
+                            <div style={{ display: 'flex', gap: '8px', marginRight: '16px' }}>
+                                <button 
+                                    onClick={() => setIsPreviewEnabled(!isPreviewEnabled)}
+                                    style={{
+                                        backgroundColor: isPreviewEnabled ? 'var(--accent-primary)' : 'transparent',
+                                        color: isPreviewEnabled ? 'white' : 'var(--text-secondary)',
+                                        border: '1px solid ' + (isPreviewEnabled ? 'transparent' : 'var(--border-color)'),
+                                        padding: '4px 10px',
+                                        borderRadius: '4px',
+                                        fontSize: '11px',
+                                        cursor: 'pointer',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '4px',
+                                        transition: 'all 0.2s ease'
+                                    }}
+                                >
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                                    {isPreviewEnabled ? 'Show Code' : 'Preview Markdown'}
+                                </button>
+                            </div>
+                        )}
                     </div>
 
                     <div style={{ flex: 1, overflow: 'hidden', backgroundColor: '#1e1e1e', margin: '0' }}>
-                        <Editor
-                            height="100%"
-                            language={getLanguage(activeFile?.name || '')}
-                            theme="vs-dark"
-                            path={activeFileId || undefined}
-                            value={activeFile?.content || ''}
-                            onChange={handleEditorChange}
-                            onMount={handleEditorMount}
-                            options={{
-                                minimap: { enabled: false },
-                                fontSize: 14,
-                                wordWrap: 'on',
-                                fontFamily: "'Consolas', 'Courier New', monospace",
-                                hover: { enabled: true },
-                                quickSuggestions: true,
-                            }}
-                        />
+                        {isPreviewEnabled && activeFile ? (
+                            <MarkdownRenderer content={activeFile.content} />
+                        ) : (
+                            <Editor
+                                height="100%"
+                                language={getLanguage(activeFile?.name || '')}
+                                theme="vs-dark"
+                                path={activeFileId || undefined}
+                                value={activeFile?.content || ''}
+                                onChange={handleEditorChange}
+                                onMount={handleEditorMount}
+                                options={{
+                                    minimap: { enabled: false },
+                                    fontSize: 14,
+                                    wordWrap: 'on',
+                                    fontFamily: "'Consolas', 'Courier New', monospace",
+                                    hover: { enabled: true },
+                                    quickSuggestions: true,
+                                }}
+                            />
+                        )}
                     </div>
                 </>
             ) : (

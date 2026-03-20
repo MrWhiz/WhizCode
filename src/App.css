@@ -408,6 +408,8 @@ body {
   display: flex;
   flex-direction: column;
   background-color: var(--bg-primary);
+  height: 100%;
+  overflow: hidden;
 }
 
 /* Tabs */

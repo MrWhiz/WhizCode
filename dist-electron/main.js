@@ -6,9 +6,9 @@ import "node:util";
 import "node:fs/promises";
 import "node:os";
 import "node:module";
-import { M, R, V } from "./main-BW9J0qK3.js";
+import { M as I, R as V, V as a } from "./main-C66U9biK.js";
 export {
-  M as MAIN_DIST,
-  R as RENDERER_DIST,
-  V as VITE_DEV_SERVER_URL
+  I as MAIN_DIST,
+  V as RENDERER_DIST,
+  a as VITE_DEV_SERVER_URL
 };

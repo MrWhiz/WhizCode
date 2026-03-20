@@ -1,7 +1,8 @@
 {
   "name": "whizcode",
   "private": true,
-  "version": "0.0.0",
+  "description": "Premium AI-powered Code Editor",
+  "version": "0.1.0",
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
@@ -25,6 +26,7 @@
     "cross-fetch": "^4.1.0",
     "crypto-js": "^4.2.0",
     "lancedb": "^0.0.1",
+    "mermaid": "^11.13.0",
     "node-fetch": "^2.7.0",
     "node-pty": "^1.1.0",
     "react": "^19.2.0",
@@ -72,7 +74,7 @@
     },
     "win": {
       "target": [
-        "nsis"
+        "zip"
       ],
       "icon": "public/icon.png"
     },
@@ -83,11 +85,11 @@
       "deleteAppDataOnUninstall": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "installerIcon": "public/icon.ico",
-      "uninstallerIcon": "public/icon.ico",
-      "installerHeaderIcon": "public/icon.ico"
+      "installerIcon": "public/icon.png",
+      "uninstallerIcon": "public/icon.png",
+      "installerHeaderIcon": "public/icon.png"
     },
-    "npmRebuild": true,
+    "npmRebuild": false,
     "asar": true,
     "extraResources": [
       {

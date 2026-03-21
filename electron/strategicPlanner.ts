@@ -29,18 +29,13 @@ export interface PlanningContext {
   codebaseSize?: 'small' | 'medium' | 'large';
   availableTools: string[];
   previousPlans?: ExecutionPlan[];
-  researchFindings?: string;
 }
-
-export type LLMProvider = (prompt: string, options?: { json?: boolean }) => Promise<string>;
 
 export class StrategicPlanner {
   private planHistory: Map<string, ExecutionPlan> = new Map();
   private taskTemplates: Map<string, Partial<Task>> = new Map();
-  private llm: LLMProvider;
 
-  constructor(llm: LLMProvider) {
-    this.llm = llm;
+  constructor() {
     this.initializeTaskTemplates();
   }
 
@@ -76,8 +71,8 @@ export class StrategicPlanner {
   }
 
   async createExecutionPlan(context: PlanningContext): Promise<ExecutionPlan> {
-    const objective = await this.extractObjective(context.userRequest);
-    const taskType = await this.classifyRequest(context.userRequest);
+    const objective = this.extractObjective(context.userRequest);
+    const taskType = this.classifyRequest(context.userRequest);
     
     let tasks: Task[] = [];
     
@@ -98,14 +93,6 @@ export class StrategicPlanner {
         tasks = await this.planGenericTask(context);
     }
 
-    // If research findings are present, enhance the tasks with the research data
-    if (context.researchFindings) {
-      tasks = tasks.map(task => ({
-        ...task,
-        description: `${task.description} (Context: ${context.researchFindings?.substring(0, 100)}...)`
-      }));
-    }
-
     const parallelGroups = this.optimizeParallelExecution(tasks);
     const plan: ExecutionPlan = {
       id: `plan_${Date.now()}`,
@@ -121,65 +108,47 @@ export class StrategicPlanner {
     return plan;
   }
 
-  private async classifyRequest(request: string): Promise<string> {
-    const prompt = `Analyze the following user request and classify its intent into one of these categories: "bug-fix", "feature-implementation", "refactoring", "analysis", "generic". 
-    Return ONLY the category name as a plain string.
+  private extractObjective(request: string): string {
+    // Extract the main objective from user request
+    const patterns = [
+      /(?:fix|solve|resolve)\s+(.+)/i,
+      /(?:implement|create|add)\s+(.+)/i,
+      /(?:refactor|improve|optimize)\s+(.+)/i,
+      /(?:analyze|understand|explain)\s+(.+)/i
+    ];
 
-    Request: "${request}"`;
-
-    try {
-      const result = await this.llm(prompt);
-      const cleaned = result.toLowerCase().trim().replace(/['"]/g, '');
-      const validCategories = ['bug-fix', 'feature-implementation', 'refactoring', 'analysis', 'generic'];
-      
-      if (validCategories.includes(cleaned)) return cleaned;
-      
-      // Heuristic fallback if LLM output is messy
-      const bugKeywords = ['fix', 'error', 'bug', 'issue', 'problem', 'broken'];
-      const featureKeywords = ['add', 'create', 'implement', 'new', 'feature'];
-      const lowerRequest = request.toLowerCase();
-      if (bugKeywords.some(keyword => lowerRequest.includes(keyword))) return 'bug-fix';
-      if (featureKeywords.some(keyword => lowerRequest.includes(keyword))) return 'feature-implementation';
-      
-      return 'generic';
-    } catch (e) {
-      return 'generic';
+    for (const pattern of patterns) {
+      const match = request.match(pattern);
+      if (match) return match[1].trim();
     }
+
+    return request.slice(0, 100) + (request.length > 100 ? '...' : '');
   }
 
-  private async extractObjective(request: string): Promise<string> {
-    const prompt = `Extract a concise, professional one-sentence objective (under 100 characters) from this user request. 
-    Focus on WHAT needs to be achieved. 
-    Return ONLY the objective sentence.
+  private classifyRequest(request: string): string {
+    const bugKeywords = ['fix', 'error', 'bug', 'issue', 'problem', 'broken'];
+    const featureKeywords = ['add', 'create', 'implement', 'new', 'feature'];
+    const refactorKeywords = ['refactor', 'improve', 'optimize', 'clean', 'restructure'];
+    const analysisKeywords = ['analyze', 'understand', 'explain', 'show', 'find'];
 
-    Request: "${request}"`;
+    const lowerRequest = request.toLowerCase();
 
-    try {
-      const result = await this.llm(prompt);
-      return result.trim().replace(/^['"]|['"]$/g, '');
-    } catch (e) {
-      return request.slice(0, 80) + '...';
-    }
+    if (bugKeywords.some(keyword => lowerRequest.includes(keyword))) return 'bug-fix';
+    if (featureKeywords.some(keyword => lowerRequest.includes(keyword))) return 'feature-implementation';
+    if (refactorKeywords.some(keyword => lowerRequest.includes(keyword))) return 'refactoring';
+    if (analysisKeywords.some(keyword => lowerRequest.includes(keyword))) return 'analysis';
+
+    return 'generic';
   }
 
   private async planBugFix(context: PlanningContext): Promise<Task[]> {
     return [
       {
-        id: 'create-spec',
-        type: 'analysis',
-        description: 'Create or update feature spec for this bug fix',
-        tools: ['createSpec', 'listSpecs', 'readSpec'],
-        dependencies: [],
-        priority: 0,
-        estimatedComplexity: 1,
-        parallelizable: false
-      },
-      {
         id: 'analyze-error',
         type: 'analysis',
         description: 'Analyze error patterns and symptoms',
         tools: ['getDiagnostics', 'grepSearch', 'read_file'],
-        dependencies: ['create-spec'],
+        dependencies: [],
         priority: 1,
         estimatedComplexity: 2,
         parallelizable: true
@@ -208,7 +177,7 @@ export class StrategicPlanner {
         id: 'validate-fix',
         type: 'validation',
         description: 'Validate the fix works',
-        tools: ['getDiagnostics', 'run_command', 'completeTask'],
+        tools: ['getDiagnostics', 'run_command'],
         dependencies: ['implement-fix'],
         priority: 4,
         estimatedComplexity: 2,
@@ -220,21 +189,11 @@ export class StrategicPlanner {
   private async planFeatureImplementation(context: PlanningContext): Promise<Task[]> {
     return [
       {
-        id: 'create-spec',
-        type: 'analysis',
-        description: 'Create feature spec (Requirements, Design, Tasks)',
-        tools: ['createSpec', 'updateSpec'],
-        dependencies: [],
-        priority: 0,
-        estimatedComplexity: 2,
-        parallelizable: false
-      },
-      {
         id: 'understand-requirements',
         type: 'analysis',
         description: 'Understand feature requirements and context',
         tools: ['read_file', 'readCode', 'list_directory'],
-        dependencies: ['create-spec'],
+        dependencies: [],
         priority: 1,
         estimatedComplexity: 2,
         parallelizable: true
@@ -243,7 +202,7 @@ export class StrategicPlanner {
         id: 'design-architecture',
         type: 'analysis',
         description: 'Design feature architecture and integration points',
-        tools: ['grepSearch', 'readCode', 'fuzzy_find_file', 'updateSpec'],
+        tools: ['grepSearch', 'readCode', 'fuzzy_find_file'],
         dependencies: ['understand-requirements'],
         priority: 2,
         estimatedComplexity: 3,
@@ -273,7 +232,7 @@ export class StrategicPlanner {
         id: 'validate-integration',
         type: 'validation',
         description: 'Validate feature integration and functionality',
-        tools: ['getDiagnostics', 'run_command', 'completeTask'],
+        tools: ['getDiagnostics', 'run_command'],
         dependencies: ['integrate-feature'],
         priority: 5,
         estimatedComplexity: 3,
@@ -285,21 +244,11 @@ export class StrategicPlanner {
   private async planRefactoring(context: PlanningContext): Promise<Task[]> {
     return [
       {
-        id: 'create-spec',
-        type: 'analysis',
-        description: 'Create refactoring spec',
-        tools: ['createSpec', 'updateSpec'],
-        dependencies: [],
-        priority: 0,
-        estimatedComplexity: 2,
-        parallelizable: false
-      },
-      {
         id: 'analyze-current-code',
         type: 'analysis',
         description: 'Analyze current code structure and patterns',
         tools: ['readCode', 'grepSearch', 'getDiagnostics'],
-        dependencies: ['create-spec'],
+        dependencies: [],
         priority: 1,
         estimatedComplexity: 3,
         parallelizable: true
@@ -318,7 +267,7 @@ export class StrategicPlanner {
         id: 'plan-refactoring',
         type: 'analysis',
         description: 'Plan refactoring steps and dependencies',
-        tools: ['readCode', 'fuzzy_find_file', 'updateSpec'],
+        tools: ['readCode', 'fuzzy_find_file'],
         dependencies: ['identify-improvements'],
         priority: 3,
         estimatedComplexity: 2,
@@ -338,7 +287,7 @@ export class StrategicPlanner {
         id: 'validate-refactoring',
         type: 'validation',
         description: 'Validate refactoring maintains functionality',
-        tools: ['getDiagnostics', 'run_command', 'completeTask'],
+        tools: ['getDiagnostics', 'run_command'],
         dependencies: ['execute-refactoring'],
         priority: 5,
         estimatedComplexity: 2,

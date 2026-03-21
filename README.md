@@ -1,6 +1,6 @@
 # WhizCode - AI-Powered Code Editor
 
-WhizCode is a modern, autonomous AI coding assistant with a VS Code-inspired interface, powered by local LLMs through Ollama. Built with React, TypeScript, Vite, and Electron.
+WhizCode is a modern, autonomous AI coding assistant with a VS Code-inspired interface, powered by local LLMs through Ollama. Built with React, TypeScript, Vite, and Tauri.
 
 ## ✨ Features
 
@@ -133,9 +133,9 @@ This simplified approach reduces complexity while maintaining high performance.
 │  │AI Insights│        │         │   │
 │  └─────────┘ └─────────┘ └─────────┘   │
 └─────────────────┬───────────────────────┘
-                  │ IPC
+                  │ Tauri API
 ┌─────────────────▼───────────────────────┐
-│           Electron Main Process         │
+│           Tauri Backend (Rust)          │
 │  ┌─────────────────────────────────┐   │
 │  │    Enhanced Agent Loop          │   │
 │  │  ┌──────────┐ ┌──────────────┐ │   │
@@ -256,21 +256,24 @@ WhizCode/
 │   │   ├── Explorer/      # File explorer
 │   │   └── Terminal/      # Terminal pane
 │   ├── types/             # TypeScript definitions
+│   ├── lib/               # Utilities
+│   │   └── tauri-api.ts   # Tauri API wrapper
 │   └── main.tsx           # App entry point
-├── electron/              # Electron main process
-│   ├── main.ts            # Main process & agent loop
-│   ├── subAgents.ts       # Sub-agent system
-│   ├── hooksSystem.ts     # Event automation
-│   └── steeringSystem.ts  # Custom instructions
+├── src-tauri/             # Tauri backend (Rust)
+│   ├── src/
+│   │   ├── main.rs        # Tauri app entry
+│   │   ├── commands/      # Tauri commands
+│   │   │   ├── fs.rs      # File operations
+│   │   │   ├── system.rs  # System info
+│   │   │   └── ...
+│   │   ├── state.rs       # App state
+│   │   └── error.rs       # Error handling
+│   └── tauri.conf.json    # Tauri config
 ├── docs/                  # Documentation
 │   ├── SECURITY.md        # Security implementation
 │   ├── BUILD_OPTIMIZATION.md
 │   ├── DISTRIBUTION_GUIDE.md
 │   └── FINAL_SIZE_REPORT.md
-├── scripts/               # Utility scripts
-│   ├── split-installer.ps1
-│   ├── join-installer.ps1
-│   └── analyze-bundle.js
 ├── public/                # Static assets
 └── package.json           # Dependencies & scripts
 ```
@@ -292,39 +295,14 @@ npm run dev
 npm run lint
 ```
 
-### Packaging & Distribution
-
-**Build installer:**
+### Building Tauri App
 ```bash
-npm run package
+# Build frontend
+npm run vite:build
+
+# Build Tauri app (includes frontend)
+cargo build --release -C src-tauri
 ```
-
-This creates a 99MB NSIS installer in `release/0.1.0/`.
-
-**Split for email distribution (20MB limit):**
-```bash
-.\scripts\split-installer.ps1
-```
-
-This creates 5 parts:
-- `WhizCode_Part_1_of_5.bin` (20 MB)
-- `WhizCode_Part_2_of_5.bin` (20 MB)
-- `WhizCode_Part_3_of_5.bin` (20 MB)
-- `WhizCode_Part_4_of_5.bin` (20 MB)
-- `WhizCode_Part_5_of_5.bin` (19.36 MB)
-
-**Rejoin split parts:**
-```bash
-.\scripts\join-installer.ps1
-```
-
-See [docs/DISTRIBUTION_GUIDE.md](docs/DISTRIBUTION_GUIDE.md) for detailed instructions.
-
-**Build Information:**
-- Installer Size: 99MB (compressed)
-- Installed Size: ~390MB
-- Build Time: ~2-3 minutes
-- Supported OS: Windows 10+
 
 ## � Security
 
@@ -437,7 +415,8 @@ When contributing, your code will be licensed under AGPL-3.0 + Commons Clause. S
 - Built with [Ollama](https://ollama.ai/) for local LLM support
 - Inspired by VS Code's interface design
 - Uses [Monaco Editor](https://microsoft.github.io/monaco-editor/) for code editing
-- Powered by [Electron](https://www.electronjs.org/) and [React](https://reactjs.org/)
+- Powered by [Tauri](https://tauri.app/) and [React](https://reactjs.org/)
+- Backend built with [Rust](https://www.rust-lang.org/)
 
 ---
 

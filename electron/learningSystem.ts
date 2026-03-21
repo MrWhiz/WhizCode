@@ -79,8 +79,7 @@ export class LearningSystem {
 
   async analyzeInteractionPatterns(): Promise<LearningInsight[]> {
     const insights: LearningInsight[] = [];
-    // Only analyze the most recent 20 sessions to prevent performance degradation
-    const sessions = this.contextMemory.getSessionHistory().slice(-20);
+    const sessions = this.contextMemory.getSessionHistory();
     
     if (sessions.length === 0) return insights;
 

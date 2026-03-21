@@ -4,7 +4,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 
 export interface MCPPower {
   id: string;

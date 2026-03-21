@@ -17,11 +17,42 @@ import SystemPerformance from './components/Explorer/SystemPerformance'
 // Types
 import type { Message, AgentStep, OpenFileProps, AIProvider } from './types'
 
+import { 
+  fs, 
+  agent, 
+  workspace, 
+  git, 
+  ollama, 
+  azure, 
+  diagnostics, 
+  dialog, 
+  events,
+  planner,
+  subAgents,
+  learning,
+  contextMemory,
+  hooks,
+  codeIntelligence
+} from './lib/tauri-api'
+
+import { 
+  loadAppState, 
+  saveAppState, 
+  setupWindowStatePersistence,
+  setupUIStatePersistence,
+  setupWorkspaceStatePersistence,
+  restoreWindowState,
+  clearAppState
+} from './lib/appState'
+
 import { WhizLogo } from './components/Branding/WhizLogo'
 import './App.css'
 
 
 function App() {
+  // Load persisted app state
+  const savedState = loadAppState()
+
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<Message[]>([
     { role: 'assistant', content: 'Hello! I\'m your WhizCode agent. Open a folder to get started.' }
@@ -44,16 +75,17 @@ function App() {
       }
     }
   }, [messages, agentSteps])
+  
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
-  const [activeFileId, setActiveFileId] = useState<string | null>(null)
+  const [activeFileId, setActiveFileId] = useState<string | null>(savedState.activeFileId)
   const [openFiles, setOpenFiles] = useState<OpenFileProps[]>([])
-  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | 'brain-health' | 'specs' | null>('explorer')
-  const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem('sidebarWidth')) || 260)
-  const [isTerminalOpen, setIsTerminalOpen] = useState(() => localStorage.getItem('isTerminalOpen') !== 'false') // Default to open
-  const [terminalHeight, setTerminalHeight] = useState(() => Number(localStorage.getItem('terminalHeight')) || 250)
+  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | 'brain-health' | 'specs' | null>(savedState.activeView)
+  const [sidebarWidth, setSidebarWidth] = useState(savedState.sidebarWidth)
+  const [isTerminalOpen, setIsTerminalOpen] = useState(savedState.isTerminalOpen)
+  const [terminalHeight, setTerminalHeight] = useState(savedState.terminalHeight)
   const [terminalKey, setTerminalKey] = useState(0)
-  const [isChatOpen, setIsChatOpen] = useState(() => localStorage.getItem('isChatOpen') !== 'false') // Default to open
-  const [chatWidth, setChatWidth] = useState(() => Number(localStorage.getItem('chatWidth')) || 400)
+  const [isChatOpen, setIsChatOpen] = useState(savedState.isChatOpen)
+  const [chatWidth, setChatWidth] = useState(savedState.chatWidth)
 
   // Explorer state
   const [refreshKey, setRefreshKey] = useState(0)
@@ -69,54 +101,129 @@ function App() {
   const streamingContentRef = useRef('')
   const STREAMING_MSG_ID = '__streaming__'
 
-  // Setup persistent IPC listeners at mount
+  // Setup persistent Tauri event listeners at mount
   useEffect(() => {
-    const ipc = (window as any).ipcRenderer
-    if (!ipc) return
+    let unlistenStep: (() => void) | null = null
+    let unlistenStream: (() => void) | null = null
 
-    const stepHandler = (_event: any, step: AgentStep) => {
-      setAgentSteps(prev => {
-        // Use requestId for precise matching if available — replace regardless of old status
-        if ((step as any).requestId) {
-          const existingIdx = prev.findIndex(s => (s as any).requestId === (step as any).requestId)
-          if (existingIdx >= 0) {
-            const newSteps = [...prev]
-            newSteps[existingIdx] = step
-            return newSteps
-          }
-          return [...prev, step]
-        }
+    const setupListeners = async () => {
+      try {
+        unlistenStep = await agent.events.onAgentStep((step: AgentStep) => {
+          setAgentSteps(prev => {
+            // Use requestId for precise matching if available — replace regardless of old status
+            if ((step as any).requestId) {
+              const existingIdx = prev.findIndex(s => (s as any).requestId === (step as any).requestId)
+              if (existingIdx >= 0) {
+                const newSteps = [...prev]
+                newSteps[existingIdx] = step
+                return newSteps
+              }
+              return [...prev, step]
+            }
 
-        // Fallback: match on tool + iteration regardless of status direction
-        // This handles: running → done, running → failed, done → done, etc.
-        const existingIdx = prev.findIndex(s =>
-          s.tool === step.tool &&
-          s.iteration === step.iteration
-        )
+            // Fallback: match on tool + iteration regardless of status direction
+            // This handles: running → done, running → failed, done → done, etc.
+            const existingIdx = prev.findIndex(s =>
+              s.tool === step.tool &&
+              s.iteration === step.iteration
+            )
 
-        if (existingIdx >= 0) {
-          const newSteps = [...prev]
-          newSteps[existingIdx] = step
-          return newSteps
-        }
-        return [...prev, step]
-      })
+            if (existingIdx >= 0) {
+              const newSteps = [...prev]
+              newSteps[existingIdx] = step
+              return newSteps
+            }
+            return [...prev, step]
+          })
+        })
+
+        unlistenStream = await agent.events.onAgentStream(({ token }: { token: string }) => {
+          streamingContentRef.current += token
+          const currentContent = streamingContentRef.current
+          setLiveStreamingContent(currentContent)
+        })
+      } catch (error) {
+        console.error('Failed to setup Tauri event listeners:', error)
+      }
     }
 
-    const streamHandler = (_event: any, { token }: { token: string }) => {
-      streamingContentRef.current += token
-      const currentContent = streamingContentRef.current
-      setLiveStreamingContent(currentContent)
-    }
-
-    ipc.on('agent:step', stepHandler)
-    ipc.on('agent:stream', streamHandler)
+    setupListeners()
 
     return () => {
-      ipc.off('agent:step', stepHandler)
-      ipc.off('agent:stream', streamHandler)
+      if (unlistenStep) unlistenStep()
+      if (unlistenStream) unlistenStream()
     }
   }, [])
+
+  // Setup window state restoration and persistence
+  useEffect(() => {
+    const initializeWindowState = async () => {
+      try {
+        // Restore window state on app startup
+        await restoreWindowState(savedState)
+      } catch (error) {
+        console.error('Failed to restore window state:', error)
+      }
+    }
+
+    initializeWindowState()
+
+    // Setup periodic window state persistence
+    const cleanup = setupWindowStatePersistence()
+
+    return cleanup
+  }, [])
+
+  // Restore saved workspace on app startup
+  useEffect(() => {
+    const restoreSavedWorkspace = async () => {
+      if (savedState.workspacePath) {
+        try {
+          console.log('[APP] Attempting to restore workspace:', savedState.workspacePath)
+          await workspace.setWorkspace(savedState.workspacePath)
+          console.log('[APP] Successfully restored workspace:', savedState.workspacePath)
+          
+          // Verify workspace was set by getting it back
+          const wsInfo = await workspace.getWorkspace()
+          if (!wsInfo) {
+            throw new Error('Workspace was not properly set')
+          }
+          console.log('[APP] Verified workspace is set:', wsInfo.path)
+          
+          // Now set the workspace path in React state
+          setWorkspacePath(savedState.workspacePath)
+          
+          // Add a small delay to ensure backend state is updated before FileTree tries to read
+          await new Promise(resolve => setTimeout(resolve, 200))
+          // Trigger FileTree to reload by incrementing refreshKey
+          setRefreshKey(prev => prev + 1)
+        } catch (error) {
+          console.error('[APP] Failed to restore saved workspace:', savedState.workspacePath, error)
+          // Clear invalid workspace path
+          clearAppState()
+        }
+      }
+    }
+
+    restoreSavedWorkspace()
+  }, [])
+
+  // Persist UI layout state whenever it changes
+  useEffect(() => {
+    setupUIStatePersistence(
+      sidebarWidth,
+      terminalHeight,
+      chatWidth,
+      isTerminalOpen,
+      isChatOpen,
+      activeView
+    )
+  }, [sidebarWidth, terminalHeight, chatWidth, isTerminalOpen, isChatOpen, activeView])
+
+  // Persist workspace state whenever it changes
+  useEffect(() => {
+    setupWorkspaceStatePersistence(workspacePath, activeFileId)
+  }, [workspacePath, activeFileId])
   const [fileErrors, setFileErrors] = useState<Record<string, number>>({})
 
   // Model settings
@@ -190,10 +297,11 @@ function App() {
   ])
 
   const checkAzureToken = useCallback(async () => {
-    const ipc = (window as any).ipcRenderer
-    if (ipc) {
-      const status = await ipc.invoke('azure:getTokenStatus')
+    try {
+      const status = await azure.getTokenStatus()
       setAzureTokenStatus(status)
+    } catch (error) {
+      console.error('Error checking Azure token status:', error)
     }
   }, [])
 
@@ -204,22 +312,19 @@ function App() {
   }, [modelProvider, checkAzureToken])
 
   const handleGenerateAzureToken = async () => {
-    const ipc = (window as any).ipcRenderer
-    if (ipc) {
-      try {
-        const result = await ipc.invoke('azure:generateToken', {
-          loginUrl: azureLoginUrl,
-          username: azureUsername,
-          password: azurePassword
-        })
-        if (result.success) {
-          checkAzureToken()
-        } else {
-          alert(`Failed to generate token: ${result.error}`)
-        }
-      } catch (e: any) {
-        alert(`Error: ${e.message}`)
+    try {
+      const result = await azure.generateToken({
+        loginUrl: azureLoginUrl,
+        username: azureUsername,
+        password: azurePassword
+      })
+      if (result.success) {
+        checkAzureToken()
+      } else {
+        alert(`Failed to generate token: ${result.error}`)
       }
+    } catch (e: any) {
+      alert(`Error: ${e.message}`)
     }
   }
 
@@ -277,70 +382,75 @@ function App() {
 
   // Restore last workspace on startup
   useEffect(() => {
-    const ipc = (window as any).ipcRenderer
-    if (!ipc) return
+    let unlistenWorkspaceRestored: (() => void) | null = null
 
-    const workspaceRestoreHandler = (_event: any, workspacePath: string) => {
-      setWorkspacePath(workspacePath)
+    const setupWorkspaceListener = async () => {
+      try {
+        unlistenWorkspaceRestored = await workspace.events.onWorkspaceRestored((workspacePath: string) => {
+          setWorkspacePath(workspacePath)
+        })
+      } catch (error) {
+        console.error('Failed to setup workspace restored listener:', error)
+      }
     }
 
-    ipc.on('workspace:restored', workspaceRestoreHandler)
+    setupWorkspaceListener()
+
     return () => {
-      ipc.off('workspace:restored', workspaceRestoreHandler)
+      if (unlistenWorkspaceRestored) unlistenWorkspaceRestored()
     }
   }, [])
 
   // Listen for file changes from the backend (when agent updates files)
   useEffect(() => {
-    const ipc = (window as any).ipcRenderer
-    if (!ipc) return
+    let unlistenFileChanged: (() => void) | null = null
 
-    const fileChangeHandler = (_event: any, { path, content }: { path: string; content: string }) => {
-      // Update the file in openFiles if it's currently open
-      setOpenFiles(prev => {
-        const fileExists = prev.some(f => f.path === path)
-        if (fileExists) {
-          return prev.map(f => f.path === path ? { ...f, content } : f)
-        }
-        return prev
-      })
+    const setupFileChangeListener = async () => {
+      try {
+        unlistenFileChanged = await events.onFileChanged(({ path, content }: { path: string; content: string }) => {
+          // Update the file in openFiles if it's currently open
+          setOpenFiles(prev => {
+            const fileExists = prev.some(f => f.path === path)
+            if (fileExists) {
+              return prev.map(f => f.path === path ? { ...f, content } : f)
+            }
+            return prev
+          })
+        })
+      } catch (error) {
+        console.error('Failed to setup file changed listener:', error)
+      }
     }
 
-    ipc.on('file:changed', fileChangeHandler)
+    setupFileChangeListener()
+
     return () => {
-      ipc.off('file:changed', fileChangeHandler)
+      if (unlistenFileChanged) unlistenFileChanged()
     }
   }, [])
 
   const refreshOllamaModels = async () => {
-    const ipc = (window as any).ipcRenderer
-    if (!ipc) return
     setOllamaChecking(true)
     setOllamaError(null)
 
     try {
       console.log('[FRONTEND] Checking Ollama health...')
       // First do a health check
-      const healthCheck = await ipc.invoke('ollama:healthCheck')
+      const healthCheck = await ollama.healthCheck()
       if (!healthCheck.healthy) {
-        setOllamaError(`Ollama health check failed: ${healthCheck.error}`)
+        setOllamaError(`Ollama health check failed: ${healthCheck.error || 'Unknown error'}`)
         setOllamaModels([])
         return
       }
 
       console.log('[FRONTEND] Ollama is healthy, fetching models...')
       // Then get models
-      const res = await ipc.invoke('ollama:getModels')
-      if (res.error) {
-        setOllamaError(res.error)
-        setOllamaModels([])
-      } else {
-        console.log('[FRONTEND] Received models:', res)
-        setOllamaModels(res)
-        setOllamaError(null)
-        if (res.length > 0 && !res.includes(model)) {
-          setModel(res[0])
-        }
+      const res = await ollama.getModels()
+      console.log('[FRONTEND] Received models:', res)
+      setOllamaModels(res)
+      setOllamaError(null)
+      if (res.length > 0 && !res.includes(model)) {
+        setModel(res[0])
       }
     } catch (error: any) {
       console.error('[FRONTEND] Ollama connection error:', error)
@@ -355,10 +465,15 @@ function App() {
   useEffect(() => {
     const fetchGitStatus = async () => {
       if (!workspacePath) return
-      const ipc = (window as any).ipcRenderer
-      if (ipc) {
-        const res = await ipc.invoke('git:status', workspacePath)
+      try {
+        const res = await git.getStatus(workspacePath)
         setGitStatus(res)
+      } catch (error: any) {
+        // Ignore cancelation errors
+        if (error?.type === 'cancelation' || error?.msg?.includes('canceled')) {
+          return
+        }
+        console.error('Error fetching git status:', error)
       }
     }
     fetchGitStatus()
@@ -420,22 +535,24 @@ function App() {
       setActiveFileId(path)
       return
     }
-    const ipc = (window as any).ipcRenderer
-    if (ipc) {
-      const content = await ipc.invoke('fs:readFile', path)
+    try {
+      const content = await fs.readFile(path)
       if (content !== null) {
         setOpenFiles(prev => [...prev, { path, name, content }])
         setActiveFileId(path)
       }
+    } catch (error) {
+      console.error('Error opening file:', error)
     }
   }
 
   const handleFileSave = async () => {
     const activeFile = openFiles.find(f => f.path === activeFileId)
     if (!activeFile) return
-    const ipc = (window as any).ipcRenderer
-    if (ipc) {
-      await ipc.invoke('fs:writeFile', activeFile.path, activeFile.content)
+    try {
+      await fs.writeFile(activeFile.path, activeFile.content)
+    } catch (error) {
+      console.error('Error saving file:', error)
     }
   }
 
@@ -488,13 +605,10 @@ function App() {
     if (openFiles.length === 0) return
 
     const checkFiles = async () => {
-      const ipc = (window as any).ipcRenderer
-      if (!ipc) return
-
       const filesToCheck = [...openFiles]
       for (const file of filesToCheck) {
         try {
-          const exists = await ipc.invoke('fs:checkFileExists', file.path)
+          const exists = await fs.checkFileExists(file.path)
           if (!exists) {
             handleFileDeleted(file.path)
           }
@@ -532,8 +646,7 @@ function App() {
 
   // Check for errors in a file
   const checkFileErrors = async (filePath: string, content: string): Promise<number> => {
-    const ipc = (window as any).ipcRenderer
-    if (!ipc || !workspacePath) return 0
+    if (!workspacePath) return 0
 
     const normFilePath = normalizePath(filePath);
     const normWorkspacePath = normalizePath(workspacePath);
@@ -544,12 +657,12 @@ function App() {
         setTimeout(() => reject(new Error('Diagnostics timeout')), 3000)
       );
 
-      const diagnostics = await Promise.race([
-        ipc.invoke('diagnostics:check', normFilePath, normWorkspacePath, content),
+      const result = await Promise.race([
+        diagnostics.check(normFilePath, normWorkspacePath, content),
         timeoutPromise
       ]);
 
-      const count = Array.isArray(diagnostics) ? diagnostics.length : 0;
+      const count = Array.isArray(result) ? result.length : 0;
       console.log(`[APP] File ${normFilePath.split('/').pop()} has ${count} errors`);
       return count;
     } catch (error) {
@@ -588,46 +701,41 @@ function App() {
     // Streaming and step handlers are now global in useEffect
     streamingContentRef.current = ''
 
-    const ipc = (window as any).ipcRenderer
     try {
-      if (ipc) {
-        const activeFile = openFiles.find(f => f.path === activeFileId)
-        const result = await ipc.invoke('execute-agent-task', {
-          task: userMsg.content,
-          model: {
-            provider: modelProvider,
-            model: model,
-            openaiKey,
-            geminiKey,
-            bedrockRegion,
-            bedrockAccessKey,
-            bedrockSecretKey,
-            azureLoginUrl,
-            azureEmbeddingUrl,
-            azureCompletionUrl,
-            azureUsername,
-            azurePassword
-          },
-          workspacePath,
-          activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
-          config: { openaiKey, geminiKey },
-          isAutopilotMode,
-          images: userMsg.images
-        })
-        const response = typeof result === 'string' ? result : result?.response || 'No response'
-        const steps = typeof result === 'object' ? result?.steps || [] : []
-        // Clear live steps before adding final message
-        setAgentSteps([])
-        // Replace streaming placeholder with final authoritative response
-        setMessages(prev => {
-          const withoutStream = prev.filter(m => (m as any).__id !== STREAMING_MSG_ID)
-          return [...withoutStream, { role: 'assistant', content: response, steps: steps.length > 0 ? steps : undefined }]
-        })
-      }
-    } catch (err) {
+      const activeFile = openFiles.find(f => f.path === activeFileId)
+      const result = await agent.executeLoop({
+        task: userMsg.content,
+        model: {
+          provider: modelProvider,
+          model: model,
+        },
+        workspacePath,
+        activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
+      })
+      const response = result?.response || 'No response'
+      const steps = result?.steps || []
+      const toolCalls = result?.tool_calls || []
+      
+      // Convert tool calls to steps for display
+      const toolSteps = toolCalls.map((call: any, idx: number) => ({
+        tool: call.tool,
+        iteration: idx + 1,
+        status: 'done' as const,
+        summary: `Executed ${call.tool} with args: ${JSON.stringify(call.args)}`
+      }))
+      
+      // Clear live steps before adding final message
+      setAgentSteps([])
+      // Replace streaming placeholder with final authoritative response
       setMessages(prev => {
         const withoutStream = prev.filter(m => (m as any).__id !== STREAMING_MSG_ID)
-        return [...withoutStream, { role: 'assistant', content: 'Error communicating with agent.' }]
+        return [...withoutStream, { role: 'assistant', content: response, steps: [...toolSteps, ...steps].length > 0 ? [...toolSteps, ...steps] : undefined }]
+      })
+    } catch (err) {
+      console.error('Agent error:', err)
+      setMessages(prev => {
+        const withoutStream = prev.filter(m => (m as any).__id !== STREAMING_MSG_ID)
+        return [...withoutStream, { role: 'assistant', content: `Error communicating with agent: ${err instanceof Error ? err.message : String(err)}` }]
       })
     } finally {
       setIsLoading(false)
@@ -635,8 +743,7 @@ function App() {
   }
 
   const handlePermissionResponse = async (approved: boolean, stepIdx?: number) => {
-    const ipc = (window as any).ipcRenderer
-    if (ipc) {
+    try {
       let requestId: string | undefined;
 
       if (stepIdx !== undefined && agentSteps[stepIdx]) {
@@ -648,18 +755,26 @@ function App() {
         }])
       }
 
-      await ipc.invoke('agent:permission-response', { approved, requestId })
+      await agent.sendPermissionResponse(approved, requestId)
+    } catch (error) {
+      console.error('Error sending permission response:', error)
     }
   }
 
   const handleStop = async () => {
-    const ipc = (window as any).ipcRenderer
-    if (ipc) await ipc.invoke('agent:stop')
+    try {
+      await agent.stop()
+    } catch (error) {
+      console.error('Error stopping agent:', error)
+    }
   }
 
   const handleReset = async () => {
-    const ipc = (window as any).ipcRenderer
-    if (ipc) await ipc.invoke('agent:reset')
+    try {
+      await agent.reset()
+    } catch (error) {
+      console.error('Error resetting agent:', error)
+    }
     setMessages([{ role: 'assistant', content: 'Conversation reset. How can I help you now?' }])
     setAgentSteps([])
   }
@@ -693,14 +808,11 @@ function App() {
   const handleCreateNewFile = async () => {
     if (!newFileDialog || !newItemName.trim()) return
 
-    const ipc = (window as any).ipcRenderer
-    if (!ipc) return
-
     try {
       const separator = newFileDialog.parentPath.includes('\\') ? '\\' : '/'
       const fullPath = newFileDialog.parentPath + separator + newItemName.trim()
 
-      await ipc.invoke('fs:createFile', fullPath)
+      await fs.createFile(fullPath)
       // Automatically open newly created files
       handleFileOpen(fullPath, newItemName.trim())
 
@@ -716,14 +828,11 @@ function App() {
   const handleCreateNewFolder = async () => {
     if (!newFolderDialog || !newItemName.trim()) return
 
-    const ipc = (window as any).ipcRenderer
-    if (!ipc) return
-
     try {
       const separator = newFolderDialog.parentPath.includes('\\') ? '\\' : '/'
       const fullPath = newFolderDialog.parentPath + separator + newItemName.trim()
 
-      await ipc.invoke('fs:createDirectory', fullPath)
+      await fs.createDirectory(fullPath)
 
       setRefreshKey(prev => prev + 1)
       setNewFolderDialog(null)
@@ -766,24 +875,38 @@ function App() {
         handleMenuHover={() => { }}
         handleMenuAction={(action) => {
           setActiveMenu(null)
-          const ipc = (window as any).ipcRenderer
-          if (!ipc) return
-          if (action === 'exit') ipc.send('app:exit')
-          else if (action === 'about') setIsAboutOpen(true)
-          else if (action === 'new-terminal') setIsTerminalOpen(true)
-          else if (action === 'toggle-terminal') setIsTerminalOpen(prev => !prev)
-          else if (action === 'toggle-sidebar') setActiveView(prev => prev ? null : 'explorer')
-
-          else if (action === 'open-folder') {
-            ipc.invoke('dialog:openFolder').then((result: any) => {
+          if (action === 'exit') {
+            // Close the window
+            window.close()
+          } else if (action === 'about') {
+            setIsAboutOpen(true)
+          } else if (action === 'new-terminal') {
+            setIsTerminalOpen(true)
+          } else if (action === 'toggle-terminal') {
+            setIsTerminalOpen(prev => !prev)
+          } else if (action === 'toggle-sidebar') {
+            setActiveView(prev => prev ? null : 'explorer')
+          } else if (action === 'open-folder') {
+            dialog.openFolder().then((result: any) => {
               if (result && !result.canceled && result.filePaths?.length > 0) {
-                setWorkspacePath(result.filePaths[0])
+                const folderPath = result.filePaths[0]
+                // Clear old workspace: close all open files and reset state
+                setOpenFiles([])
+                setActiveFileId(null)
+                setWorkspacePath(folderPath)
+                workspace.setWorkspace(folderPath).catch((error: any) => {
+                  console.error('Error setting workspace in backend:', error)
+                })
                 setMessages([])
                 setAgentSteps([])
-                ipc.invoke('agent:reset')
+                agent.reset()
               }
+            }).catch((error: any) => {
+              console.error('Error opening folder:', error)
             })
-          } else if (action === 'save') handleFileSave()
+          } else if (action === 'save') {
+            handleFileSave()
+          }
         }}
       />
 
@@ -848,14 +971,23 @@ function App() {
                       <button
                         className="sidebar-action-btn"
                         onClick={() => {
-                          const ipc = (window as any).ipcRenderer;
-                          if (ipc) {
-                            ipc.invoke('dialog:openFolder').then((result: any) => {
-                              if (result && !result.canceled && result.filePaths?.length > 0) {
-                                setWorkspacePath(result.filePaths[0]);
-                              }
-                            });
-                          }
+                          dialog.openFolder().then((result: any) => {
+                            if (result && !result.canceled && result.filePaths?.length > 0) {
+                              const folderPath = result.filePaths[0];
+                              // Clear old workspace: close all open files and reset state
+                              setOpenFiles([])
+                              setActiveFileId(null)
+                              setWorkspacePath(folderPath);
+                              workspace.setWorkspace(folderPath).catch((error: any) => {
+                                console.error('Error setting workspace in backend:', error)
+                              })
+                              setMessages([])
+                              setAgentSteps([])
+                              agent.reset()
+                            }
+                          }).catch((error: any) => {
+                            console.error('Error opening folder:', error)
+                          });
                         }}
                         title="Open Folder"
                       >
@@ -986,15 +1118,27 @@ function App() {
             getLanguage={getLanguage}
             handleContentChange={handleContentChange}
             handleMenuAction={(action) => {
-              const ipc = (window as any).ipcRenderer
-              if (!ipc) return
               if (action === 'open-folder') {
-                ipc.invoke('dialog:openFolder').then((result: any) => {
+                dialog.openFolder().then((result: any) => {
                   if (result && !result.canceled && result.filePaths?.length > 0) {
-                    setWorkspacePath(result.filePaths[0])
+                    const folderPath = result.filePaths[0]
+                    // Clear old workspace: close all open files and reset state
+                    setOpenFiles([])
+                    setActiveFileId(null)
+                    setWorkspacePath(folderPath)
+                    workspace.setWorkspace(folderPath).catch((error: any) => {
+                      console.error('Error setting workspace in backend:', error)
+                    })
+                    setMessages([])
+                    setAgentSteps([])
+                    agent.reset()
                   }
+                }).catch((error: any) => {
+                  console.error('Error opening folder:', error)
                 })
-              } else if (action === 'new-terminal') setIsTerminalOpen(true)
+              } else if (action === 'new-terminal') {
+                setIsTerminalOpen(true)
+              }
             }}
             fileErrors={fileErrors}
             onFixError={handleFixError}

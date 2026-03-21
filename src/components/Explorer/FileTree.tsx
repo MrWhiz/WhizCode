@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import type { FileEntry } from '../../types'
+import { fs, events } from '../../lib/tauri-api'
 
 interface ContextMenu {
     x: number
@@ -17,7 +18,8 @@ const FileTreeItem = ({
     collapseAll = false, 
     fileFilter = '', 
     fileErrors = {}, 
-    gitStatus = null 
+    gitStatus = null,
+    workspacePath = ''
 }: { 
     entry: FileEntry, 
     level?: number, 
@@ -27,16 +29,28 @@ const FileTreeItem = ({
     collapseAll?: boolean,
     fileFilter?: string,
     fileErrors?: Record<string, number>,
-    gitStatus?: { branch: string, changes: { file: string, status: string }[] } | null
+    gitStatus?: { branch: string, changes: { file: string, status: string }[] } | null,
+    workspacePath?: string
 }) => {
     const [expanded, setExpanded] = useState(false)
     const [children, setChildren] = useState<FileEntry[]>([])
 
     const fetchChildren = useCallback(async () => {
-        const ipc = (window as any).ipcRenderer;
-        if (ipc && entry.isDirectory) {
-            const res = await ipc.invoke('fs:readDirectory', entry.path);
-            setChildren(res);
+        if (entry.isDirectory) {
+            try {
+                const res = await fs.readDirectory(entry.path)
+                // Sort: folders first, then files, both alphabetically
+                const sorted = res.sort((a, b) => {
+                    if (a.isDirectory === b.isDirectory) {
+                        return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+                    }
+                    return a.isDirectory ? -1 : 1
+                })
+                setChildren(sorted)
+            } catch (error) {
+                console.error('Failed to read directory:', error)
+                setChildren([])
+            }
         }
     }, [entry.path, entry.isDirectory])
 
@@ -105,27 +119,51 @@ const FileTreeItem = ({
     }
 
     const getGitStatus = () => {
-        if (!gitStatus || !gitStatus.changes) return null;
+        if (!gitStatus || !gitStatus.changes) {
+            return null;
+        }
         
         const changes = gitStatus.changes;
-        const entryPath = entry.path.replace(/\\/g, '/');
-        const lowerEntryEdge = entryPath.toLowerCase();
         
+        // Normalize paths by removing Windows UNC prefix (\\?\)
+        const normalizePath = (p: string) => {
+            return p.replace(/\\/g, '/').replace(/^\/\?\//, '').toLowerCase();
+        };
+        
+        // Convert absolute path to relative path from workspace root
+        let relativePath = entry.path;
+        if (workspacePath) {
+            const wsPath = normalizePath(workspacePath);
+            const entryPath = normalizePath(entry.path);
+            
+            if (entryPath.startsWith(wsPath)) {
+                relativePath = entryPath.substring(wsPath.length).replace(/^\//, '');
+            } else {
+                relativePath = entryPath;
+            }
+        } else {
+            relativePath = normalizePath(entry.path);
+        }
+        
+        // Find exact match for this file/folder
         const match = changes.find(c => {
-            const normGitPath = c.file.replace(/\\/g, '/').replace(/\/$/, '').trim();
-            const lowerGit = normGitPath.toLowerCase();
-            return lowerEntryEdge.endsWith('/' + lowerGit) || lowerEntryEdge === lowerGit;
+            const gitFilePath = normalizePath(c.file);
+            return gitFilePath === relativePath;
         });
         
-        if (match) return match.status;
+        if (match) {
+            return match.status;
+        }
 
         if (entry.isDirectory) {
-            const lowerName = entry.name.toLowerCase();
+            // Check if any git change is inside this directory
             const hasChangesInside = changes.some(c => {
-                const normGitPath = c.file.replace(/\\/g, '/').toLowerCase();
-                return normGitPath.includes('/' + lowerName + '/') || normGitPath.startsWith(lowerName + '/');
+                const gitFilePath = normalizePath(c.file);
+                return gitFilePath.startsWith(relativePath + '/');
             });
-            if (hasChangesInside) return 'M'; 
+            if (hasChangesInside) {
+                return 'M';
+            }
         }
         
         return null;
@@ -206,7 +244,8 @@ const FileTreeItem = ({
                             collapseAll={collapseAll} 
                             fileFilter={fileFilter} 
                             fileErrors={fileErrors} 
-                            gitStatus={gitStatus} 
+                            gitStatus={gitStatus}
+                            workspacePath={workspacePath}
                         />
                     ))}
                 </div>
@@ -243,10 +282,22 @@ export const FileTree = ({
     const [newItemName, setNewItemName] = useState('')
 
     const fetchFiles = useCallback(async () => {
-        const ipc = (window as any).ipcRenderer;
-        if (ipc) {
-            const res = await ipc.invoke('fs:readDirectory', path);
-            setFiles(res);
+        try {
+            const res = await fs.readDirectory(path)
+            // Sort: folders first, then files, both alphabetically
+            const sorted = res.sort((a, b) => {
+                if (a.isDirectory === b.isDirectory) {
+                    return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+                }
+                return a.isDirectory ? -1 : 1
+            })
+            setFiles(sorted)
+        } catch (error) {
+            console.error('Failed to read directory:', path, error)
+            if (error instanceof Error) {
+                console.error('Error details:', error.message)
+            }
+            setFiles([])
         }
     }, [path])
 
@@ -255,19 +306,27 @@ export const FileTree = ({
     }, [fetchFiles, externalRefreshKey])
 
     useEffect(() => {
-        const ipc = (window as any).ipcRenderer;
-        if (!ipc) return;
+        let unlistenFileChanged: (() => void) | null = null
 
-        const handler = () => {
-            fetchFiles();
-            setRefreshKey(prev => prev + 1);
-        };
+        const setupListener = async () => {
+            try {
+                unlistenFileChanged = await events.onFileChanged(() => {
+                    fetchFiles()
+                    setRefreshKey(prev => prev + 1)
+                })
+            } catch (error) {
+                console.error('Failed to setup file change listener:', error)
+            }
+        }
 
-        ipc.on('fs:directoryChanged', handler);
+        setupListener()
+
         return () => {
-            ipc.off('fs:directoryChanged', handler);
-        };
-    }, [fetchFiles]);
+            if (unlistenFileChanged) {
+                unlistenFileChanged()
+            }
+        }
+    }, [fetchFiles])
 
     const handleContextMenu = (e: React.MouseEvent, entry: FileEntry) => {
         setContextMenu({
@@ -288,8 +347,6 @@ export const FileTree = ({
 
     const handleMenuAction = async (action: string) => {
         if (!contextMenu) return
-        const ipc = (window as any).ipcRenderer
-        if (!ipc) return
 
         const entry = contextMenu.entry
         setContextMenu(null)
@@ -304,20 +361,30 @@ export const FileTree = ({
             case 'rename':
                 const newName = prompt('Enter new name:', entry.name)
                 if (newName && newName !== entry.name) {
-                    const success = await ipc.invoke('fs:rename', { oldPath: entry.path, newName })
-                    if (success) {
+                    try {
                         const newPath = entry.path.substring(0, entry.path.lastIndexOf('\\') + 1) + newName
+                        await fs.renameFile(entry.path, newPath)
                         onFileRenamed?.(entry.path, newPath)
                         fetchFiles()
+                    } catch (error) {
+                        console.error('Failed to rename file:', error)
+                        alert('Failed to rename file')
                     }
                 }
                 break
             case 'delete':
                 if (confirm(`Are you sure you want to delete ${entry.name}?`)) {
-                    const success = await ipc.invoke('fs:delete', entry.path)
-                    if (success) {
+                    try {
+                        if (entry.isDirectory) {
+                            await fs.deleteDirectory(entry.path)
+                        } else {
+                            await fs.deleteFile(entry.path)
+                        }
                         onFileDeleted?.(entry.path)
                         fetchFiles()
+                    } catch (error) {
+                        console.error('Failed to delete:', error)
+                        alert('Failed to delete')
                     }
                 }
                 break
@@ -329,28 +396,32 @@ export const FileTree = ({
                 navigator.clipboard.writeText(relPath)
                 break
             case 'revealInExplorer':
-                ipc.invoke('shell:reveal', entry.path)
+                // TODO: Implement shell reveal in Tauri
+                console.log('Reveal in explorer:', entry.path)
                 break
             case 'openInTerminal':
-                ipc.invoke('terminal:openAt', entry.isDirectory ? entry.path : path)
+                // TODO: Implement terminal open in Tauri
+                console.log('Open in terminal:', entry.isDirectory ? entry.path : path)
                 break
         }
     }
 
     const handleCreateItem = async () => {
         if (!newItemDialog || !newItemName) return
-        const ipc = (window as any).ipcRenderer
-        if (!ipc) return
 
-        const success = await ipc.invoke(
-            newItemDialog.type === 'file' ? 'fs:createFile' : 'fs:createDirectory',
-            { parentPath: newItemDialog.parentPath, name: newItemName }
-        )
-
-        if (success) {
+        try {
+            const itemPath = newItemDialog.parentPath + '/' + newItemName
+            if (newItemDialog.type === 'file') {
+                await fs.createFile(itemPath)
+            } else {
+                await fs.createDirectory(itemPath)
+            }
             setNewItemDialog(null)
             setNewItemName('')
             fetchFiles()
+        } catch (error) {
+            console.error('Failed to create item:', error)
+            alert('Failed to create item')
         }
     }
 
@@ -370,6 +441,7 @@ export const FileTree = ({
                     fileFilter={fileFilter}
                     fileErrors={fileErrors}
                     gitStatus={gitStatus}
+                    workspacePath={path}
                 />
             ))}
             

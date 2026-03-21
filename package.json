@@ -4,31 +4,27 @@
   "description": "Premium AI-powered Code Editor",
   "version": "0.1.0",
   "type": "module",
-  "main": "dist-electron/main.js",
   "scripts": {
-    "dev": "cross-env NODE_NO_WARNINGS=1 vite",
-    "prebuild": "powershell -Command \"Remove-Item -Path dist, dist-electron -Recurse -Force -ErrorAction SilentlyContinue; exit 0\"",
-    "build": "tsc -b && vite build",
+    "dev": "tauri dev",
+    "vite:dev": "vite",
+    "build": "tsc -b && vite build && tauri build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "package": "npm run build && cross-env WIN_CODESIGN_DIR=C:\\Users\\MrWhiz\\AppData\\Local\\electron-builder\\Cache\\winCodeSign\\990202979 electron-builder build --windows"
+    "tauri": "tauri"
   },
   "overrides": {
     "dompurify": "^3.3.3",
     "fast-xml-parser": "^5.5.7"
   },
   "dependencies": {
-    "chokidar": "^5.0.0",
-    "node-pty": "^1.1.0",
-    "systeminformation": "^5.31.5",
-    "tree-sitter": "^0.21.1",
-    "tree-sitter-typescript": "^0.23.2"
+    "systeminformation": "^5.31.5"
   },
   "devDependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.705.0",
     "@eslint/js": "^9.39.1",
     "@monaco-editor/react": "^4.7.0",
-    "@types/chokidar": "^1.7.5",
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/cli": "^2.10.1",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
@@ -36,11 +32,7 @@
     "@vitejs/plugin-react": "^5.1.1",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "7zip-bin": "^5.2.0",
-    "cross-env": "^10.1.0",
     "dompurify": "^3.3.3",
-    "electron": "^40.6.1",
-    "electron-builder": "^26.8.1",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
@@ -55,68 +47,6 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.48.0",
     "vite": "^7.3.1",
-    "vite-plugin-electron": "^0.29.0",
-    "vite-plugin-electron-renderer": "^0.14.6",
     "voyageai": "^0.2.1"
-  },
-  "build": {
-    "appId": "com.mrwhiz.whizcode",
-    "productName": "WhizCode",
-    "copyright": "Copyright © 2026 MrWhiz",
-    "files": [
-      "dist/**/*",
-      "dist-electron/**/*",
-      "package.json",
-      "!node_modules/**/*",
-      "node_modules/node-pty/**/*",
-      "node_modules/tree-sitter/**/*",
-      "node_modules/tree-sitter-typescript/**/*",
-      "node_modules/tree-sitter-javascript/**/*",
-      "node_modules/chokidar/**/*",
-      "node_modules/systeminformation/**/*",
-      "!node_modules/**/*.ts",
-      "!node_modules/**/*.d.ts",
-      "!node_modules/**/*.map",
-      "!node_modules/**/*.md",
-      "!node_modules/**/*.markdown",
-      "!node_modules/**/test/**/*",
-      "!node_modules/**/tests/**/*",
-      "!node_modules/**/examples/**/*",
-      "!node_modules/**/docs/**/*",
-      "!node_modules/**/.github/**/*",
-      "!node_modules/**/.gitignore",
-      "!node_modules/**/.eslintrc*",
-      "!node_modules/**/tsconfig.json",
-      "!node_modules/**/jest.config.*",
-      "!node_modules/**/webpack.config.*",
-      "!node_modules/**/rollup.config.*",
-      "!node_modules/**/package-lock.json",
-      "!node_modules/**/yarn.lock",
-      "!node_modules/**/pnpm-lock.yaml"
-    ],
-    "directories": {
-      "output": "release/${version}"
-    },
-    "win": {
-      "target": [
-        "nsis"
-      ],
-      "icon": "release/0.1.0/.icon-ico/icon.ico"
-    },
-    "nsis": {
-      "oneClick": true,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": false,
-      "deleteAppDataOnUninstall": false,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "installerIcon": "release/0.1.0/.icon-ico/icon.ico",
-      "uninstallerIcon": "release/0.1.0/.icon-ico/icon.ico",
-      "installerHeaderIcon": "release/0.1.0/.icon-ico/icon.ico",
-      "differentialPackage": true
-    },
-    "npmRebuild": false,
-    "asar": true,
-    "compression": "maximum"
   }
 }

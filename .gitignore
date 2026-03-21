@@ -16,14 +16,21 @@ out
 release
 build
 
+# Rust/Tauri builds
+src-tauri/target/
+src-tauri/gen/
+Cargo.lock
+
 # Project Context & Local Config
 *.local
 .whizcode
 .gemini
+.knowledge
 
 # Temp / Scratch
 tmp
 temp_test
+check_output.txt
 
 # Editor directories and files
 .vscode/*
@@ -35,3 +42,20 @@ temp_test
 *.njsproj
 *.sln
 *.sw?
+
+# OS files
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Environment
+.env
+.env.local
+.env.*.local

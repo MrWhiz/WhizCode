@@ -11,7 +11,7 @@ Split the installer into 5 parts of 20MB each, email them separately, then rejoi
 ### Step 1: Split the Installer
 Run the split script:
 ```powershell
-.\split-installer.ps1
+.\scripts\split-installer.ps1
 ```
 
 This creates 5 files in `release/0.1.0/split/`:

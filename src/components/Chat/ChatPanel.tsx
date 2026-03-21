@@ -611,12 +611,6 @@ export const ChatPanel = ({
                         <div className="chat-msg assistant">
                             <div className="chat-msg-sender">WHIZCODE</div>
                             <div className="chat-msg-content">
-                                {liveStreamingContent && (
-                                    <div className="reasoning-stream" style={{ marginBottom: '12px', opacity: 0.9 }}>
-                                        <MessageContent content={liveStreamingContent} role="assistant" />
-                                    </div>
-                                )}
-                                
                                 {agentSteps.length > 0 && (
                                     <div className="agent-steps live">
                                         {agentSteps.map((step, si) => (

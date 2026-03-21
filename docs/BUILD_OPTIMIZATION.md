@@ -85,7 +85,7 @@ For future releases, use differential packages:
 
 ## Build Size Breakdown
 
-Typical size distribution (100MB installer):
+Typical size distribution (99MB installer):
 - Electron runtime: ~40-50MB
 - Node modules: ~30-40MB
 - Application code: ~5-10MB

@@ -260,4 +260,3 @@ If you have questions about the license:
 ---
 
 **Remember:** The goal is to keep WhizCode open source and free, while preventing commercial exploitation.
-

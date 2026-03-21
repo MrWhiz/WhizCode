@@ -299,10 +299,19 @@ npm run lint
 npm run package
 ```
 
+This creates a 99MB NSIS installer in `release/0.1.0/`.
+
 **Split for email distribution (20MB limit):**
 ```bash
 .\scripts\split-installer.ps1
 ```
+
+This creates 5 parts:
+- `WhizCode_Part_1_of_5.bin` (20 MB)
+- `WhizCode_Part_2_of_5.bin` (20 MB)
+- `WhizCode_Part_3_of_5.bin` (20 MB)
+- `WhizCode_Part_4_of_5.bin` (20 MB)
+- `WhizCode_Part_5_of_5.bin` (19.36 MB)
 
 **Rejoin split parts:**
 ```bash
@@ -317,49 +326,26 @@ See [docs/DISTRIBUTION_GUIDE.md](docs/DISTRIBUTION_GUIDE.md) for detailed instru
 - Build Time: ~2-3 minutes
 - Supported OS: Windows 10+
 
-## 🔍 Troubleshooting
+## � Security
 
-### Common Issues
+WhizCode includes comprehensive security measures:
+- **Path Traversal Prevention** - Validates all file operations stay within workspace
+- **Command Injection Prevention** - Uses safe argument arrays for external commands
+- **Input Validation** - Strict validation on all IPC handlers
+- **Sensitive Data Encryption** - Azure tokens encrypted with AES-256-CBC
+- **Secure IPC Communication** - Context isolation and preload validation
 
-**"Ollama not detected"**
-```bash
-ollama serve
-```
+See [docs/SECURITY.md](docs/SECURITY.md) for detailed security implementation.
 
-**"Model not found"**
-```bash
-ollama list  # Check installed models
-ollama pull <model-name>
-```
+## 📦 Build Optimization
 
-**Agent is slow**
-- Use smaller models (3b or 7b)
-- Use same model for both roles
-- Check RAM usage
+WhizCode is optimized for minimal size and maximum performance:
+- **Code Splitting** - Large libraries split into separate chunks
+- **Terser Minification** - Aggressive minification with console removal
+- **Whitelist-Only Dependencies** - Only runtime dependencies included
+- **Maximum Compression** - NSIS uses best compression algorithm
 
-**Agent keeps repeating actions**
-- Built-in loop detection will self-correct
-- Click "Stop" and rephrase request if stuck
-
-### Performance Optimization
-
-**Hardware Requirements:**
-- Minimum: 8GB RAM, use 3b models
-- Recommended: 16GB RAM, use 7b-8b models  
-- Optimal: 32GB+ RAM, use 13b-16b models
-
-**Response Times:**
-- First request: 2-10s (model loading)
-- Subsequent: 0.5-3s (model cached)
-- Tool execution: 0.1-1s (file operations)
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+See [docs/BUILD_OPTIMIZATION.md](docs/BUILD_OPTIMIZATION.md) for optimization details.
 
 ## 📄 License
 
@@ -388,7 +374,63 @@ This project is licensed under the **GNU Affero General Public License v3.0 (AGP
 - Create proprietary versions
 - Remove attribution or license notices
 
-See [LICENSE](LICENSE) file for full details.
+See [LICENSE](LICENSE) file and [docs/LICENSE_GUIDE.md](docs/LICENSE_GUIDE.md) for full details.
+
+## � Troubleshooting
+
+### Common Issues
+
+**"Ollama not detected"**
+```bash
+ollama serve
+```
+
+**"Model not found"**
+```bash
+ollama list  # Check installed models
+ollama pull <model-name>
+```
+
+**Agent is slow**
+- Use smaller models (3b or 7b)
+- Use same model for both roles
+- Check RAM usage
+
+**Agent keeps repeating actions**
+- Built-in loop detection will self-correct
+- Click "Stop" and rephrase request if stuck
+
+### Build Issues
+- Clear `dist/` and `dist-electron/` directories
+- Run `npm install` to ensure dependencies are installed
+- Check Node.js version compatibility
+
+### Installer Issues
+- Verify all 5 parts are present (if using split installer)
+- Check file sizes match original split
+- Try manual rejoin with Command Prompt
+
+### Performance Optimization
+
+**Hardware Requirements:**
+- Minimum: 8GB RAM, use 3b models
+- Recommended: 16GB RAM, use 7b-8b models  
+- Optimal: 32GB+ RAM, use 13b-16b models
+
+**Response Times:**
+- First request: 2-10s (model loading)
+- Subsequent: 0.5-3s (model cached)
+- Tool execution: 0.1-1s (file operations)
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
+
+When contributing, your code will be licensed under AGPL-3.0 + Commons Clause. See [docs/LICENSE_GUIDE.md](docs/LICENSE_GUIDE.md) for details.
 
 ## 🙏 Acknowledgments
 

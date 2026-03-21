@@ -2172,14 +2172,8 @@ Searched for: "${edit.search.substring(0, 50)}..."`
           });
 
           try {
-            if (terminalManager) {
-              // Write to all terminals or a 'default' one if we had its actual ID
-              // For now, let's try to find an active one or just the first one
-              const terminals = terminalManager.getAllTerminals();
-              if (terminals.length > 0) {
-                terminalManager.write(terminals[0].id, `\r\n# Executing agent command: ${command}\r\n`);
-              }
-            }
+            // Note: Don't write command to terminal here - the shell will echo it automatically
+            // Writing it here causes duplication since the shell echoes the command anyway
 
             // Pre-check for directory creation commands (common source of "Operation cancelled" if dir exists)
             if ((command.includes('create-vite') || command.includes('create vite')) && command.includes('--template')) {

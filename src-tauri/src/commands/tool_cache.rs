@@ -83,7 +83,7 @@ impl ToolResultCache {
 }
 
 #[tauri::command]
-pub async fn tool_cache_get(tool: String, args: serde_json::Value) -> Result<Option<String>> {
+pub async fn tool_cache_get(_tool: String, _args: serde_json::Value) -> Result<Option<String>> {
     // This would need to be called with shared state
     Ok(None)
 }

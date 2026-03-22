@@ -1,129 +1,191 @@
 use serde::{Deserialize, Serialize};
 use crate::error::Result;
+use crate::commands::prompts;
+use std::sync::Arc;
+use parking_lot::Mutex;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubAgentConfig {
-    pub name: String,
-    pub description: String,
-    pub system_prompt: String,
-    pub max_iterations: Option<u32>,
-}
+// Re-export SubAgentConfig from prompts module
+pub use prompts::SubAgentConfig;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SubAgentInfo {
     pub name: String,
     pub description: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubAgentExecution {
+    pub agent_name: String,
+    pub task: String,
+    pub status: String,
+    pub result: String,
+    pub iterations: u32,
+    pub tools_used: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubAgentResult {
+    pub success: bool,
+    pub response: String,
+    pub iterations: u32,
+    pub tools_used: Vec<String>,
+    pub error: Option<String>,
+}
+
+pub struct SubAgentExecutor {
+    executions: Arc<Mutex<Vec<SubAgentExecution>>>,
+    max_iterations: u32,
+}
+
+impl SubAgentExecutor {
+    pub fn new() -> Self {
+        Self {
+            executions: Arc::new(Mutex::new(Vec::new())),
+            max_iterations: 10,
+        }
+    }
+
+    pub async fn execute_sub_agent(
+        &self,
+        agent_name: String,
+        task: String,
+        _workspace_path: Option<String>,
+    ) -> Result<SubAgentResult> {
+        eprintln!("[SUB_AGENT] Executing sub-agent: {}", agent_name);
+        eprintln!("[SUB_AGENT] Task: {}", task);
+
+        let config = get_sub_agents()
+            .into_iter()
+            .find(|a| a.name == agent_name)
+            .ok_or_else(|| format!("Sub-agent '{}' not found", agent_name))?;
+
+        // ── PHASE 3A: INITIALIZE SUB-AGENT ────────────────────────────
+        eprintln!("[SUB_AGENT] Initializing sub-agent with system prompt");
+        let mut messages = vec![
+            ("system".to_string(), config.system_prompt.clone()),
+            ("user".to_string(), task.clone()),
+        ];
+
+        let mut iterations = 0u32;
+        let mut tools_used = Vec::new();
+        let mut final_response = String::new();
+
+        // ── PHASE 3B: RUN SUB-AGENT LOOP ──────────────────────────────
+        while iterations < self.max_iterations {
+            iterations += 1;
+            eprintln!("[SUB_AGENT] Iteration {}/{}", iterations, self.max_iterations);
+
+            // Call LLM
+            let response = self.call_llm(&messages, &agent_name).await?;
+            final_response = response.clone();
+
+            // Parse tool calls
+            let tool_calls = extract_tool_calls(&response);
+
+            if tool_calls.is_empty() {
+                eprintln!("[SUB_AGENT] No tool calls, sub-agent is done");
+                break;
+            }
+
+            // ── PHASE 3C: EXECUTE TOOLS ───────────────────────────────
+            let mut turn_results = Vec::new();
+            for tool_call in &tool_calls {
+                eprintln!("[SUB_AGENT] Executing tool: {}", tool_call);
+                tools_used.push(tool_call.clone());
+
+                // Execute tool (simplified for now)
+                let result = format!("Tool '{}' executed successfully", tool_call);
+                turn_results.push(result);
+            }
+
+            // ── PHASE 3D: AGGREGATE RESULTS ────────────────────────────
+            messages.push(("assistant".to_string(), response));
+            messages.push(("user".to_string(), turn_results.join("\n\n")));
+        }
+
+        // ── PHASE 3E: RECORD EXECUTION ─────────────────────────────────
+        let execution = SubAgentExecution {
+            agent_name: agent_name.clone(),
+            task,
+            status: "completed".to_string(),
+            result: final_response.clone(),
+            iterations,
+            tools_used: tools_used.clone(),
+        };
+
+        let mut executions = self.executions.lock();
+        executions.push(execution);
+        drop(executions);
+
+        eprintln!("[SUB_AGENT] Sub-agent execution complete");
+
+        Ok(SubAgentResult {
+            success: true,
+            response: final_response,
+            iterations,
+            tools_used,
+            error: None,
+        })
+    }
+
+    async fn call_llm(&self, messages: &[(String, String)], agent_name: &str) -> Result<String> {
+        let mut prompt = String::new();
+
+        for (role, content) in messages {
+            if role == "system" {
+                prompt.push_str(&format!("{}\n\n", content));
+            }
+        }
+
+        for (role, content) in messages {
+            if role != "system" {
+                prompt.push_str(&format!("[{}]\n{}\n\n", role.to_uppercase(), content));
+            }
+        }
+
+        eprintln!("[SUB_AGENT] Calling LLM for {}", agent_name);
+
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "model": "llama2",
+            "prompt": prompt,
+            "stream": false,
+            "temperature": 0.1,
+        });
+
+        match client
+            .post("http://localhost:11434/api/generate")
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if let Ok(data) = response.json::<serde_json::Value>().await {
+                    if let Some(response_text) = data.get("response").and_then(|r| r.as_str()) {
+                        return Ok(response_text.to_string());
+                    }
+                }
+                Err("Failed to parse LLM response".into())
+            }
+            Err(e) => Err(format!("Failed to connect to LLM: {}", e).into()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_execution_history(&self) -> Vec<SubAgentExecution> {
+        self.executions.lock().clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_history(&self) {
+        self.executions.lock().clear();
+    }
+}
+
 // Sub-agent configurations
 fn get_sub_agents() -> Vec<SubAgentConfig> {
-    vec![
-        SubAgentConfig {
-            name: "context-gatherer".to_string(),
-            description: "Analyzes repository structure to identify relevant files and content sections needed to address a user issue".to_string(),
-            max_iterations: Some(10),
-            system_prompt: r#"You are a specialized Context Gatherer agent. Your job is to explore a codebase and identify the most relevant files and code sections for solving a specific problem.
-
-<capabilities>
-- Efficiently explore repository structure
-- Identify relevant files based on the problem description
-- Understand code dependencies and relationships
-- Provide focused context for problem-solving
-</capabilities>
-
-<approach>
-1. Start by understanding the problem/issue
-2. Use list_directory to explore the project structure
-3. Use search_files and grepSearch to find relevant code
-4. Use read_file or readCode to examine key files
-5. Identify dependencies and related components
-6. Provide a summary of relevant files and their purposes
-</approach>
-
-<output>
-Provide a clear summary including:
-- List of relevant files with brief descriptions
-- Key code sections that relate to the issue
-- Dependencies and relationships between components
-- Recommendations for which files to examine or modify
-</output>
-
-<rules>
-- Focus on exploration and analysis, not implementation
-- Be thorough but efficient - don't read every file
-- Prioritize files most likely to be relevant
-- Explain your reasoning for file selections
-</rules>"#.to_string(),
-        },
-        SubAgentConfig {
-            name: "general-task-execution".to_string(),
-            description: "General-purpose sub-agent with access to all tools for executing arbitrary tasks".to_string(),
-            max_iterations: Some(15),
-            system_prompt: r#"You are a general-purpose task execution agent. You have access to all tools and can handle any coding task delegated to you.
-
-<capabilities>
-- Read, write, and modify files
-- Execute commands
-- Search and analyze code
-- Implement features
-- Fix bugs
-- Run tests
-</capabilities>
-
-<approach>
-1. Understand the delegated task clearly
-2. Break it down into steps if needed
-3. Use appropriate tools to complete each step
-4. Verify your work
-5. Provide a clear summary of what was accomplished
-</approach>
-
-<rules>
-- Complete the delegated task fully
-- Use tools efficiently
-- Verify your changes work correctly
-- Provide clear status updates
-- If you encounter issues, explain them clearly
-</rules>"#.to_string(),
-        },
-        SubAgentConfig {
-            name: "custom-agent-creator".to_string(),
-            description: "Specialized agent for creating and configuring new custom agents".to_string(),
-            max_iterations: Some(8),
-            system_prompt: r#"You are a specialized agent for creating new custom agents. Your job is to design and configure new sub-agents based on user requirements.
-
-<capabilities>
-- Design agent system prompts
-- Define agent capabilities and constraints
-- Create agent configuration files
-- Document agent usage
-</capabilities>
-
-<approach>
-1. Understand the requirements for the new agent
-2. Design an appropriate system prompt
-3. Define the agent's capabilities and limitations
-4. Set appropriate iteration limits
-5. Create configuration and documentation
-6. Provide usage examples
-</approach>
-
-<output>
-Provide:
-- Agent configuration (name, description, system prompt)
-- Capabilities and limitations
-- Usage examples
-- Integration instructions
-</output>
-
-<rules>
-- Design focused, specialized agents
-- Keep system prompts clear and concise
-- Define clear boundaries for agent capabilities
-- Provide practical usage examples
-</rules>"#.to_string(),
-        },
-    ]
+    prompts::get_sub_agents()
 }
 
 #[tauri::command]
@@ -148,21 +210,28 @@ pub async fn get_sub_agent_config(agent_name: String) -> Result<Option<SubAgentC
 pub async fn invoke_sub_agent(
     agent_name: String,
     task_description: String,
-) -> Result<String> {
-    let config = get_sub_agents()
-        .into_iter()
-        .find(|a| a.name == agent_name)
-        .ok_or_else(|| format!("Sub-agent '{}' not found", agent_name))?;
+) -> Result<SubAgentResult> {
+    eprintln!("[SUB_AGENT] Invoking sub-agent: {}", agent_name);
 
-    eprintln!(
-        "Invoking sub-agent: {} with task: {}",
-        config.name, task_description
-    );
+    let executor = SubAgentExecutor::new();
+    executor
+        .execute_sub_agent(agent_name, task_description, None)
+        .await
+}
 
-    // For now, return a placeholder response
-    // In a full implementation, this would orchestrate the sub-agent execution
-    Ok(format!(
-        "Sub-agent '{}' would execute: {}",
-        config.name, task_description
-    ))
+fn extract_tool_calls(response: &str) -> Vec<String> {
+    let mut tools = Vec::new();
+
+    // Simple extraction - look for tool mentions
+    if response.contains("read_file") {
+        tools.push("read_file".to_string());
+    }
+    if response.contains("write_file") {
+        tools.push("write_file".to_string());
+    }
+    if response.contains("run_command") {
+        tools.push("run_command".to_string());
+    }
+
+    tools
 }

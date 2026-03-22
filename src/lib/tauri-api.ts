@@ -992,3 +992,17 @@ export default {
   toolCache,
   customTools,
 }
+
+// Planning Commands
+export const planning = {
+  async createExecutionPlan(userRequest: string, workspacePath?: string): Promise<any> {
+    try {
+      return await invoke('create_execution_plan', { 
+        user_request: userRequest, 
+        workspace_path: workspacePath 
+      })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+}

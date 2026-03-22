@@ -303,7 +303,7 @@ export const FileTree = ({
 
     useEffect(() => {
         fetchFiles()
-    }, [fetchFiles, externalRefreshKey])
+    }, [path, externalRefreshKey])
 
     useEffect(() => {
         let unlistenFileChanged: (() => void) | null = null
@@ -326,7 +326,7 @@ export const FileTree = ({
                 unlistenFileChanged()
             }
         }
-    }, [fetchFiles])
+    }, [])
 
     const handleContextMenu = (e: React.MouseEvent, entry: FileEntry) => {
         setContextMenu({

@@ -21,6 +21,7 @@ pub struct AppState {
     pub app_handle: Option<AppHandle>,
 }
 
+#[allow(dead_code)]
 impl AppState {
     pub fn new() -> Self {
         AppState {

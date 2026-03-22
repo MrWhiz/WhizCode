@@ -79,13 +79,9 @@ pub async fn read_directory(
             .to_string()
     };
     
-    eprintln!("[read_directory] workspace={}, path={}", workspace, path);
-    
     let dir_path = PathBuf::from(&path);
     let workspace_path = PathBuf::from(&workspace);
     let resolved = utils::validate_path_in_workspace(&dir_path, &workspace_path)?;
-    
-    eprintln!("[read_directory] resolved={}", resolved.display());
     
     let mut entries = Vec::new();
     let mut dir = tokio::fs::read_dir(&resolved).await
@@ -104,7 +100,6 @@ pub async fn read_directory(
         });
     }
     
-    eprintln!("[read_directory] found {} entries", entries.len());
     Ok(entries)
 }
 

@@ -1,5 +1,6 @@
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { useState, useEffect } from 'react'
+import { saveAppState } from '../lib/appState'
 
 interface MenuItem {
     label?: string
@@ -52,10 +53,13 @@ export const TitleBar = ({ menus, activeMenu, toggleMenu, handleMenuHover, handl
             const appWindow = WebviewWindow.getCurrent()
             if (isMaximized) {
                 await appWindow.unmaximize()
+                setIsMaximized(false)
+                saveAppState({ isMaximized: false })
             } else {
                 await appWindow.maximize()
+                setIsMaximized(true)
+                saveAppState({ isMaximized: true })
             }
-            setIsMaximized(!isMaximized)
         } catch (error) {
             console.error('Failed to maximize:', error)
         }

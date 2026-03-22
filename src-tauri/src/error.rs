@@ -44,4 +44,34 @@ impl From<&str> for ApiError {
     }
 }
 
+impl From<reqwest::Error> for ApiError {
+    fn from(err: reqwest::Error) -> Self {
+        ApiError {
+            code: "NETWORK_ERROR".to_string(),
+            message: err.to_string(),
+            details: None,
+        }
+    }
+}
+
+impl From<tokio::time::error::Elapsed> for ApiError {
+    fn from(err: tokio::time::error::Elapsed) -> Self {
+        ApiError {
+            code: "TIMEOUT".to_string(),
+            message: err.to_string(),
+            details: None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(err: serde_json::Error) -> Self {
+        ApiError {
+            code: "JSON_ERROR".to_string(),
+            message: err.to_string(),
+            details: None,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ApiError>;

@@ -108,13 +108,13 @@ impl CustomToolRegistry {
 }
 
 #[tauri::command]
-pub async fn register_custom_tool(tool: CustomTool) -> Result<()> {
+pub async fn register_custom_tool(_tool: CustomTool) -> Result<()> {
     // This would need to be called with shared state
     Ok(())
 }
 
 #[tauri::command]
-pub async fn unregister_custom_tool(name: String) -> Result<()> {
+pub async fn unregister_custom_tool(_name: String) -> Result<()> {
     // This would need to be called with shared state
     Ok(())
 }
@@ -126,7 +126,7 @@ pub async fn list_custom_tools() -> Result<Vec<CustomTool>> {
 }
 
 #[tauri::command]
-pub async fn execute_custom_tool(name: String, args: Vec<String>) -> Result<String> {
+pub async fn execute_custom_tool(_name: String, _args: Vec<String>) -> Result<String> {
     // This would need to be called with shared state
     Ok(String::new())
 }

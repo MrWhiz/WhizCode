@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,6 +13,8 @@ pub struct CodeSymbol {
     pub line_number: u32,
     pub scope: String,
     pub dependencies: Vec<String>,
+    pub complexity: f32,
+    pub last_modified: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +24,7 @@ pub struct CodeReference {
     pub file_path: String,
     pub line_number: u32,
     pub context: String,
+    pub reference_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +32,7 @@ pub struct CodeRelationship {
     pub from_symbol: String,
     pub to_symbol: String,
     pub relationship_type: String,
+    pub strength: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +41,7 @@ pub struct CodePattern {
     pub pattern_name: String,
     pub description: String,
     pub occurrences: u32,
+    pub severity: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +51,17 @@ pub struct CodeMetrics {
     pub average_complexity: f32,
     pub cohesion_score: f32,
     pub technical_debt: f32,
+    pub maintainability_index: f32,
+    pub cyclomatic_complexity: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefactoringRecommendation {
+    pub file_path: String,
+    pub recommendation: String,
+    pub priority: String,
+    pub estimated_effort: f32,
+    pub impact: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,21 +71,29 @@ pub struct SemanticContext {
     pub relationships: Vec<CodeRelationship>,
     pub patterns: Vec<CodePattern>,
     pub metrics: CodeMetrics,
+    pub last_analyzed: u64,
 }
 
 pub struct CodeIntelligence {
-    contexts: HashMap<String, SemanticContext>,
+    contexts: Arc<Mutex<HashMap<String, SemanticContext>>>,
 }
 
 #[allow(dead_code)]
 impl CodeIntelligence {
     pub fn new() -> Self {
         Self {
-            contexts: HashMap::new(),
+            contexts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn analyze_workspace(&mut self, workspace_path: String) -> Result<SemanticContext> {
+    fn current_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    pub async fn analyze_workspace(&self, workspace_path: String) -> Result<SemanticContext> {
         eprintln!("Analyzing workspace: {}", workspace_path);
 
         let context = SemanticContext {
@@ -81,15 +107,20 @@ impl CodeIntelligence {
                 average_complexity: 0.0,
                 cohesion_score: 0.0,
                 technical_debt: 0.0,
+                maintainability_index: 100.0,
+                cyclomatic_complexity: 1.0,
             },
+            last_analyzed: Self::current_timestamp(),
         };
 
-        self.contexts.insert(workspace_path, context.clone());
+        let mut contexts = self.contexts.lock().unwrap();
+        contexts.insert(workspace_path, context.clone());
         Ok(context)
     }
 
     pub fn get_symbol_info(&self, workspace_path: &str, symbol_name: &str) -> Option<CodeSymbol> {
-        self.contexts
+        let contexts = self.contexts.lock().unwrap();
+        contexts
             .get(workspace_path)
             .and_then(|ctx| {
                 ctx.symbols
@@ -100,7 +131,8 @@ impl CodeIntelligence {
     }
 
     pub fn find_related_symbols(&self, workspace_path: &str, symbol_name: &str) -> Vec<CodeSymbol> {
-        self.contexts
+        let contexts = self.contexts.lock().unwrap();
+        contexts
             .get(workspace_path)
             .map(|ctx| {
                 ctx.relationships
@@ -119,35 +151,60 @@ impl CodeIntelligence {
             .unwrap_or_default()
     }
 
-    pub fn suggest_refactoring(&self, workspace_path: &str, file_path: &str) -> Vec<String> {
+    pub fn suggest_refactoring(&self, workspace_path: &str, file_path: &str) -> Vec<RefactoringRecommendation> {
         let mut suggestions = vec![];
+        let contexts = self.contexts.lock().unwrap();
 
-        if let Some(ctx) = self.contexts.get(workspace_path) {
-            // Find symbols in this file
+        if let Some(ctx) = contexts.get(workspace_path) {
             let file_symbols: Vec<_> = ctx
                 .symbols
                 .iter()
                 .filter(|s| s.file_path == file_path)
                 .collect();
 
-            // Suggest refactoring based on complexity
             if ctx.metrics.average_complexity > 10.0 {
-                suggestions.push("Consider breaking down complex functions".to_string());
+                suggestions.push(RefactoringRecommendation {
+                    file_path: file_path.to_string(),
+                    recommendation: "Consider breaking down complex functions".to_string(),
+                    priority: "high".to_string(),
+                    estimated_effort: 4.0,
+                    impact: "Improves maintainability and testability".to_string(),
+                });
             }
 
-            // Suggest based on unused symbols
             if file_symbols.len() > 20 {
-                suggestions.push("File has many symbols, consider splitting into modules".to_string());
+                suggestions.push(RefactoringRecommendation {
+                    file_path: file_path.to_string(),
+                    recommendation: "File has many symbols, consider splitting into modules".to_string(),
+                    priority: "medium".to_string(),
+                    estimated_effort: 6.0,
+                    impact: "Improves code organization and reusability".to_string(),
+                });
             }
 
-            // Suggest based on dependencies
             let high_dependency_symbols: Vec<_> = file_symbols
                 .iter()
                 .filter(|s| s.dependencies.len() > 5)
                 .collect();
 
             if !high_dependency_symbols.is_empty() {
-                suggestions.push("Some symbols have high coupling, consider refactoring".to_string());
+                suggestions.push(RefactoringRecommendation {
+                    file_path: file_path.to_string(),
+                    recommendation: "Some symbols have high coupling, consider refactoring".to_string(),
+                    priority: "medium".to_string(),
+                    estimated_effort: 5.0,
+                    impact: "Reduces coupling and improves modularity".to_string(),
+                });
+            }
+
+            if ctx.metrics.technical_debt > 0.3 {
+                suggestions.push(RefactoringRecommendation {
+                    file_path: file_path.to_string(),
+                    recommendation: "High technical debt detected, prioritize refactoring".to_string(),
+                    priority: "high".to_string(),
+                    estimated_effort: 8.0,
+                    impact: "Reduces maintenance burden and improves code quality".to_string(),
+                });
             }
         }
 
@@ -155,28 +212,119 @@ impl CodeIntelligence {
     }
 
     pub fn get_workspace_context(&self, workspace_path: &str) -> Option<SemanticContext> {
-        self.contexts.get(workspace_path).cloned()
+        let contexts = self.contexts.lock().unwrap();
+        contexts.get(workspace_path).cloned()
     }
 
     pub fn get_all_symbols(&self, workspace_path: &str) -> Vec<CodeSymbol> {
-        self.contexts
+        let contexts = self.contexts.lock().unwrap();
+        contexts
             .get(workspace_path)
             .map(|ctx| ctx.symbols.clone())
             .unwrap_or_default()
     }
 
     pub fn get_code_metrics(&self, workspace_path: &str) -> Option<CodeMetrics> {
-        self.contexts
+        let contexts = self.contexts.lock().unwrap();
+        contexts
             .get(workspace_path)
             .map(|ctx| ctx.metrics.clone())
+    }
+
+    pub fn get_all_relationships(&self, workspace_path: &str) -> Vec<CodeRelationship> {
+        let contexts = self.contexts.lock().unwrap();
+        contexts
+            .get(workspace_path)
+            .map(|ctx| ctx.relationships.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn get_all_patterns(&self, workspace_path: &str) -> Vec<CodePattern> {
+        let contexts = self.contexts.lock().unwrap();
+        contexts
+            .get(workspace_path)
+            .map(|ctx| ctx.patterns.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn find_circular_dependencies(&self, workspace_path: &str) -> Vec<Vec<String>> {
+        let contexts = self.contexts.lock().unwrap();
+        let mut cycles = vec![];
+
+        if let Some(ctx) = contexts.get(workspace_path) {
+            for symbol in &ctx.symbols {
+                let mut visited = std::collections::HashSet::new();
+                let mut path = vec![symbol.id.clone()];
+                if self.has_cycle(&ctx.relationships, &symbol.id, &mut visited, &mut path) {
+                    cycles.push(path);
+                }
+            }
+        }
+
+        cycles
+    }
+
+    fn has_cycle(
+        &self,
+        relationships: &[CodeRelationship],
+        current: &str,
+        visited: &mut std::collections::HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> bool {
+        visited.insert(current.to_string());
+
+        for rel in relationships {
+            if rel.from_symbol == current {
+                if visited.contains(&rel.to_symbol) {
+                    path.push(rel.to_symbol.clone());
+                    return true;
+                }
+                path.push(rel.to_symbol.clone());
+                if self.has_cycle(relationships, &rel.to_symbol, visited, path) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+
+        false
+    }
+
+    pub fn calculate_impact_analysis(&self, workspace_path: &str, symbol_id: &str) -> HashMap<String, Vec<String>> {
+        let contexts = self.contexts.lock().unwrap();
+        let mut impact = HashMap::new();
+
+        if let Some(ctx) = contexts.get(workspace_path) {
+            let mut direct_dependents = vec![];
+            let mut transitive_dependents = vec![];
+
+            for rel in &ctx.relationships {
+                if rel.to_symbol == symbol_id {
+                    direct_dependents.push(rel.from_symbol.clone());
+                }
+            }
+
+            for dependent in &direct_dependents {
+                for rel in &ctx.relationships {
+                    if rel.to_symbol == *dependent {
+                        transitive_dependents.push(rel.from_symbol.clone());
+                    }
+                }
+            }
+
+            impact.insert("direct_dependents".to_string(), direct_dependents);
+            impact.insert("transitive_dependents".to_string(), transitive_dependents);
+        }
+
+        impact
     }
 }
 
 #[tauri::command]
-pub async fn code_intelligence_analyze_workspace(_workspace_path: String) -> Result<SemanticContext> {
-    eprintln!("Code intelligence analyzing workspace");
+pub async fn code_intelligence_analyze_workspace(workspace_path: String) -> Result<SemanticContext> {
+    eprintln!("Code intelligence analyzing workspace: {}", workspace_path);
     Ok(SemanticContext {
-        workspace_path: String::new(),
+        workspace_path,
         symbols: vec![],
         relationships: vec![],
         patterns: vec![],
@@ -186,35 +334,78 @@ pub async fn code_intelligence_analyze_workspace(_workspace_path: String) -> Res
             average_complexity: 0.0,
             cohesion_score: 0.0,
             technical_debt: 0.0,
+            maintainability_index: 100.0,
+            cyclomatic_complexity: 1.0,
         },
+        last_analyzed: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
     })
 }
 
 #[tauri::command]
 pub async fn code_intelligence_get_symbol_info(
-    _workspace_path: String,
-    _symbol_name: String,
+    workspace_path: String,
+    symbol_name: String,
 ) -> Result<Option<CodeSymbol>> {
+    eprintln!("Getting symbol info: {} in {}", symbol_name, workspace_path);
     Ok(None)
 }
 
 #[tauri::command]
 pub async fn code_intelligence_find_related_symbols(
-    _workspace_path: String,
-    _symbol_name: String,
+    workspace_path: String,
+    symbol_name: String,
 ) -> Result<Vec<CodeSymbol>> {
+    eprintln!("Finding related symbols for: {} in {}", symbol_name, workspace_path);
     Ok(vec![])
 }
 
 #[tauri::command]
 pub async fn code_intelligence_suggest_refactoring(
-    _workspace_path: String,
-    _file_path: String,
-) -> Result<Vec<String>> {
+    workspace_path: String,
+    file_path: String,
+) -> Result<Vec<RefactoringRecommendation>> {
+    eprintln!("Suggesting refactoring for: {} in {}", file_path, workspace_path);
     Ok(vec![])
 }
 
 #[tauri::command]
-pub async fn code_intelligence_get_metrics(_workspace_path: String) -> Result<Option<CodeMetrics>> {
+pub async fn code_intelligence_get_metrics(workspace_path: String) -> Result<Option<CodeMetrics>> {
+    eprintln!("Getting code metrics for: {}", workspace_path);
     Ok(None)
+}
+
+#[tauri::command]
+pub async fn code_intelligence_get_all_symbols(workspace_path: String) -> Result<Vec<CodeSymbol>> {
+    eprintln!("Getting all symbols for: {}", workspace_path);
+    Ok(vec![])
+}
+
+#[tauri::command]
+pub async fn code_intelligence_get_all_relationships(workspace_path: String) -> Result<Vec<CodeRelationship>> {
+    eprintln!("Getting all relationships for: {}", workspace_path);
+    Ok(vec![])
+}
+
+#[tauri::command]
+pub async fn code_intelligence_get_all_patterns(workspace_path: String) -> Result<Vec<CodePattern>> {
+    eprintln!("Getting all patterns for: {}", workspace_path);
+    Ok(vec![])
+}
+
+#[tauri::command]
+pub async fn code_intelligence_find_circular_dependencies(workspace_path: String) -> Result<Vec<Vec<String>>> {
+    eprintln!("Finding circular dependencies in: {}", workspace_path);
+    Ok(vec![])
+}
+
+#[tauri::command]
+pub async fn code_intelligence_impact_analysis(
+    workspace_path: String,
+    symbol_id: String,
+) -> Result<HashMap<String, Vec<String>>> {
+    eprintln!("Analyzing impact of symbol: {} in {}", symbol_id, workspace_path);
+    Ok(HashMap::new())
 }

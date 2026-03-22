@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::error::Result;
+use crate::commands::prompts;
 use tauri::Emitter;
-use std::sync::Arc;
-use parking_lot::RwLock;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StreamToken {
@@ -23,6 +22,8 @@ pub struct AgentStep {
     pub status: String,
     pub summary: String,
     pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -72,6 +73,20 @@ impl StreamingAgentOrchestrator {
         ];
 
         while iteration < self.max_iterations {
+            // Check if agent was cancelled
+            if crate::commands::agent::is_agent_cancelled() {
+                eprintln!("[Agent] Execution cancelled by user");
+                steps.push(AgentStep {
+                    iteration,
+                    tool: "cancelled".to_string(),
+                    status: "cancelled".to_string(),
+                    summary: "Agent execution was cancelled by user".to_string(),
+                    result: None,
+                    logs: None,
+                });
+                break;
+            }
+
             iteration += 1;
             eprintln!("[Agent] Iteration {}/{}", iteration, self.max_iterations);
 
@@ -89,6 +104,7 @@ impl StreamingAgentOrchestrator {
                     status: "done".to_string(),
                     summary: "Agent completed reasoning".to_string(),
                     result: Some(response.clone()),
+                    logs: Some(vec![response.clone()]),
                 });
                 break;
             }
@@ -104,7 +120,13 @@ impl StreamingAgentOrchestrator {
                     status: if tool_result.is_ok() { "done".to_string() } else { "failed".to_string() },
                     summary: format!("Executed {} with args: {}", tool_call.tool, tool_call.args),
                     result: tool_result.as_ref().ok().map(|s| s.clone()),
+                    logs: tool_result.as_ref().ok().map(|s| vec![s.clone()]),
                 };
+
+                // Emit tool step event for real-time UI update
+                if let Some(app) = &self.app_handle {
+                    let _ = app.emit("agent:step", &step);
+                }
 
                 steps.push(step);
                 all_tool_calls.push(tool_call.clone());
@@ -130,19 +152,29 @@ impl StreamingAgentOrchestrator {
     }
 
     async fn call_llm_streaming(&self, messages: &[(String, String)], model: &str) -> Result<(String, u32)> {
+        // Build the prompt from messages, ensuring system prompt is first
         let mut prompt = String::new();
+        
         for (role, content) in messages {
-            prompt.push_str(&format!("{}: {}\n\n", role, content));
+            if role == "system" {
+                prompt.push_str(&format!("{}\n\n", content));
+            }
         }
-
-        eprintln!("[LLM] Calling {} with streaming", model);
+        
+        for (role, content) in messages {
+            if role != "system" {
+                prompt.push_str(&format!("[{}]\n{}\n\n", role.to_uppercase(), content));
+            }
+        }
+        
+        eprintln!("[LLM] Calling {} with prompt length: {}", model, prompt.len());
 
         let client = reqwest::Client::new();
         let payload = serde_json::json!({
             "model": model,
             "prompt": prompt,
             "stream": true,
-            "temperature": 0.7,
+            "temperature": 0.1,
             "top_p": 0.9,
             "top_k": 40,
         });
@@ -187,7 +219,7 @@ impl StreamingAgentOrchestrator {
         }
     }
 
-    async fn execute_tool(&self, tool_call: &ToolCall, _workspace_path: &Option<String>) -> Result<String> {
+    async fn execute_tool(&self, tool_call: &ToolCall, workspace_path: &Option<String>) -> Result<String> {
         match tool_call.tool.as_str() {
             "read_file" => {
                 let path = tool_call.args.get("path")
@@ -244,6 +276,14 @@ impl StreamingAgentOrchestrator {
                     .and_then(|c| c.as_str())
                     .ok_or("Missing content argument")?;
                 
+                // Create parent directories if they don't exist
+                let file_path = std::path::Path::new(path);
+                if let Some(parent) = file_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                
                 tokio::fs::write(path, content).await?;
                 Ok(format!("Successfully wrote to {}", path))
             }
@@ -257,15 +297,42 @@ impl StreamingAgentOrchestrator {
                     return Err("Empty command".into());
                 }
                 
-                let output = tokio::process::Command::new(parts[0])
-                    .args(&parts[1..])
-                    .output()
-                    .await?;
+                let mut cmd = tokio::process::Command::new(parts[0]);
+                cmd.args(&parts[1..]);
                 
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Set working directory to workspace if available
+                if let Some(ws) = workspace_path {
+                    cmd.current_dir(&ws);
+                }
                 
-                Ok(format!("Command output:\n{}\n{}", stdout, stderr))
+                // Add timeout for command execution
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    cmd.output()
+                ).await {
+                    Ok(Ok(output)) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let status = output.status;
+                        
+                        if !status.success() {
+                            Err(format!("Command failed with status {}:\nStdout: {}\nStderr: {}", status, stdout, stderr).into())
+                        } else if stdout.is_empty() && stderr.is_empty() {
+                            Ok(format!("Command executed successfully"))
+                        } else {
+                            let mut result = String::new();
+                            if !stdout.is_empty() {
+                                result.push_str(&format!("Output:\n{}\n", stdout));
+                            }
+                            if !stderr.is_empty() {
+                                result.push_str(&format!("Warnings/Info:\n{}", stderr));
+                            }
+                            Ok(result)
+                        }
+                    }
+                    Ok(Err(e)) => Err(format!("Command execution failed: {}", e).into()),
+                    Err(_) => Err("Command execution timed out after 30 seconds".into()),
+                }
             }
             "edit_file" => {
                 let path = tool_call.args.get("path")
@@ -308,53 +375,59 @@ impl StreamingAgentOrchestrator {
                 
                 let output = match operation {
                     "status" => {
-                        let output = tokio::process::Command::new("git")
-                            .arg("status")
-                            .arg("--porcelain")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("git");
+                        cmd.arg("status").arg("--porcelain");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "add" => {
                         let path = tool_call.args.get("path").and_then(|p| p.as_str()).ok_or("Missing path")?;
-                        let output = tokio::process::Command::new("git")
-                            .arg("add")
-                            .arg(path)
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("git");
+                        cmd.arg("add").arg(path);
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "commit" => {
                         let message = tool_call.args.get("message").and_then(|m| m.as_str()).ok_or("Missing message")?;
-                        let output = tokio::process::Command::new("git")
-                            .arg("commit")
-                            .arg("-m")
-                            .arg(message)
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("git");
+                        cmd.arg("commit").arg("-m").arg(message);
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "push" => {
-                        let output = tokio::process::Command::new("git")
-                            .arg("push")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("git");
+                        cmd.arg("push");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "pull" => {
-                        let output = tokio::process::Command::new("git")
-                            .arg("pull")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("git");
+                        cmd.arg("pull");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "log" => {
-                        let output = tokio::process::Command::new("git")
-                            .arg("log")
-                            .arg("--oneline")
-                            .arg("-10")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("git");
+                        cmd.arg("log").arg("--oneline").arg("-10");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     _ => return Err(format!("Unknown git operation: {}", operation).into()),
@@ -368,36 +441,41 @@ impl StreamingAgentOrchestrator {
                 
                 let output = match operation {
                     "install" => {
-                        let output = tokio::process::Command::new("npm")
-                            .arg("install")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("npm");
+                        cmd.arg("install");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "add" => {
                         let package = tool_call.args.get("package").and_then(|p| p.as_str()).ok_or("Missing package")?;
-                        let output = tokio::process::Command::new("npm")
-                            .arg("install")
-                            .arg(package)
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("npm");
+                        cmd.arg("install").arg(package);
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "list" => {
-                        let output = tokio::process::Command::new("npm")
-                            .arg("list")
-                            .arg("--depth=0")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("npm");
+                        cmd.arg("list").arg("--depth=0");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "run" => {
                         let script = tool_call.args.get("script").and_then(|s| s.as_str()).ok_or("Missing script")?;
-                        let output = tokio::process::Command::new("npm")
-                            .arg("run")
-                            .arg(script)
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("npm");
+                        cmd.arg("run").arg(script);
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     _ => return Err(format!("Unknown npm operation: {}", operation).into()),
@@ -411,26 +489,31 @@ impl StreamingAgentOrchestrator {
                 
                 let output = match operation {
                     "ps" => {
-                        let output = tokio::process::Command::new("docker")
-                            .arg("ps")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("docker");
+                        cmd.arg("ps");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "images" => {
-                        let output = tokio::process::Command::new("docker")
-                            .arg("images")
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("docker");
+                        cmd.arg("images");
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     "logs" => {
                         let container = tool_call.args.get("container").and_then(|c| c.as_str()).ok_or("Missing container")?;
-                        let output = tokio::process::Command::new("docker")
-                            .arg("logs")
-                            .arg(container)
-                            .output()
-                            .await?;
+                        let mut cmd = tokio::process::Command::new("docker");
+                        cmd.arg("logs").arg(container);
+                        if let Some(ws) = workspace_path {
+                            cmd.current_dir(&ws);
+                        }
+                        let output = cmd.output().await?;
                         String::from_utf8_lossy(&output.stdout).to_string()
                     }
                     _ => return Err(format!("Unknown docker operation: {}", operation).into()),
@@ -442,25 +525,7 @@ impl StreamingAgentOrchestrator {
     }
 
     fn get_system_prompt(&self, workspace_path: &Option<String>, active_file: &Option<serde_json::Value>) -> String {
-        let mut prompt = r#"You are an AI coding assistant with access to tools. Your goal is to help the user accomplish their task.
-
-Available tools:
-- read_file: Read the contents of a file. Args: {"path": "file_path"}
-- write_file: Write content to a file. Args: {"path": "file_path", "content": "file_content"}
-- edit_file: Edit specific lines in a file. Args: {"path": "file_path", "start_line": 1, "end_line": 10, "content": "new_content"}
-- list_directory: List files in a directory. Args: {"path": "directory_path"}
-- search_files: Search for files matching a pattern. Args: {"path": "directory_path", "pattern": "search_pattern"}
-- run_command: Run a shell command. Args: {"command": "command_string"}
-- git: Git operations. Args: {"operation": "status|add|commit|push|pull|log", "path": "file_path", "message": "commit_message"}
-- npm: NPM operations. Args: {"operation": "install|add|list|run", "package": "package_name", "script": "script_name"}
-- docker: Docker operations. Args: {"operation": "ps|images|logs|run", "container": "container_name", "image": "image_name"}
-
-When you need to use a tool, output it as JSON on a single line:
-{"tool": "tool_name", "args": {"arg1": "value1", "arg2": "value2"}}
-
-You can use multiple tools in one response. After using tools, analyze the results and decide if you need more tools or if you're done.
-
-When you're done with the task, provide a summary of what you did."#.to_string();
+        let mut prompt = prompts::KIRO_SYSTEM_PROMPT.to_string();
 
         if let Some(ws) = workspace_path {
             prompt.push_str(&format!("\n\nCurrent workspace: {}", ws));
@@ -479,16 +544,24 @@ When you're done with the task, provide a summary of what you did."#.to_string()
 fn extract_tool_calls(response: &str) -> Vec<ToolCall> {
     let mut tool_calls = Vec::new();
     
+    eprintln!("[EXTRACT] Response length: {}", response.len());
+    eprintln!("[EXTRACT] Response preview: {}", &response[..std::cmp::min(200, response.len())]);
+    
     let lines: Vec<&str> = response.lines().collect();
     for line in lines {
         let trimmed = line.trim();
         if trimmed.starts_with('{') && trimmed.contains("\"tool\"") {
+            eprintln!("[EXTRACT] Found potential tool call: {}", trimmed);
             if let Ok(call) = serde_json::from_str::<ToolCall>(trimmed) {
+                eprintln!("[EXTRACT] Successfully parsed tool call: {}", call.tool);
                 tool_calls.push(call);
+            } else {
+                eprintln!("[EXTRACT] Failed to parse as JSON");
             }
         }
     }
     
+    eprintln!("[EXTRACT] Total tool calls found: {}", tool_calls.len());
     tool_calls
 }
 

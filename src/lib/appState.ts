@@ -111,6 +111,18 @@ export async function restoreWindowState(state: AppState): Promise<void> {
     const appWindow = WebviewWindow.getCurrent()
     if (!appWindow) return
     
+    // Restore fullscreen state first
+    if (state.isFullscreen) {
+      await appWindow.setFullscreen(true)
+      return
+    }
+
+    // Restore maximized state
+    if (state.isMaximized) {
+      await appWindow.maximize()
+      return
+    }
+    
     // Only restore if we have valid dimensions (not minimized)
     const hasValidDimensions = state.windowWidth > 0 && state.windowHeight > 0
     
@@ -128,11 +140,6 @@ export async function restoreWindowState(state: AppState): Promise<void> {
 
     if (state.windowWidth !== undefined && state.windowHeight !== undefined) {
       await appWindow.setSize(new PhysicalSize(state.windowWidth, state.windowHeight))
-    }
-
-    // Restore fullscreen state (but not maximized, as that can cause issues)
-    if (state.isFullscreen) {
-      await appWindow.setFullscreen(true)
     }
   } catch (error) {
     console.error('Failed to restore window state:', error)

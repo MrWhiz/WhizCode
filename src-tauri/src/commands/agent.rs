@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 use crate::error::Result;
+use std::sync::Arc;
+use parking_lot::Mutex;
+
+// Global cancellation token for agent execution
+lazy_static::lazy_static! {
+    static ref AGENT_CANCEL_TOKEN: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+}
 
 #[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
@@ -157,12 +164,22 @@ fn extract_tool_calls(response: &str) -> Vec<ToolCall> {
 
 #[tauri::command]
 pub async fn agent_stop() -> Result<()> {
+    let mut cancel = AGENT_CANCEL_TOKEN.lock();
+    *cancel = true;
+    eprintln!("Agent stop requested");
     Ok(())
 }
 
 #[tauri::command]
 pub async fn agent_reset() -> Result<()> {
+    let mut cancel = AGENT_CANCEL_TOKEN.lock();
+    *cancel = false;
+    eprintln!("Agent reset");
     Ok(())
+}
+
+pub fn is_agent_cancelled() -> bool {
+    *AGENT_CANCEL_TOKEN.lock()
 }
 
 #[tauri::command]

@@ -16,6 +16,7 @@ pub struct WorkspaceInfo {
 pub async fn set_workspace(
     path: String,
     state: State<'_, Arc<RwLock<AppState>>>,
+    vector_state: State<'_, Arc<std::sync::Mutex<crate::commands::vector_search::VectorSearchSystem>>>,
 ) -> Result<()> {
     let workspace_path = PathBuf::from(&path);
     
@@ -27,6 +28,13 @@ pub async fn set_workspace(
         return Err("Workspace path is not a directory".into());
     }
     
+    // Reinitialize vector search system with the new workspace root
+    // so the DB lives inside the workspace's .whizcode folder
+    if let Ok(new_system) = crate::commands::vector_search::VectorSearchSystem::new(&path) {
+        let mut vs = vector_state.lock().unwrap();
+        *vs = new_system;
+    }
+
     let mut app_state = state.write();
     app_state.set_workspace(workspace_path);
     

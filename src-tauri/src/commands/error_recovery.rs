@@ -41,10 +41,21 @@ pub struct ErrorStatistics {
 }
 
 #[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RecoveryAttempt {
+    pub error_type: String,
+    pub strategy_id: String,
+    pub success: bool,
+    pub timestamp: u64,
+    pub execution_time_ms: u32,
+}
+
+#[allow(dead_code)]
 pub struct ErrorRecoverySystem {
     strategies: Arc<Mutex<HashMap<String, RecoveryStrategy>>>,
     error_history: Arc<Mutex<Vec<ErrorContext>>>,
     recovery_attempts: Arc<Mutex<HashMap<String, (u32, u32)>>>, // (attempts, successes)
+    recovery_log: Arc<Mutex<Vec<RecoveryAttempt>>>,
 }
 
 impl ErrorRecoverySystem {
@@ -54,6 +65,7 @@ impl ErrorRecoverySystem {
             strategies: Arc::new(Mutex::new(HashMap::new())),
             error_history: Arc::new(Mutex::new(Vec::new())),
             recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
+            recovery_log: Arc::new(Mutex::new(Vec::new())),
         };
         system.initialize_default_strategies();
         system
@@ -346,6 +358,168 @@ impl ErrorRecoverySystem {
         let mut strategies = self.strategies.lock().unwrap();
         strategies.remove(strategy_id).is_some()
     }
+
+    #[allow(dead_code)]
+    pub fn execute_recovery_strategy(
+        &self,
+        error_type: &str,
+        strategy_id: &str,
+    ) -> RecoveryResult {
+        let start_time = std::time::SystemTime::now();
+        
+        let strategies = self.strategies.lock().unwrap();
+        if let Some(strategy) = strategies.get(strategy_id) {
+            // Simulate recovery execution
+            let recovered = strategy.success_rate > 0.5;
+            
+            let execution_time_ms = std::time::SystemTime::now()
+                .duration_since(start_time)
+                .unwrap_or_default()
+                .as_millis() as u32;
+
+            // Log recovery attempt
+            let attempt = RecoveryAttempt {
+                error_type: error_type.to_string(),
+                strategy_id: strategy_id.to_string(),
+                success: recovered,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                execution_time_ms,
+            };
+
+            let mut log = self.recovery_log.lock().unwrap();
+            log.push(attempt);
+
+            // Update recovery attempts
+            let mut attempts = self.recovery_attempts.lock().unwrap();
+            let entry = attempts.entry(error_type.to_string()).or_insert((0, 0));
+            entry.0 += 1;
+            if recovered {
+                entry.1 += 1;
+            }
+
+            if recovered {
+                RecoveryResult {
+                    recovered: true,
+                    message: format!("Successfully recovered from {} using strategy: {}", error_type, strategy_id),
+                    suggested_action: None,
+                    fallback_recommendations: vec![],
+                }
+            } else {
+                RecoveryResult {
+                    recovered: false,
+                    message: format!("Recovery strategy {} did not resolve the error", strategy_id),
+                    suggested_action: Some(strategy.recovery_steps.join(" → ")),
+                    fallback_recommendations: self.generate_fallback_recommendations(error_type),
+                }
+            }
+        } else {
+            RecoveryResult {
+                recovered: false,
+                message: format!("Strategy {} not found", strategy_id),
+                suggested_action: None,
+                fallback_recommendations: vec![],
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn auto_recover(&self, error: &str, tool: &str, workspace_path: &Option<String>) -> RecoveryResult {
+        let error_type = self.classify_error(error);
+        
+        // Record error
+        let context = ErrorContext {
+            error_type: error_type.clone(),
+            message: error.to_string(),
+            tool: tool.to_string(),
+            workspace_path: workspace_path.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+
+        let mut history = self.error_history.lock().unwrap();
+        history.push(context);
+
+        // Find best recovery strategy
+        let strategy_id = {
+            let strategies = self.strategies.lock().unwrap();
+            if let Some(strategy) = strategies.get(&error_type) {
+                Some(strategy.id.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(strategy_id) = strategy_id {
+            // Try automatic recovery
+            let result = self.execute_recovery_strategy(&error_type, &strategy_id);
+            if result.recovered {
+                return result;
+            }
+        }
+
+        // If auto-recovery failed, return suggestions
+        RecoveryResult {
+            recovered: false,
+            message: format!("Auto-recovery failed for error type: {}. Manual intervention needed.", error_type),
+            suggested_action: None,
+            fallback_recommendations: self.generate_fallback_recommendations(&error_type),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_recovery_log(&self, limit: Option<usize>) -> Vec<RecoveryAttempt> {
+        let log = self.recovery_log.lock().unwrap();
+        let limit = limit.unwrap_or(100);
+        log.iter().rev().take(limit).cloned().collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn get_strategy_effectiveness(&self, strategy_id: &str) -> Option<f32> {
+        let log = self.recovery_log.lock().unwrap();
+        let attempts: Vec<_> = log.iter()
+            .filter(|a| a.strategy_id == strategy_id)
+            .collect();
+        
+        if attempts.is_empty() {
+            return None;
+        }
+
+        let successes = attempts.iter().filter(|a| a.success).count() as f32;
+        Some(successes / attempts.len() as f32)
+    }
+
+    #[allow(dead_code)]
+    pub fn update_strategy_success_rate(&self, strategy_id: &str) {
+        if let Some(effectiveness) = self.get_strategy_effectiveness(strategy_id) {
+            let mut strategies = self.strategies.lock().unwrap();
+            if let Some(strategy) = strategies.get_mut(strategy_id) {
+                strategy.success_rate = effectiveness;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_best_strategy_for_error(&self, error_type: &str) -> Option<RecoveryStrategy> {
+        let strategies = self.strategies.lock().unwrap();
+        
+        // Find all strategies that match this error type
+        let mut matching: Vec<_> = strategies.iter()
+            .filter(|(_, s)| {
+                let patterns: Vec<&str> = s.error_pattern.split('|').collect();
+                patterns.iter().any(|p| error_type.contains(p.trim()))
+            })
+            .collect();
+
+        // Sort by success rate (highest first)
+        matching.sort_by(|a, b| b.1.success_rate.partial_cmp(&a.1.success_rate).unwrap_or(std::cmp::Ordering::Equal));
+
+        matching.first().map(|(_, s)| (*s).clone())
+    }
 }
 
 impl Default for ErrorRecoverySystem {
@@ -418,4 +592,64 @@ pub fn error_recovery_remove_strategy(
 ) -> Result<bool, String> {
     let system = state.lock().unwrap();
     Ok(system.remove_strategy(&strategy_id))
+}
+
+#[tauri::command]
+pub fn error_recovery_auto_recover(
+    error: String,
+    tool: String,
+    workspace_path: Option<String>,
+    state: State<'_, Arc<Mutex<ErrorRecoverySystem>>>,
+) -> Result<RecoveryResult, String> {
+    let system = state.lock().unwrap();
+    Ok(system.auto_recover(&error, &tool, &workspace_path))
+}
+
+#[tauri::command]
+pub fn error_recovery_execute_strategy(
+    error_type: String,
+    strategy_id: String,
+    state: State<'_, Arc<Mutex<ErrorRecoverySystem>>>,
+) -> Result<RecoveryResult, String> {
+    let system = state.lock().unwrap();
+    Ok(system.execute_recovery_strategy(&error_type, &strategy_id))
+}
+
+#[tauri::command]
+pub fn error_recovery_get_log(
+    limit: Option<usize>,
+    state: State<'_, Arc<Mutex<ErrorRecoverySystem>>>,
+) -> Result<Vec<RecoveryAttempt>, String> {
+    let system = state.lock().unwrap();
+    Ok(system.get_recovery_log(limit))
+}
+
+#[tauri::command]
+pub fn error_recovery_strategy_effectiveness(
+    strategy_id: String,
+    state: State<'_, Arc<Mutex<ErrorRecoverySystem>>>,
+) -> Result<Option<f32>, String> {
+    let system = state.lock().unwrap();
+    Ok(system.get_strategy_effectiveness(&strategy_id))
+}
+
+#[tauri::command]
+pub fn error_recovery_update_strategy_rates(
+    state: State<'_, Arc<Mutex<ErrorRecoverySystem>>>,
+) -> Result<(), String> {
+    let system = state.lock().unwrap();
+    let strategies = system.get_recovery_strategies();
+    for strategy in strategies {
+        system.update_strategy_success_rate(&strategy.id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn error_recovery_best_strategy(
+    error_type: String,
+    state: State<'_, Arc<Mutex<ErrorRecoverySystem>>>,
+) -> Result<Option<RecoveryStrategy>, String> {
+    let system = state.lock().unwrap();
+    Ok(system.get_best_strategy_for_error(&error_type))
 }

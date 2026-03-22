@@ -31,7 +31,6 @@ fn main() {
         .manage(Arc::new(std::sync::Mutex::new(commands::diagnostics_service::DiagnosticsService::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::diff::DiffService::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::memory::MemoryService::new())))
-        .manage(Arc::new(std::sync::Mutex::new(commands::planner::WhizCodePlanner::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::hooks::HooksManager::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::code_intelligence::CodeIntelligence::new())))
         .invoke_handler(tauri::generate_handler![
@@ -46,6 +45,7 @@ fn main() {
             commands::fs::delete_directory,
             commands::fs::rename_file,
             commands::fs::check_file_exists,
+            commands::fs::watch_directory,
             
             // Terminal operations
             commands::terminal::terminal_create,
@@ -83,6 +83,8 @@ fn main() {
             
             // Vector search operations
             commands::vector_search::vector_index_workspace,
+            commands::vector_search::vector_index_workspace_full,
+            commands::vector_search::vector_get_file_tree,
             commands::vector_search::vector_semantic_search,
             commands::vector_search::vector_find_similar,
             commands::vector_search::vector_get_recommendations,
@@ -98,6 +100,12 @@ fn main() {
             commands::error_recovery::error_recovery_clear_history,
             commands::error_recovery::error_recovery_add_strategy,
             commands::error_recovery::error_recovery_remove_strategy,
+            commands::error_recovery::error_recovery_auto_recover,
+            commands::error_recovery::error_recovery_execute_strategy,
+            commands::error_recovery::error_recovery_get_log,
+            commands::error_recovery::error_recovery_strategy_effectiveness,
+            commands::error_recovery::error_recovery_update_strategy_rates,
+            commands::error_recovery::error_recovery_best_strategy,
             
             // MCP service operations
             commands::mcp_service::mcp_initialize,
@@ -139,6 +147,7 @@ fn main() {
             // Ollama operations
             commands::ollama::ollama_health_check,
             commands::ollama::ollama_get_models,
+            commands::ollama::ollama_pull_model,
             
             // Dialog operations
             commands::dialog::dialog_open_folder,
@@ -175,28 +184,18 @@ fn main() {
             
             // Vector operations
             commands::vector_search::vector_get_index_stats,
+            commands::vector_search::vector_index_workspace_full,
+            commands::vector_search::vector_semantic_search,
+            commands::vector_search::vector_get_file_tree,
+            commands::vector_search::vector_update_file,
+            commands::vector_search::vector_clear_index,
+            commands::vector_search::vector_get_stats,
             
             // Specs operations
             commands::specs::specs_list,
             commands::specs::specs_get,
             
-            // Planner operations
-            commands::planner::create_plan,
-            commands::planner::planner_save_plan,
-            commands::planner::planner_get_plan,
-            commands::planner::planner_get_all_plans,
-            commands::planner::planner_start_plan,
-            commands::planner::planner_complete_plan,
-            commands::planner::planner_update_task_status,
-            commands::planner::planner_delete_plan,
-            commands::planner::planner_create_spec,
-            commands::planner::planner_get_spec,
-            commands::planner::planner_get_all_specs,
-            commands::planner::planner_get_active_specs,
-            commands::planner::planner_update_spec_status,
-            commands::planner::planner_update_spec_progress,
-            commands::planner::planner_delete_spec,
-            commands::planner::planner_get_metrics,
+            // Planning operations
             commands::planning::create_execution_plan,
             
             // Sub-agents operations
@@ -314,6 +313,24 @@ fn main() {
             
             // Agent orchestrator operations
             commands::agent_orchestrator::execute_agent_loop,
+            commands::agent_orchestrator::agent_reasoning_with_cot,
+            commands::agent_orchestrator::agent_validate_cot_response,
+            commands::agent_orchestrator::agent_get_cot_metrics,
+            commands::agent_orchestrator::agent_evaluate_confidence,
+            commands::agent_orchestrator::agent_calculate_tool_confidence,
+            commands::agent_orchestrator::agent_assess_decision_risk,
+            commands::agent_orchestrator::agent_get_confidence_thresholds,
+            
+            // Tool metrics operations
+            commands::tool_metrics::tool_metrics_record_execution,
+            commands::tool_metrics::tool_metrics_get_metrics,
+            commands::tool_metrics::tool_metrics_get_all,
+            commands::tool_metrics::tool_metrics_rank_tools,
+            commands::tool_metrics::tool_metrics_get_recommendations,
+            commands::tool_metrics::tool_metrics_get_history,
+            commands::tool_metrics::tool_metrics_get_failure_analysis,
+            commands::tool_metrics::tool_metrics_get_statistics,
+            commands::tool_metrics::tool_metrics_clear,
             
             // Agent streaming operations
             commands::agent_streaming::execute_agent_loop_streaming,

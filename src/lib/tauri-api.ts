@@ -88,7 +88,7 @@ export const fs = {
     maxFiles?: number
   ): Promise<FileEntry[]> {
     try {
-      return await invoke('read_directory_recursive', { path, max_files: maxFiles })
+      return await invoke('read_directory_recursive', { path, maxFiles })
     } catch (error) {
       throw handleError(error)
     }
@@ -128,7 +128,7 @@ export const fs = {
 
   async renameFile(oldPath: string, newPath: string): Promise<void> {
     try {
-      return await invoke('rename_file', { old_path: oldPath, new_path: newPath })
+      return await invoke('rename_file', { oldPath, newPath })
     } catch (error) {
       throw handleError(error)
     }
@@ -157,6 +157,74 @@ export const fs = {
       throw handleError(error)
     }
   },
+
+  async watchDirectory(path: string): Promise<void> {
+    try {
+      return await invoke('watch_directory', { path })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+}
+
+// Vector search
+export const vectorSearch = {
+  async indexWorkspaceFull(workspacePath: string, embeddingModel?: string): Promise<void> {
+    try {
+      return await invoke('vector_index_workspace_full', {
+        workspacePath: workspacePath,
+        embeddingModel: embeddingModel ?? 'nomic-embed-text',
+      })
+    } catch (error) {
+      // Non-fatal - indexing failure shouldn't block the user
+      console.warn('[VectorSearch] Indexing failed:', error)
+    }
+  },
+
+  async getFileTree(workspacePath: string, maxFiles?: number): Promise<string> {
+    try {
+      return await invoke('vector_get_file_tree', {
+        workspacePath: workspacePath,
+        maxFiles: maxFiles ?? 300,
+      })
+    } catch (error) {
+      return ''
+    }
+  },
+
+  async semanticSearch(query: string, limit?: number): Promise<any[]> {
+    try {
+      return await invoke('vector_semantic_search', {
+        query: { query, limit: limit ?? 10 },
+      })
+    } catch (error) {
+      return []
+    }
+  },
+
+  async getIndexStats(): Promise<any> {
+    try {
+      return await invoke('vector_get_index_stats')
+    } catch (error) {
+      return null
+    }
+  },
+
+  async updateFile(path: string): Promise<void> {
+    try {
+      return await invoke('vector_update_file', { path })
+    } catch (error) {
+      console.warn('[VectorSearch] updateFile failed:', error)
+    }
+  },
+
+  async clearIndex(): Promise<void> {
+    try {
+      return await invoke('vector_clear_index')
+    } catch (error) {
+      console.warn('[VectorSearch] clearIndex failed:', error)
+    }
+  },
 }
 
 // Search Commands
@@ -166,7 +234,7 @@ export const search = {
     includeGlob?: string
   ): Promise<SearchResult[]> {
     try {
-      return await invoke('search_files', { pattern, include_glob: includeGlob })
+      return await invoke('search_files', { pattern, includeGlob })
     } catch (error) {
       throw handleError(error)
     }
@@ -177,7 +245,7 @@ export const search = {
     maxResults?: number
   ): Promise<FuzzyResult[]> {
     try {
-      return await invoke('fuzzy_find_file', { query, max_results: maxResults })
+      return await invoke('fuzzy_find_file', { query, maxResults })
     } catch (error) {
       throw handleError(error)
     }
@@ -190,7 +258,7 @@ export const terminal = {
     try {
       return await invoke('terminal_create', { 
         config: {
-          shell_type: shellType,
+          shellType,
           cwd: cwd || null
         }
       })
@@ -201,7 +269,7 @@ export const terminal = {
 
   async writeToTerminal(terminalId: string, data: string): Promise<void> {
     try {
-      return await invoke('terminal_write', { terminal_id: terminalId, data })
+      return await invoke('terminal_write', { terminalId, data })
     } catch (error) {
       throw handleError(error)
     }
@@ -213,7 +281,7 @@ export const terminal = {
     rows: number
   ): Promise<void> {
     try {
-      return await invoke('terminal_resize', { terminal_id: terminalId, cols, rows })
+      return await invoke('terminal_resize', { terminalId, cols, rows })
     } catch (error) {
       throw handleError(error)
     }
@@ -374,7 +442,7 @@ function handleError(error: unknown): TauriError {
 export const diagnostics = {
   async check(filePath: string, content: string, language: string): Promise<any[]> {
     try {
-      const report = await invoke<any>('diagnostics_check_file', { file_path: filePath, content, language })
+      const report = await invoke<any>('diagnostics_check_file', { filePath, content, language })
       return report.diagnostics || []
     } catch (error) {
       throw handleError(error)
@@ -416,10 +484,10 @@ export const agent = {
       return await invoke('execute_agent_task', {
         task: options.task,
         model: options.model,
-        workspace_path: options.workspacePath,
-        active_file: options.activeFile,
+        workspacePath: options.workspacePath,
+        activeFile: options.activeFile,
         config: options.config,
-        is_autopilot_mode: options.isAutopilotMode,
+        isAutopilotMode: options.isAutopilotMode,
         images: options.images
       })
     } catch (error) {
@@ -432,8 +500,8 @@ export const agent = {
       return await invoke('execute_agent_loop', {
         task: options.task,
         model: options.model,
-        workspace_path: options.workspacePath,
-        active_file: options.activeFile,
+        workspacePath: options.workspacePath,
+        activeFile: options.activeFile,
       })
     } catch (error) {
       throw handleError(error)
@@ -442,14 +510,14 @@ export const agent = {
 
   async executeLoopStreaming(options: any): Promise<any> {
     try {
-      const wsPath = options.workspace_path || options.workspacePath || null
-      const activeFile = options.active_file || options.activeFile || null
-      console.log('[API] Invoking execute_agent_loop_streaming, workspace_path =', wsPath)
+      const wsPath = options.workspacePath || null
+      const activeFile = options.activeFile || null
+      console.log('[API] Invoking execute_agent_loop_streaming, workspacePath =', wsPath)
       return await invoke('execute_agent_loop_streaming', {
         task: options.task,
         model: options.model,
-        workspace_path: wsPath,
-        active_file: activeFile,
+        workspacePath: wsPath,
+        activeFile: activeFile,
       })
     } catch (error) {
       throw handleError(error)
@@ -474,7 +542,7 @@ export const agent = {
 
   async sendPermissionResponse(approved: boolean, requestId?: string): Promise<void> {
     try {
-      return await invoke('agent_permission_response', { approved, request_id: requestId })
+      return await invoke('agent_permission_response', { approved, requestId })
     } catch (error) {
       throw handleError(error)
     }
@@ -514,6 +582,14 @@ export const ollama = {
       throw handleError(error)
     }
   },
+
+  async pullModel(modelName: string): Promise<void> {
+    try {
+      return await invoke('ollama_pull_model', { modelName })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
 }
 
 // Azure Commands
@@ -529,7 +605,7 @@ export const azure = {
   async generateToken(options: { loginUrl: string; username: string; password: string }): Promise<{ success: boolean; error?: string }> {
     try {
       return await invoke('azure_generate_token', { 
-        login_url: options.loginUrl, 
+        loginUrl: options.loginUrl, 
         username: options.username, 
         password: options.password 
       })
@@ -559,7 +635,7 @@ export const ai = {
 
   async getCodeMetrics(workspacePath: string): Promise<any> {
     try {
-      return await invoke('ai_get_code_metrics', { workspace_path: workspacePath })
+      return await invoke('ai_get_code_metrics', { workspacePath })
     } catch (error) {
       throw handleError(error)
     }
@@ -659,7 +735,7 @@ export const subAgents = {
 
   async getConfig(agentName: string): Promise<any> {
     try {
-      return await invoke('get_sub_agent_config', { agent_name: agentName })
+      return await invoke('get_sub_agent_config', { agentName })
     } catch (error) {
       throw handleError(error)
     }
@@ -667,7 +743,7 @@ export const subAgents = {
 
   async invoke(agentName: string, taskDescription: string): Promise<string> {
     try {
-      return await invoke('invoke_sub_agent', { agent_name: agentName, task_description: taskDescription })
+      return await invoke('invoke_sub_agent', { agentName, taskDescription })
     } catch (error) {
       throw handleError(error)
     }
@@ -685,7 +761,7 @@ export const learning = {
 
   async getRecommendations(taskType: string): Promise<string[]> {
     try {
-      return await invoke('learning_get_recommendations', { task_type: taskType })
+      return await invoke('learning_get_recommendations', { taskType })
     } catch (error) {
       throw handleError(error)
     }
@@ -701,7 +777,7 @@ export const learning = {
 
   async recordInteraction(userRequest: string, agentResponse: string, toolsUsed: string[], success: boolean, durationMs: number): Promise<void> {
     try {
-      return await invoke('learning_record_interaction', { user_request: userRequest, agent_response: agentResponse, tools_used: toolsUsed, success, duration_ms: durationMs })
+      return await invoke('learning_record_interaction', { userRequest, agentResponse, toolsUsed, success, durationMs })
     } catch (error) {
       throw handleError(error)
     }
@@ -711,7 +787,7 @@ export const learning = {
 export const contextMemory = {
   async recordPattern(pattern: string, context: string, language: string, projectType: string): Promise<void> {
     try {
-      return await invoke('context_memory_record_pattern', { pattern, context, language, project_type: projectType })
+      return await invoke('context_memory_record_pattern', { pattern, context, language, projectType })
     } catch (error) {
       throw handleError(error)
     }
@@ -743,7 +819,7 @@ export const contextMemory = {
 
   async recordError(errorType: string, context: string, solution: string, success: boolean): Promise<void> {
     try {
-      return await invoke('context_memory_record_error', { error_type: errorType, context, solution, success })
+      return await invoke('context_memory_record_error', { errorType, context, solution, success })
     } catch (error) {
       throw handleError(error)
     }
@@ -751,7 +827,7 @@ export const contextMemory = {
 
   async getSimilarErrors(errorType: string): Promise<any[]> {
     try {
-      return await invoke('context_memory_get_similar_errors', { error_type: errorType })
+      return await invoke('context_memory_get_similar_errors', { errorType })
     } catch (error) {
       throw handleError(error)
     }
@@ -759,7 +835,7 @@ export const contextMemory = {
 
   async recordStrategy(taskType: string, strategy: string, tools: string[], duration: number): Promise<void> {
     try {
-      return await invoke('context_memory_record_strategy', { task_type: taskType, strategy, tools, duration })
+      return await invoke('context_memory_record_strategy', { taskType, strategy, tools, duration })
     } catch (error) {
       throw handleError(error)
     }
@@ -767,7 +843,7 @@ export const contextMemory = {
 
   async getBestStrategies(taskType: string): Promise<any[]> {
     try {
-      return await invoke('context_memory_get_best_strategies', { task_type: taskType })
+      return await invoke('context_memory_get_best_strategies', { taskType })
     } catch (error) {
       throw handleError(error)
     }
@@ -801,7 +877,7 @@ export const hooks = {
 
   async remove(hookId: string): Promise<void> {
     try {
-      return await invoke('hooks_remove', { hook_id: hookId })
+      return await invoke('hooks_remove', { hookId })
     } catch (error) {
       throw handleError(error)
     }
@@ -817,7 +893,7 @@ export const hooks = {
 
   async getForEvent(eventType: string): Promise<any[]> {
     try {
-      return await invoke('hooks_get_for_event', { event_type: eventType })
+      return await invoke('hooks_get_for_event', { eventType })
     } catch (error) {
       throw handleError(error)
     }
@@ -825,7 +901,7 @@ export const hooks = {
 
   async triggerFileEvent(eventType: string, filePath: string): Promise<any[]> {
     try {
-      return await invoke('hooks_trigger_file_event', { event_type: eventType, file_path: filePath })
+      return await invoke('hooks_trigger_file_event', { eventType, filePath })
     } catch (error) {
       throw handleError(error)
     }
@@ -833,7 +909,7 @@ export const hooks = {
 
   async triggerToolEvent(eventType: string, toolName: string): Promise<any[]> {
     try {
-      return await invoke('hooks_trigger_tool_event', { event_type: eventType, tool_name: toolName })
+      return await invoke('hooks_trigger_tool_event', { eventType, toolName })
     } catch (error) {
       throw handleError(error)
     }
@@ -843,7 +919,7 @@ export const hooks = {
 export const codeIntelligence = {
   async analyzeWorkspace(workspacePath: string): Promise<any> {
     try {
-      return await invoke('code_intelligence_analyze_workspace', { workspace_path: workspacePath })
+      return await invoke('code_intelligence_analyze_workspace', { workspacePath })
     } catch (error) {
       throw handleError(error)
     }
@@ -851,7 +927,7 @@ export const codeIntelligence = {
 
   async getSymbolInfo(workspacePath: string, symbolName: string): Promise<any> {
     try {
-      return await invoke('code_intelligence_get_symbol_info', { workspace_path: workspacePath, symbol_name: symbolName })
+      return await invoke('code_intelligence_get_symbol_info', { workspacePath, symbolName })
     } catch (error) {
       throw handleError(error)
     }
@@ -859,7 +935,7 @@ export const codeIntelligence = {
 
   async findRelatedSymbols(workspacePath: string, symbolName: string): Promise<any[]> {
     try {
-      return await invoke('code_intelligence_find_related_symbols', { workspace_path: workspacePath, symbol_name: symbolName })
+      return await invoke('code_intelligence_find_related_symbols', { workspacePath, symbolName })
     } catch (error) {
       throw handleError(error)
     }
@@ -867,7 +943,7 @@ export const codeIntelligence = {
 
   async suggestRefactoring(workspacePath: string, filePath: string): Promise<string[]> {
     try {
-      return await invoke('code_intelligence_suggest_refactoring', { workspace_path: workspacePath, file_path: filePath })
+      return await invoke('code_intelligence_suggest_refactoring', { workspacePath, filePath })
     } catch (error) {
       throw handleError(error)
     }
@@ -875,7 +951,7 @@ export const codeIntelligence = {
 
   async getMetrics(workspacePath: string): Promise<any> {
     try {
-      return await invoke('code_intelligence_get_metrics', { workspace_path: workspacePath })
+      return await invoke('code_intelligence_get_metrics', { workspacePath })
     } catch (error) {
       throw handleError(error)
     }
@@ -888,8 +964,8 @@ export const advancedTools = {
     try {
       return await invoke('execute_edit_file', {
         path: args.path,
-        start_line: args.startLine,
-        end_line: args.endLine,
+        startLine: args.startLine,
+        endLine: args.endLine,
         content: args.content,
       })
     } catch (error) {
@@ -1033,8 +1109,8 @@ export const planning = {
   async createExecutionPlan(userRequest: string, workspacePath?: string): Promise<any> {
     try {
       return await invoke('create_execution_plan', { 
-        user_request: userRequest, 
-        workspace_path: workspacePath 
+        userRequest, 
+        workspacePath 
       })
     } catch (error) {
       throw handleError(error)

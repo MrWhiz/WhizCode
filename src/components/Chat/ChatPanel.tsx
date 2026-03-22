@@ -522,6 +522,23 @@ export const ChatPanel = ({
     const [respondedSteps, setRespondedSteps] = React.useState<Record<number, boolean>>({});
     const [alwaysRun, setAlwaysRun] = React.useState(false);
     const [countdown, setCountdown] = React.useState<number | null>(null);
+    const [currentPhase, setCurrentPhase] = React.useState<string>('analyzing');
+    const [phaseStartTime, setPhaseStartTime] = React.useState<number>(Date.now());
+
+    React.useEffect(() => {
+        const unlistenPhase = window.__TAURI_INVOKE__?.('listen', {
+            event: 'agent:phase',
+            handler: (event: any) => {
+                const phase = event.payload?.phase || 'analyzing';
+                setCurrentPhase(phase);
+                setPhaseStartTime(Date.now());
+            }
+        }).catch(() => {});
+
+        return () => {
+            unlistenPhase?.then((unlisten: any) => unlisten?.());
+        };
+    }, []);
 
     React.useEffect(() => {
         if (!isLoading) {
@@ -529,7 +546,19 @@ export const ChatPanel = ({
             setCountdown(null);
             // Reset alwaysRun on task completion? Or keep it? Usually better to reset for safety.
             // setAlwaysRun(false); 
+        } else {
+            // Reset phase start time when loading begins
+            setPhaseStartTime(Date.now());
         }
+    }, [isLoading]);
+
+    // Update elapsed time every second
+    React.useEffect(() => {
+        if (!isLoading) return;
+        const timer = setInterval(() => {
+            setPhaseStartTime(prev => prev); // Trigger re-render
+        }, 1000);
+        return () => clearInterval(timer);
     }, [isLoading]);
 
     const onPermissionClick = (approved: boolean, idx: number) => {
@@ -577,38 +606,20 @@ export const ChatPanel = ({
     const getCurrentThought = (content: string) => {
         if (!content) return null;
         
-        // Multi-pattern search for thought blocks including common model behaviors
+        // Only show thought blocks - don't show raw LLM output which may contain
+        // model thinking tokens with repeated words
         const patterns = [
-            /\[THOUGHT\]([\s\S]*?)(?:\[\/THOUGHT\]|```|\{|$)/i,
-            /<think>([\s\S]*?)(?:<\/think>|```|\{|$)/i,
-            /\[REASONING\]([\s\S]*?)(?:\[\/REASONING\]|```|\{|$)/i,
-            /REASONING:([\s\S]*?)(?:```|\{|$)/i,
-            /EXPECTATION:([\s\S]*?)(?:```|\{|$)/i,
-            /THOUGHT:([\s\S]*?)(?:```|\{|$)/i,
+            /\[THOUGHT\]([\s\S]*?)(?:\[\/THOUGHT\]|```|\{)/i,
+            /<think>([\s\S]*?)(?:<\/think>|```|\{)/i,
+            /\[REASONING\]([\s\S]*?)(?:\[\/REASONING\]|```|\{)/i,
         ];
-
-        // 1. If we have finished a thinking block and started another phase (tool/content), 
-        // we should return null to let the tool status take over.
-        if (content.match(/\[\/THOUGHT\]|<\/think>|\[\/REASONING\]/i) && (content.includes('{') || content.includes('```'))) {
-            return null;
-        }
 
         for (const pattern of patterns) {
             const match = content.match(pattern);
             if (match && match[1].trim()) {
                 const thought = match[1].trim();
-                // Return only the most recent snippet if it's huge, focusing on the latest tokens
-                return thought.length > 200 ? '...' + thought.slice(-200) : thought;
+                return thought.length > 150 ? '...' + thought.slice(-150) : thought;
             }
-        }
-
-        // Broad fallback: if the content is being typed and no tools/code are yet present, it's reasoning
-        if (content.length > 0 && !content.includes('```')) {
-            const cleanText = content.replace(/\[\/THOUGHT\]|<\/think>|\[THOUGHT\]|<think>|\[REASONING\]|\[\/REASONING\]/gi, '').trim();
-            // Show only the last two sentences or last 15 words to keep it "live"
-            const words = cleanText.split(/\s+/);
-            if (words.length > 15) return '...' + words.slice(-15).join(' ');
-            return cleanText || null;
         }
         
         return null;
@@ -732,7 +743,9 @@ export const ChatPanel = ({
                                     flexShrink: 0
                                 }}></div>
                                     <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                        <span style={{ fontWeight: 600, color: 'var(--accent-primary)', marginRight: '6px' }}>THINKING:</span>
+                                        <span style={{ fontWeight: 600, color: 'var(--accent-primary)', marginRight: '6px' }}>
+                                            {currentPhase.toUpperCase()}:
+                                        </span>
                                         <span className="live-thought-text" style={{ fontStyle: 'italic', opacity: 1, maxWidth: 'none' }}>
                                             {activeThought || (agentSteps.length > 0 ? (
                                                 agentSteps.find((s: any) => s.status === 'running')?.summary || 
@@ -741,6 +754,9 @@ export const ChatPanel = ({
                                             ) : 'Analyzing context...')}
                                         </span>
                                     </div>
+                                    <span style={{ fontSize: '10px', color: 'var(--text-secondary)', marginLeft: '8px', whiteSpace: 'nowrap' }}>
+                                        {Math.round((Date.now() - phaseStartTime) / 1000)}s
+                                    </span>
                             </div>
                         </div>
                     )}

@@ -31,7 +31,8 @@ import {
   learning,
   contextMemory,
   hooks,
-  codeIntelligence
+  codeIntelligence,
+  vectorSearch,
 } from './lib/tauri-api'
 import { 
   loadAppState, 
@@ -58,6 +59,7 @@ function App() {
   const [selectedImages, setSelectedImages] = useState<string[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [agentSteps, setAgentSteps] = useState<AgentStep[]>([])
+  const [agentError, setAgentError] = useState<string | null>(null)
   const [liveStreamingContent, setLiveStreamingContent] = useState('')
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -100,6 +102,7 @@ function App() {
   useEffect(() => {
     let unlistenStep: (() => void) | null = null
     let unlistenStream: (() => void) | null = null
+    let unlistenError: (() => void) | null = null
 
     const setupListeners = async () => {
       try {
@@ -147,6 +150,20 @@ function App() {
             return [...prev, { role: 'assistant', content: currentContent, __id: STREAMING_MSG_ID } as any]
           })
         })
+
+        // Listen for agent errors
+        unlistenError = await (window as any).__TAURI_INVOKE__?.('listen', {
+          event: 'agent:error',
+          handler: (event: any) => {
+            const errorData = event.payload
+            const errorMsg = errorData?.error || 'Unknown agent error'
+            console.error('[AGENT ERROR]', errorMsg)
+            setAgentError(errorMsg)
+            setIsLoading(false)
+            // Add error message to chat
+            setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: ${errorMsg}` }])
+          }
+        }).catch(() => {})
       } catch (error) {
         console.error('Failed to setup Tauri event listeners:', error)
       }
@@ -157,6 +174,7 @@ function App() {
     return () => {
       if (unlistenStep) unlistenStep()
       if (unlistenStream) unlistenStream()
+      if (unlistenError) unlistenError()
     }
   }, [])
 
@@ -229,6 +247,16 @@ function App() {
   useEffect(() => {
     setupWorkspaceStatePersistence(workspacePath, activeFileId)
   }, [workspacePath, activeFileId])
+
+  // Start filesystem watcher when workspace changes
+  useEffect(() => {
+    if (!workspacePath) return
+    fs.watchDirectory(workspacePath).catch(() => {})
+
+    // Background: index workspace with real embeddings
+    // Fire-and-forget - doesn't block the UI
+    vectorSearch.indexWorkspaceFull(workspacePath).catch(() => {})
+  }, [workspacePath])
   const [fileErrors, setFileErrors] = useState<Record<string, number>>({})
 
   // Model settings
@@ -244,7 +272,7 @@ function App() {
       case 'gemini': return 'gemini-1.5-pro';
       case 'bedrock': return 'anthropic.claude-3-5-sonnet-20241022-v2:0';
       case 'azure-gateway': return 'gpt-4o';
-      default: return 'qwen2.5-coder:latest';
+      default: return 'qwen3:latest';
     }
   })
   const [openaiKey, setOpenaiKey] = useState(() => localStorage.getItem('openaiKey') || '')
@@ -461,7 +489,9 @@ function App() {
       setOllamaModels(res)
       setOllamaError(null)
       if (res.length > 0 && !res.includes(model)) {
-        setModel(res[0])
+        // Prefer qwen3:latest as default if available
+        const preferred = res.find(m => m.startsWith('qwen3')) || res[0]
+        setModel(preferred)
       }
     } catch (error: any) {
       console.error('[FRONTEND] Ollama connection error:', error)

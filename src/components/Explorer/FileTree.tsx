@@ -37,6 +37,8 @@ interface FileTreeItemProps {
     fileErrors?: Record<string, number>
     gitStatus?: { branch: string, changes: { file: string, status: string }[] } | null
     workspacePath?: string
+    expandedPaths: Set<string>
+    onToggleExpand: (path: string, expanded: boolean) => void
 }
 
 const FileTreeItem: React.FC<FileTreeItemProps> = ({
@@ -49,10 +51,12 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
     fileFilter = '',
     fileErrors = {},
     gitStatus = null,
-    workspacePath = ''
+    workspacePath = '',
+    expandedPaths,
+    onToggleExpand,
 }) => {
-    const [expanded, setExpanded] = useState(false)
     const [children, setChildren] = useState<FileEntry[]>([])
+    const expanded = expandedPaths.has(entry.path)
 
     const fetchChildren = useCallback(async () => {
         if (entry.isDirectory) {
@@ -74,24 +78,25 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
 
     useEffect(() => {
         if (collapseAll) {
-            setExpanded(false);
+            onToggleExpand(entry.path, false)
         }
     }, [collapseAll])
 
+    // Re-fetch whenever refreshKey changes and folder is expanded
     useEffect(() => {
         if (expanded && entry.isDirectory) {
-            fetchChildren();
+            fetchChildren()
         }
     }, [refreshKey, expanded, entry.isDirectory, fetchChildren])
 
     const handleClick = async () => {
         if (entry.isDirectory) {
             if (!expanded) {
-                await fetchChildren();
+                await fetchChildren()
             }
-            setExpanded(!expanded)
+            onToggleExpand(entry.path, !expanded)
         } else {
-            onFileOpen(entry.path, entry.name);
+            onFileOpen(entry.path, entry.name)
         }
     }
 
@@ -221,6 +226,8 @@ const FileTreeItem: React.FC<FileTreeItemProps> = ({
                             fileErrors={fileErrors} 
                             gitStatus={gitStatus}
                             workspacePath={workspacePath}
+                            expandedPaths={expandedPaths}
+                            onToggleExpand={onToggleExpand}
                         />
                     ))}
                 </div>
@@ -257,6 +264,42 @@ export const FileTree: React.FC<FileTreeProps> = ({
     const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null)
     const [newItemDialog, setNewItemDialog] = useState<{ type: 'file' | 'folder', parentPath: string } | null>(null)
     const [newItemName, setNewItemName] = useState('')
+
+    // Persist expanded folders per workspace path
+    const storageKey = `filetree-expanded:${path}`
+    const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
+        try {
+            const saved = localStorage.getItem(storageKey)
+            return saved ? new Set(JSON.parse(saved)) : new Set()
+        } catch {
+            return new Set()
+        }
+    })
+
+    // Reset expanded state when workspace changes
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem(`filetree-expanded:${path}`)
+            setExpandedPaths(saved ? new Set(JSON.parse(saved)) : new Set())
+        } catch {
+            setExpandedPaths(new Set())
+        }
+    }, [path])
+
+    const handleToggleExpand = useCallback((entryPath: string, isExpanded: boolean) => {
+        setExpandedPaths(prev => {
+            const next = new Set(prev)
+            if (isExpanded) {
+                next.add(entryPath)
+            } else {
+                next.delete(entryPath)
+            }
+            try {
+                localStorage.setItem(`filetree-expanded:${path}`, JSON.stringify([...next]))
+            } catch {}
+            return next
+        })
+    }, [path])
 
     // Popup state
     const [popupState, setPopupState] = useState<{
@@ -308,6 +351,14 @@ export const FileTree: React.FC<FileTreeProps> = ({
     useEffect(() => {
         fetchFiles()
     }, [path, externalRefreshKey, fetchFiles])
+
+    // Handle collapseAll
+    useEffect(() => {
+        if (collapseAll) {
+            setExpandedPaths(new Set())
+            try { localStorage.setItem(`filetree-expanded:${path}`, '[]') } catch {}
+        }
+    }, [collapseAll, path])
 
     useEffect(() => {
         let unlistenFileChanged: (() => void) | null = null
@@ -450,6 +501,8 @@ export const FileTree: React.FC<FileTreeProps> = ({
                     fileErrors={fileErrors}
                     gitStatus={gitStatus}
                     workspacePath={path}
+                    expandedPaths={expandedPaths}
+                    onToggleExpand={handleToggleExpand}
                 />
             ))}
             

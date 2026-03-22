@@ -6,6 +6,8 @@ use tauri::State;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use crate::state::AppState;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StreamToken {
@@ -49,6 +51,8 @@ pub struct StreamingAgentOrchestrator {
     #[allow(dead_code)]
     conversation_history: Vec<(String, String)>,
     app_handle: Option<tauri::AppHandle>,
+    suppress_stream: bool,
+    file_tree_cache: Arc<RwLock<HashMap<String, (String, u64)>>>, // (workspace_path) -> (tree, timestamp)
 }
 
 #[derive(Deserialize, Debug)]
@@ -65,6 +69,8 @@ impl StreamingAgentOrchestrator {
             max_iterations: 10,
             conversation_history: Vec::new(),
             app_handle,
+            suppress_stream: false,
+            file_tree_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -89,37 +95,47 @@ impl StreamingAgentOrchestrator {
         let mut total_tokens = 0u32;
         let mut status = "done".to_string();
 
-        // --- Phase 0: Strategic Planning ---
-        let mut persona = "planner".to_string();
-        let planner_prompt = crate::commands::prompts::STRATEGIC_PLANNER_PROMPT.to_string();
-        let planning_msg = vec![
-            ("system".to_string(), planner_prompt),
-            ("user".to_string(), format!("Generate a plan for this task in the workspace:\n{}", task)),
-        ];
-        
-        // Emit planning start
-        if let Some(app) = &self.app_handle {
-            let _ = app.emit("agent:persona", &persona);
-        }
+        // --- Phase 0: Fast rule-based planning (no LLM call) ---
+        let sub_tasks = self.build_plan_fast(&task);
+        eprintln!("[Orchestrator] Fast plan: {} sub-tasks", sub_tasks.len());
 
-        let (plan_response, tokens) = self.call_llm_streaming(&planning_msg, model_name).await?;
-        total_tokens += tokens;
-        
-        let sub_tasks = self.parse_plan_json(&plan_response);
-        eprintln!("[Orchestrator] Generated {} sub-tasks", sub_tasks.len());
+        // Emit planning done immediately so UI shows activity
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("agent:phase", &serde_json::json!({
+                "phase": "planning",
+                "status": "completed",
+                "description": format!("Plan ready: {} phases", sub_tasks.len())
+            }));
+            let _ = app.emit("agent:step", AgentStep {
+                iteration: 0,
+                tool: "planning".to_string(),
+                status: "done".to_string(),
+                summary: format!("Plan: {}", sub_tasks.iter().map(|t| t.agent.as_str()).collect::<Vec<_>>().join(" → ")),
+                result: None,
+                logs: None,
+                persona: Some("planner".to_string()),
+                request_id: None,
+            });
+        }
 
         let mut turn_messages = vec![
             ("system".to_string(), self.get_system_prompt(&workspace_path, &active_file)),
-            ("user".to_string(), format!("Plan:\n{}\n\nStarting Task: {}", plan_response, task)),
+            ("user".to_string(), task.clone()),
         ];
 
         // --- Multi-Phase Execution Loop ---
         for sub_task in sub_tasks {
-            persona = sub_task.agent.clone();
+            let persona = sub_task.agent.clone();
             eprintln!("[Orchestrator] Switching to Persona: {}", persona);
+            eprintln!("[Orchestrator] Task description: {}", sub_task.description);
             
             if let Some(app) = &self.app_handle {
                 let _ = app.emit("agent:persona", &persona);
+                let _ = app.emit("agent:phase", &serde_json::json!({
+                    "phase": persona.clone(),
+                    "status": "started",
+                    "description": sub_task.description.clone()
+                }));
             }
 
             // Update system prompt based on persona
@@ -130,8 +146,9 @@ impl StreamingAgentOrchestrator {
                 _ => crate::commands::prompts::RESEARCHER_PROMPT.to_string(),
             };
 
-            turn_messages[0] = ("system".to_string(), format!("{}\n\nYour current focus: {}\nProject Context:\n{}", 
-                persona_prompt, sub_task.description, self.get_system_prompt(&workspace_path, &active_file)));
+            turn_messages[0] = ("system".to_string(), format!("{}\n\nYour current focus: {}", 
+                persona_prompt, sub_task.description));
+            eprintln!("[Orchestrator] System prompt updated for {} persona", persona);
             
             // Loop for this specific phase
             let mut phase_iterations = 0;
@@ -140,12 +157,41 @@ impl StreamingAgentOrchestrator {
                 
                 iteration += 1;
                 phase_iterations += 1;
-                eprintln!("[Agent] Iteration {}/{} (Phase: {})", iteration, self.max_iterations, persona);
+                eprintln!("[Agent] === Iteration {}/{} (Phase: {}, Phase iteration: {}/{}) ===", iteration, self.max_iterations, persona, phase_iterations, 5);
 
                 let (response, tokens) = self.call_llm_streaming(&turn_messages, model_name).await?;
                 total_tokens += tokens;
 
-                let tool_calls = extract_tool_calls(&response);
+                let mut tool_calls = extract_tool_calls(&response);
+                eprintln!("[Agent] LLM response length: {}, extracted {} tool calls", response.len(), tool_calls.len());
+                if tool_calls.is_empty() {
+                    eprintln!("[Agent] LLM response (first 1000 chars): {}", &response[..response.len().min(1000)]);
+                    eprintln!("[Agent] Full response: {}", response);
+                }
+
+                // If LLM gave natural language instead of tool calls, retry once with a hard correction
+                if tool_calls.is_empty() && looks_like_natural_language(&response) {
+                    eprintln!("[Agent] LLM gave natural language, retrying with correction...");
+                    let mut correction_msgs = turn_messages.clone();
+                    correction_msgs.push(("assistant".to_string(), response.clone()));
+                    correction_msgs.push(("user".to_string(),
+                        "ERROR: You output text instead of JSON tool calls.\n\
+                         You MUST output ONLY raw JSON objects, one per line.\n\
+                         Do not output any text, explanations, or markdown.\n\
+                         Example of CORRECT output:\n\
+                         {\"tool\": \"read_file\", \"args\": {\"path\": \"/workspace/file.txt\"}}\n\
+                         {\"tool\": \"done\", \"args\": {}}\n\
+                         Now output your tool calls (JSON only):".to_string()
+                    ));
+                    self.suppress_stream = true;
+                    let (retry_response, retry_tokens) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    self.suppress_stream = false;
+                    total_tokens += retry_tokens;
+                    tool_calls = extract_tool_calls(&retry_response);
+                    if tool_calls.is_empty() {
+                        eprintln!("[Agent] Retry also gave no tool calls, treating as done");
+                    }
+                }
 
                 if tool_calls.is_empty() {
                     steps.push(AgentStep {
@@ -158,43 +204,90 @@ impl StreamingAgentOrchestrator {
                         persona: Some(persona.clone()),
                         request_id: None,
                     });
+                    
+                    // Emit phase completion
+                    if let Some(app) = &self.app_handle {
+                        let _ = app.emit("agent:phase", &serde_json::json!({
+                            "phase": persona.clone(),
+                            "status": "completed",
+                            "description": format!("{} phase completed", persona)
+                        }));
+                    }
                     break;
                 }
 
-                for tool_call in &tool_calls {
-                    eprintln!("[Agent] Executing tool: {}", tool_call.tool);
-                    let tool_result = self.execute_tool(tool_call, &workspace_path, &vector_system, &code_intel).await;
+                // Push assistant response ONCE for all tool calls in this turn
+                turn_messages.push(("assistant".to_string(), response.clone()));
 
-                    let step = AgentStep {
-                        iteration,
-                        tool: tool_call.tool.clone(),
-                        status: if tool_result.is_ok() { "done".to_string() } else { "failed".to_string() },
-                        summary: format!("[{}] {}", persona.to_uppercase(), tool_call.tool),
-                        result: tool_result.as_ref().ok().map(|s| s.clone()),
-                        logs: tool_result.as_ref().ok().map(|s| vec![s.clone()]),
-                        persona: Some(persona.clone()),
-                        request_id: None,
-                    };
+                let mut tool_results = Vec::new();
+                let mut done = false;
 
-                    if let Some(app) = &self.app_handle {
-                        let _ = app.emit("agent:step", &step);
+                // Identify independent tool groups for parallel execution
+                let tool_groups = identify_independent_tool_groups(&tool_calls);
+                eprintln!("[Agent] Tool groups for parallel execution: {} groups from {} tools", tool_groups.len(), tool_calls.len());
+
+                // Execute each group (currently sequential, but structured for future parallelization)
+                for (group_idx, group) in tool_groups.iter().enumerate() {
+                    eprintln!("[Agent] Executing group {} with {} tools in parallel", group_idx + 1, group.len());
+                    let group_start = std::time::Instant::now();
+
+                    // Execute all tools in this group
+                    for &tool_idx in group {
+                        let tool_call = &tool_calls[tool_idx];
+                        eprintln!("[Agent] Executing tool: {}", tool_call.tool);
+
+                        if tool_call.tool == "done" {
+                            eprintln!("[Agent] Phase complete via done tool");
+                            done = true;
+                            break;
+                        }
+
+                        let start_time = std::time::Instant::now();
+                        let tool_result = self.execute_tool(tool_call, &workspace_path, &vector_system, &code_intel).await;
+                        let elapsed = start_time.elapsed().as_millis();
+
+                        let step = AgentStep {
+                            iteration,
+                            tool: tool_call.tool.clone(),
+                            status: if tool_result.is_ok() { "done".to_string() } else { "failed".to_string() },
+                            summary: format!("[{}] {} ({}ms)", persona.to_uppercase(), tool_call.tool, elapsed),
+                            result: tool_result.as_ref().ok().cloned(),
+                            logs: tool_result.as_ref().ok().map(|s| vec![s.clone()]),
+                            persona: Some(persona.clone()),
+                            request_id: None,
+                        };
+
+                        if let Some(app) = &self.app_handle {
+                            let _ = app.emit("agent:step", &step);
+                        }
+
+                        steps.push(step);
+                        all_tool_calls.push(tool_call.clone());
+
+                        match tool_result {
+                            Ok(result) => tool_results.push(format!("[{}] result:\n{}", tool_call.tool, result)),
+                            Err(e)     => tool_results.push(format!("[{}] error:\n{}", tool_call.tool, e)),
+                        }
                     }
 
-                    steps.push(step);
-                    all_tool_calls.push(tool_call.clone());
+                    let group_elapsed = group_start.elapsed().as_millis();
+                    eprintln!("[Agent] Group {} completed in {}ms", group_idx + 1, group_elapsed);
 
-                    if let Ok(result) = tool_result {
-                        turn_messages.push(("assistant".to_string(), response.clone()));
-                        turn_messages.push(("user".to_string(), format!("Tool result:\n{}", result)));
-                    }
-
-                    if tool_call.tool == "done" {
-                        eprintln!("[Agent] Phase complete via done tool");
+                    if done {
                         break;
                     }
                 }
-                
-                if tool_calls.iter().any(|c| c.tool == "done") { break; }
+
+                // Push all tool results as a single user message with explicit reminder
+                if !tool_results.is_empty() {
+                    let results_msg = format!(
+                        "Tool results:\n{}\n\nContinue with more tool calls or output {{\"tool\": \"done\", \"args\": {{}}}} when finished.",
+                        tool_results.join("\n\n")
+                    );
+                    turn_messages.push(("user".to_string(), results_msg));
+                }
+
+                if done { break; }
             }
             
             // If we reached max iterations across phases, stop everything
@@ -206,7 +299,18 @@ impl StreamingAgentOrchestrator {
         }
 
         Ok(StreamingAgentResponse {
-            response: turn_messages.last().map(|m| m.1.clone()).unwrap_or_else(|| "Task processed with no final message.".to_string()),
+            response: {
+                // Build a clean summary from completed steps instead of raw message content
+                let done_steps: Vec<String> = steps.iter()
+                    .filter(|s| s.status == "done" && s.tool != "planning" && s.tool != "reasoning")
+                    .map(|s| format!("- {}", s.summary))
+                    .collect();
+                if done_steps.is_empty() {
+                    "Task completed.".to_string()
+                } else {
+                    format!("Completed:\n{}", done_steps.join("\n"))
+                }
+            },
             steps,
             tool_calls: all_tool_calls,
             total_tokens,
@@ -215,18 +319,15 @@ impl StreamingAgentOrchestrator {
     }
 
     async fn call_llm_streaming(&self, messages: &[(String, String)], model: &str) -> Result<(String, u32)> {
-        // Build the prompt from messages, ensuring system prompt is first
+        // Build prompt: system first, then conversation in order
         let mut prompt = String::new();
         
         for (role, content) in messages {
-            if role == "system" {
-                prompt.push_str(&format!("{}\n\n", content));
-            }
-        }
-        
-        for (role, content) in messages {
-            if role != "system" {
-                prompt.push_str(&format!("[{}]\n{}\n\n", role.to_uppercase(), content));
+            match role.as_str() {
+                "system" => prompt.push_str(&format!("{}\n\n", content)),
+                "user"   => prompt.push_str(&format!("[USER]\n{}\n\n", content)),
+                "assistant" => prompt.push_str(&format!("[ASSISTANT]\n{}\n\n", content)),
+                _ => {}
             }
         }
         
@@ -240,10 +341,13 @@ impl StreamingAgentOrchestrator {
             "temperature": 0.1,
             "top_p": 0.9,
             "top_k": 40,
+            "num_predict": 2048,
         });
 
         let mut response_text = String::new();
         let mut token_count = 0u32;
+        let mut token_batch = String::new();
+        const BATCH_SIZE: usize = 10; // Emit every 10 tokens instead of every token
 
         match client
             .post("http://localhost:11434/api/generate")
@@ -259,25 +363,63 @@ impl StreamingAgentOrchestrator {
                             if let Ok(data) = serde_json::from_str::<serde_json::Value>(line) {
                                 if let Some(token) = data.get("response").and_then(|r| r.as_str()) {
                                     response_text.push_str(token);
+                                    token_batch.push_str(token);
                                     token_count += 1;
 
-                                    if let Some(app) = &self.app_handle {
-                                        let _ = app.emit("agent:stream", StreamToken {
-                                            token: token.to_string(),
-                                            iteration: 0,
-                                        });
+                                    // Emit batched tokens every BATCH_SIZE tokens
+                                    if token_count % BATCH_SIZE as u32 == 0 {
+                                        if let Some(app) = &self.app_handle {
+                                            if !self.suppress_stream {
+                                                let _ = app.emit("agent:stream", StreamToken {
+                                                    token: token_batch.clone(),
+                                                    iteration: 0,
+                                                });
+                                                token_batch.clear();
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+                        
+                        // Emit any remaining tokens
+                        if !token_batch.is_empty() {
+                            if let Some(app) = &self.app_handle {
+                                if !self.suppress_stream {
+                                    let _ = app.emit("agent:stream", StreamToken {
+                                        token: token_batch,
+                                        iteration: 0,
+                                    });
+                                }
+                            }
+                        }
+                        
+                        eprintln!("[LLM] Response received: {} tokens", token_count);
                         Ok((response_text, token_count))
                     }
-                    Err(e) => Err(format!("Failed to read response: {}", e).into()),
+                    Err(e) => {
+                        let err_msg = format!("Failed to read response: {}", e);
+                        eprintln!("[LLM] {}", err_msg);
+                        if let Some(app) = &self.app_handle {
+                            let _ = app.emit("agent:error", &serde_json::json!({
+                                "error": err_msg,
+                                "phase": "llm_response"
+                            }));
+                        }
+                        Err(err_msg.into())
+                    }
                 }
             }
             Err(e) => {
-                eprintln!("Ollama connection error: {}", e);
-                Err(format!("Failed to connect to LLM: {}", e).into())
+                let err_msg = format!("Failed to connect to LLM at http://localhost:11434: {}. Is Ollama running?", e);
+                eprintln!("[LLM] {}", err_msg);
+                if let Some(app) = &self.app_handle {
+                    let _ = app.emit("agent:error", &serde_json::json!({
+                        "error": err_msg,
+                        "phase": "llm_connection"
+                    }));
+                }
+                Err(err_msg.into())
             }
         }
     }
@@ -290,12 +432,22 @@ impl StreamingAgentOrchestrator {
         code_intel: &Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
     ) -> Result<String> {
         let ws_root = workspace_path.as_deref().unwrap_or(".");
-        let resolve = |p: &str| {
-            let path = std::path::Path::new(p);
+        let resolve = |p: &str| -> std::path::PathBuf {
+            // Replace LLM placeholder paths like /workspace/ with the real workspace root
+            let normalized = if p.starts_with("/workspace/") {
+                p.replacen("/workspace/", "", 1)
+            } else if p == "/workspace" {
+                String::new()
+            } else {
+                p.to_string()
+            };
+            let path = std::path::Path::new(&normalized);
             if path.is_absolute() {
                 path.to_path_buf()
+            } else if normalized.is_empty() {
+                std::path::Path::new(ws_root).to_path_buf()
             } else {
-                std::path::Path::new(ws_root).join(p)
+                std::path::Path::new(ws_root).join(&normalized)
             }
         };
 
@@ -756,8 +908,38 @@ impl StreamingAgentOrchestrator {
         let mut prompt = prompts::KIRO_SYSTEM_PROMPT.to_string();
 
         if let Some(ws) = workspace_path {
-            prompt.push_str(&format!("\n\nCurrent workspace: {}", ws));
+            prompt.push_str(&format!("\n\nCurrent workspace path: {}\nIMPORTANT: Use this EXACT path in all file operations. Do NOT use /workspace/ as a placeholder.", ws));
+
+            // Get file tree with caching (5 minute TTL)
+            let file_tree = {
+                let cache = self.file_tree_cache.read();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                if let Some((tree, timestamp)) = cache.get(ws) {
+                    if now - timestamp < 300 { // 5 minute cache
+                        eprintln!("[Cache] File tree hit for {}", ws);
+                        tree.clone()
+                    } else {
+                        drop(cache);
+                        let new_tree = crate::commands::vector_search::VectorSearchSystem::build_file_tree(ws, 200);
+                        let mut cache_mut = self.file_tree_cache.write();
+                        cache_mut.insert(ws.clone(), (new_tree.clone(), now));
+                        new_tree
+                    }
+                } else {
+                    drop(cache);
+                    let new_tree = crate::commands::vector_search::VectorSearchSystem::build_file_tree(ws, 200);
+                    let mut cache_mut = self.file_tree_cache.write();
+                    cache_mut.insert(ws.clone(), (new_tree.clone(), now));
+                    new_tree
+                }
+            };
             
+            prompt.push_str(&format!("\n\n<workspace_structure>\n{}\n</workspace_structure>", file_tree));
+
             // Inject Knowledge Items (The 'Brain')
             if let Ok(lore) = crate::commands::distillation::load_relevant_knowledge(std::path::Path::new(ws)) {
                 if !lore.is_empty() {
@@ -827,6 +1009,117 @@ impl StreamingAgentOrchestrator {
             description: "Complete the original task".to_string(),
         }]
     }
+
+    fn build_plan_fast(&self, task: &str) -> Vec<PlannedSubTask> {
+        let lower = task.to_lowercase();
+        eprintln!("[Planner] Analyzing task: {}", task);
+        eprintln!("[Planner] Lowercase: {}", lower);
+        
+        // Read/search/explain tasks → just executor
+        let is_read_only = lower.contains("explain") || lower.contains("what is") || lower.contains("show me") || lower.contains("list");
+        eprintln!("[Planner] is_read_only: {}", is_read_only);
+        
+        // Write/create/fix tasks → researcher + executor + reviewer
+        let needs_review = lower.contains("create") || lower.contains("build") || lower.contains("implement") || lower.contains("fix") || lower.contains("refactor");
+        eprintln!("[Planner] needs_review: {}", needs_review);
+
+        if is_read_only {
+            eprintln!("[Planner] Plan: executor only (read-only task)");
+            vec![PlannedSubTask {
+                id: "task_1".to_string(),
+                agent: "executor".to_string(),
+                description: task.to_string(),
+            }]
+        } else if needs_review {
+            eprintln!("[Planner] Plan: researcher → executor → reviewer (complex task)");
+            vec![
+                PlannedSubTask { id: "task_1".to_string(), agent: "researcher".to_string(), description: format!("Explore workspace structure relevant to: {}", task) },
+                PlannedSubTask { id: "task_2".to_string(), agent: "executor".to_string(), description: task.to_string() },
+                PlannedSubTask { id: "task_3".to_string(), agent: "reviewer".to_string(), description: "Verify the implementation is correct and complete".to_string() },
+            ]
+        } else {
+            eprintln!("[Planner] Plan: researcher → executor (standard task)");
+            vec![
+                PlannedSubTask { id: "task_1".to_string(), agent: "researcher".to_string(), description: format!("Gather context for: {}", task) },
+                PlannedSubTask { id: "task_2".to_string(), agent: "executor".to_string(), description: task.to_string() },
+            ]
+        }
+    }
+}
+
+/// Identifies which tools can be executed in parallel (no shared dependencies)
+fn identify_independent_tool_groups(tool_calls: &[ToolCall]) -> Vec<Vec<usize>> {
+    if tool_calls.is_empty() {
+        return vec![];
+    }
+
+    // Tools that read from the same file or write to the same file have dependencies
+    let mut groups: Vec<Vec<usize>> = vec![];
+    let mut used_indices = std::collections::HashSet::new();
+
+    for (i, tool_i) in tool_calls.iter().enumerate() {
+        if used_indices.contains(&i) {
+            continue;
+        }
+
+        let mut group = vec![i];
+        used_indices.insert(i);
+
+        // Find all tools that can run in parallel with tool_i
+        for (j, tool_j) in tool_calls.iter().enumerate().skip(i + 1) {
+            if used_indices.contains(&j) {
+                continue;
+            }
+
+            // Check if tools have conflicting file operations
+            if !tools_have_conflict(tool_i, tool_j) {
+                group.push(j);
+                used_indices.insert(j);
+            }
+        }
+
+        groups.push(group);
+    }
+
+    groups
+}
+
+/// Checks if two tools have conflicting file operations
+fn tools_have_conflict(tool_a: &ToolCall, tool_b: &ToolCall) -> bool {
+    // Tools that don't access files can always run in parallel
+    let file_tools = ["read_file", "write_file", "edit_file", "delete_file", "list_directory"];
+    
+    if !file_tools.contains(&tool_a.tool.as_str()) || !file_tools.contains(&tool_b.tool.as_str()) {
+        return false;
+    }
+
+    // Get file paths from both tools
+    let path_a = tool_a.args.get("path").and_then(|p| p.as_str());
+    let path_b = tool_b.args.get("path").and_then(|p| p.as_str());
+
+    match (path_a, path_b) {
+        (Some(a), Some(b)) => {
+            // Same file = conflict
+            if a == b {
+                return true;
+            }
+            // One is parent of other = conflict
+            if a.starts_with(b) || b.starts_with(a) {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn looks_like_natural_language(response: &str) -> bool {
+    let trimmed = response.trim();
+    // If it starts with a JSON object brace, it's probably tool calls
+    if trimmed.starts_with('{') { return false; }
+    // If it contains common natural language patterns, it's prose
+    let prose_signals = ["I will", "I'll", "Let me", "First,", "To ", "Step ", "Here ", "Sure", "Okay", "The ", "This "];
+    prose_signals.iter().any(|s| trimmed.contains(s))
 }
 
 fn extract_tool_calls(response: &str) -> Vec<ToolCall> {

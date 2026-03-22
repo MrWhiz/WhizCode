@@ -6,7 +6,6 @@ use tauri::State;
 use walkdir::WalkDir;
 use rusqlite::{params, Connection, Result as SqliteResult};
 use crate::error::Result;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeChunk {
     pub id: String,
@@ -44,7 +43,7 @@ pub struct IndexStats {
 }
 
 pub struct VectorSearchSystem {
-    db: Arc<Mutex<Connection>>,
+    pub db: Arc<Mutex<Connection>>,
     #[allow(dead_code)]
     index_dir: PathBuf,
 }
@@ -193,20 +192,147 @@ impl VectorSearchSystem {
     }
 
     fn generate_embedding(&self, text: &str) -> Vec<f32> {
-        // Simple hash-based embedding for demonstration (can be replaced by real LLM embeddings)
-        let mut embedding = vec![0.0; 64];
-        for (i, c) in text.chars().enumerate() {
-            let idx = (c as usize + i) % 64;
-            embedding[idx] += 1.0;
+        // Synchronous fallback: simple TF-style hash embedding (used when Ollama is unavailable)
+        let mut embedding = vec![0.0f32; 64];
+        let words: Vec<&str> = text.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            let h = word.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+            embedding[h % 64] += 1.0 / (1.0 + i as f32 * 0.1);
         }
-        // Normalize
         let norm = (embedding.iter().map(|x| x * x).sum::<f32>()).sqrt();
         if norm > 0.0 {
-            for x in embedding.iter_mut() {
-                *x /= norm;
-            }
+            for x in embedding.iter_mut() { *x /= norm; }
         }
         embedding
+    }
+
+    pub async fn generate_embedding_ollama(text: &str, model: &str) -> Vec<f32> {
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({ "model": model, "prompt": text });
+        if let Ok(resp) = client
+            .post("http://localhost:11434/api/embeddings")
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(arr) = json.get("embedding").and_then(|e| e.as_array()) {
+                    let v: Vec<f32> = arr.iter()
+                        .filter_map(|x| x.as_f64().map(|f| f as f32))
+                        .collect();
+                    if !v.is_empty() {
+                        return v;
+                    }
+                }
+            }
+        }
+        // Fallback to hash embedding if Ollama unavailable
+        let mut embedding = vec![0.0f32; 64];
+        let words: Vec<&str> = text.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            let h = word.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+            embedding[h % 64] += 1.0 / (1.0 + i as f32 * 0.1);
+        }
+        let norm = (embedding.iter().map(|x| x * x).sum::<f32>()).sqrt();
+        if norm > 0.0 {
+            for x in embedding.iter_mut() { *x /= norm; }
+        }
+        embedding
+    }
+
+    #[allow(dead_code)]
+    pub async fn index_workspace_with_embeddings(&self, workspace_path: &str, embedding_model: &str) -> crate::error::Result<()> {
+        Self::index_workspace_with_embeddings_db(Arc::clone(&self.db), workspace_path, embedding_model).await
+    }
+
+    pub async fn index_workspace_with_embeddings_db(db: Arc<Mutex<Connection>>, workspace_path: &str, embedding_model: &str) -> crate::error::Result<()> {
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("DELETE FROM code_chunks", []).map_err(|e| format!("Failed to clear index: {}", e))?;
+        }
+
+        let mut file_count = 0;
+        let mut chunk_count = 0;
+
+        // Collect all chunks first (sync), then embed + insert (async)
+        let mut pending: Vec<(String, String, String, u32, u32)> = Vec::new(); // (id, file_path, content, start, end)
+
+        for entry in WalkDir::new(workspace_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+        {
+            let path = entry.path();
+            if crate::utils::should_skip_file(path) { continue; }
+
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "md" | "json" | "toml") {
+                if let Ok(content) = fs::read_to_string(path) {
+                    let file_path = path.to_string_lossy().to_string();
+                    let lines: Vec<&str> = content.lines().collect();
+                    for (i, window) in lines.chunks(40).enumerate() {
+                        let start = (i * 40) as u32;
+                        let end = start + window.len() as u32;
+                        let chunk_content = window.join("\n");
+                        let id = format!("{}:{}", file_path, start);
+                        pending.push((id, file_path.clone(), chunk_content, start, end));
+                    }
+                    file_count += 1;
+                }
+            }
+        }
+
+        for (id, file_path, chunk_content, start, end) in &pending {
+            // Async embedding - no lock held
+            let embedding = Self::generate_embedding_ollama(chunk_content, embedding_model).await;
+            let embedding_json = serde_json::to_string(&embedding).unwrap_or_default();
+
+            // Lock only for the insert
+            let conn = db.lock().unwrap();
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO code_chunks (id, file_path, chunk_type, symbol_name, content, start_line, end_line, embedding, complexity, dependencies)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![id, file_path, "block", Option::<String>::None, chunk_content,
+                        start, end, embedding_json, 1u32, "[]"],
+            );
+            chunk_count += 1;
+        }
+
+        eprintln!("[VECTOR] Indexed {} files, {} chunks with Ollama embeddings", file_count, chunk_count);
+        Ok(())
+    }
+
+    /// Build a compact file tree string for injection into the system prompt
+    pub fn build_file_tree(workspace_path: &str, max_files: usize) -> String {
+        let mut lines = vec![format!("workspace: {}", workspace_path)];
+        let mut count = 0;
+
+        for entry in WalkDir::new(workspace_path)
+            .max_depth(4)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if count >= max_files { break; }
+            let path = entry.path();
+            if crate::utils::should_skip_file(path) { continue; }
+
+            let depth = entry.depth();
+            let indent = "  ".repeat(depth);
+            let name = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if path.is_dir() {
+                lines.push(format!("{}📁 {}/", indent, name));
+            } else {
+                lines.push(format!("{}📄 {}", indent, name));
+                count += 1;
+            }
+        }
+
+        lines.join("\n")
     }
 
     fn cosine_similarity(&self, v1: &[f32], v2: &[f32]) -> f32 {
@@ -274,6 +400,29 @@ pub async fn vector_index_workspace(
 ) -> Result<()> {
     let system = state.lock().unwrap();
     system.index_workspace(&workspace_path)
+}
+
+#[tauri::command]
+pub async fn vector_index_workspace_full(
+    workspace_path: String,
+    embedding_model: Option<String>,
+    state: State<'_, Arc<Mutex<VectorSearchSystem>>>,
+) -> Result<()> {
+    let model = embedding_model.unwrap_or_else(|| "nomic-embed-text".to_string());
+    // Extract the db Arc without holding the outer MutexGuard across an await
+    let db = {
+        let system = state.lock().unwrap();
+        Arc::clone(&system.db)
+    };
+    VectorSearchSystem::index_workspace_with_embeddings_db(db, &workspace_path, &model).await
+}
+
+#[tauri::command]
+pub async fn vector_get_file_tree(
+    workspace_path: String,
+    max_files: Option<usize>,
+) -> Result<String> {
+    Ok(VectorSearchSystem::build_file_tree(&workspace_path, max_files.unwrap_or(300)))
 }
 
 #[tauri::command]

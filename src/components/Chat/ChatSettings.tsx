@@ -1,4 +1,10 @@
+import { useState, useEffect } from 'react'
+import { listen } from '@tauri-apps/api/event'
+import { ollama } from '../../lib/tauri-api'
 import type { AIProvider } from '../../types'
+
+const RECOMMENDED_TASK_MODEL = 'qwen3:latest'
+const RECOMMENDED_EMBED_MODEL = 'nomic-embed-text'
 
 interface ChatSettingsProps {
     isSettingsOpen: boolean;
@@ -73,6 +79,38 @@ export const ChatSettings = ({
     azureTokenStatus,
     onGenerateAzureToken
 }: ChatSettingsProps) => {
+
+    const [pullingModels, setPullingModels] = useState<Record<string, { status: string; progress?: number }>>({})
+
+    useEffect(() => {
+        let unlisten: (() => void) | null = null
+        listen<{ model: string; status: string; completed?: number; total?: number }>('ollama:pull_progress', (event) => {
+            const { model: m, status, completed, total } = event.payload
+            setPullingModels(prev => {
+                if (status === 'done' || status.startsWith('error')) {
+                    const next = { ...prev }
+                    delete next[m]
+                    return next
+                }
+                const progress = (completed && total && total > 0) ? Math.round((completed / total) * 100) : undefined
+                return { ...prev, [m]: { status, progress } }
+            })
+        }).then(fn => { unlisten = fn })
+        return () => { if (unlisten) unlisten() }
+    }, [])
+
+    const handlePullModel = async (modelName: string) => {
+        setPullingModels(prev => ({ ...prev, [modelName]: { status: 'starting...' } }))
+        try {
+            await ollama.pullModel(modelName)
+        } catch (e) {
+            setPullingModels(prev => {
+                const next = { ...prev }
+                delete next[modelName]
+                return next
+            })
+        }
+    }
 
     const providers = [
         { id: 'ollama' as const, name: 'Ollama', icon: '🦙', description: 'Local models' },
@@ -263,6 +301,40 @@ export const ChatSettings = ({
                                         )}
                                     </div>
                                 )}
+
+                                {/* Recommended Models */}
+                                <div style={{ marginTop: 12 }}>
+                                    <div style={{ fontSize: '11px', opacity: 0.6, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Recommended Models</div>
+                                    {[
+                                        { name: RECOMMENDED_TASK_MODEL, label: 'Task Model', desc: 'Reasoning & coding' },
+                                        { name: RECOMMENDED_EMBED_MODEL, label: 'Embedding Model', desc: 'Vector search & indexing' },
+                                    ].map(({ name, label, desc }) => {
+                                        const isInstalled = ollamaModels.some(m => m === name || m.startsWith(name.split(':')[0]))
+                                        const pulling = pullingModels[name]
+                                        return (
+                                            <div key={name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 8px', marginBottom: 4, background: 'var(--bg-secondary)', borderRadius: 4, border: '1px solid var(--border-color)' }}>
+                                                <div>
+                                                    <span style={{ fontSize: '12px', fontFamily: 'monospace' }}>{name}</span>
+                                                    <span style={{ fontSize: '10px', opacity: 0.5, marginLeft: 6 }}>{label} · {desc}</span>
+                                                </div>
+                                                {isInstalled ? (
+                                                    <span style={{ fontSize: '10px', color: '#89d185' }}>✓ installed</span>
+                                                ) : pulling ? (
+                                                    <span style={{ fontSize: '10px', opacity: 0.7 }}>
+                                                        {pulling.progress !== undefined ? `${pulling.progress}%` : pulling.status}
+                                                    </span>
+                                                ) : (
+                                                    <button
+                                                        onClick={() => handlePullModel(name)}
+                                                        style={{ fontSize: '10px', padding: '2px 8px', background: 'var(--accent-primary)', color: '#fff', border: 'none', borderRadius: 3, cursor: 'pointer' }}
+                                                    >
+                                                        Pull
+                                                    </button>
+                                                )}
+                                            </div>
+                                        )
+                                    })}
+                                </div>
                             </div>
                         )}
 

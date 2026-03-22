@@ -371,3 +371,52 @@ pub async fn check_file_exists(
     
     Ok(resolved.exists())
 }
+
+#[tauri::command]
+pub async fn watch_directory(
+    path: String,
+    handle: AppHandle,
+) -> Result<()> {
+    use notify::{Watcher, RecursiveMode, recommended_watcher, Event};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let watch_path = PathBuf::from(&path);
+    if !watch_path.exists() {
+        return Err("Path does not exist".into());
+    }
+
+    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+
+    let mut watcher = recommended_watcher(tx).map_err(|e| e.to_string())?;
+    watcher.watch(&watch_path, RecursiveMode::Recursive).map_err(|e| e.to_string())?;
+
+    // Spawn a background thread to forward events to the frontend
+    std::thread::spawn(move || {
+        // Keep watcher alive in this thread
+        let _watcher = watcher;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(Ok(event)) => {
+                    // Debounce: only emit for create/remove/modify events
+                    use notify::EventKind;
+                    let should_emit = matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)
+                    );
+                    if should_emit {
+                        for p in &event.paths {
+                            let path_str = p.to_string_lossy().to_string();
+                            let _ = handle.emit("file:changed", FileChangedPayload { path: path_str });
+                        }
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    Ok(())
+}

@@ -64,6 +64,16 @@ impl From<tokio::time::error::Elapsed> for ApiError {
     }
 }
 
+impl From<walkdir::Error> for ApiError {
+    fn from(err: walkdir::Error) -> Self {
+        ApiError {
+            code: "FS_WALK_ERROR".to_string(),
+            message: err.to_string(),
+            details: None,
+        }
+    }
+}
+
 impl From<serde_json::Error> for ApiError {
     fn from(err: serde_json::Error) -> Self {
         ApiError {

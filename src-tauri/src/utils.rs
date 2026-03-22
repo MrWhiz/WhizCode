@@ -3,29 +3,74 @@ use crate::error::{ApiError, Result};
 
 /// Validates that a path is within the workspace boundary
 pub fn validate_path_in_workspace(file_path: &Path, workspace_path: &Path) -> Result<PathBuf> {
-    let resolved = file_path.canonicalize()
+    // If the path exists, canonicalize it directly
+    if file_path.exists() {
+        let resolved = file_path.canonicalize()
+            .map_err(|e| ApiError {
+                code: "PATH_ERROR".to_string(),
+                message: format!("Failed to resolve path: {}", e),
+                details: None,
+            })?;
+        
+        let workspace_resolved = workspace_path.canonicalize()
+            .map_err(|e| ApiError {
+                code: "WORKSPACE_ERROR".to_string(),
+                message: format!("Failed to resolve workspace: {}", e),
+                details: None,
+            })?;
+        
+        if !resolved.starts_with(&workspace_resolved) {
+            return Err(ApiError {
+                code: "PATH_TRAVERSAL".to_string(),
+                message: format!("Path traversal attempt detected: {:?} is outside workspace", file_path),
+                details: None,
+            });
+        }
+        
+        return Ok(resolved);
+    }
+
+    // If the path doesn't exist, validate its parent directory
+    let parent = file_path.parent().ok_or_else(|| ApiError {
+        code: "PATH_ERROR".to_string(),
+        message: "Path has no parent".to_string(),
+        details: None,
+    })?;
+
+    // Recurse to find the first existing parent
+    let mut current = parent;
+    while !current.exists() {
+        if let Some(p) = current.parent() {
+            current = p;
+        } else {
+            break;
+        }
+    }
+
+    let resolved_parent = current.canonicalize()
         .map_err(|e| ApiError {
             code: "PATH_ERROR".to_string(),
-            message: format!("Failed to resolve path: {}", e),
+            message: format!("Failed to resolve parent path: {}", e),
             details: None,
         })?;
-    
+
     let workspace_resolved = workspace_path.canonicalize()
         .map_err(|e| ApiError {
             code: "WORKSPACE_ERROR".to_string(),
             message: format!("Failed to resolve workspace: {}", e),
             details: None,
         })?;
-    
-    if !resolved.starts_with(&workspace_resolved) {
+
+    if !resolved_parent.starts_with(&workspace_resolved) {
         return Err(ApiError {
             code: "PATH_TRAVERSAL".to_string(),
             message: format!("Path traversal attempt detected: {:?} is outside workspace", file_path),
             details: None,
         });
     }
-    
-    Ok(resolved)
+
+    // Return the joined path (not canonicalized because it doesn't exist yet)
+    Ok(file_path.to_path_buf())
 }
 
 /// Checks if a file is likely binary by reading first 1024 bytes

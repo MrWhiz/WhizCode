@@ -5,6 +5,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Message, AgentStep } from '../../types'
 import { ChatSettings } from './ChatSettings'
+import { MermaidDiagram } from './MermaidDiagram'
 
 interface ChatPanelProps {
     chatWidth: number;
@@ -47,6 +48,52 @@ const LogContainer = ({ logs }: { logs: string[] }) => {
     );
 };
 
+// Smart summary formatter — turns raw "Executed X with args: {...}" into readable text
+const formatStepSummary = (tool: string, summary: string): string => {
+    // Try to extract args JSON from the summary
+    const match = summary.match(/args:\s*(\{.*\})/s);
+    if (!match) return summary;
+
+    try {
+        const args = JSON.parse(match[1]);
+        switch (tool) {
+            case 'write_file':
+            case 'edit_file': {
+                const path = args.path || args.file || '';
+                const fileName = path.split(/[/\\]/).pop() || path;
+                return tool === 'write_file'
+                    ? `Write  ${fileName}`
+                    : `Edit  ${fileName}${args.start_line ? `  (lines ${args.start_line}–${args.end_line || '?'})` : ''}`;
+            }
+            case 'read_file': {
+                const path = args.path || '';
+                const fileName = path.split(/[/\\]/).pop() || path;
+                return `Read  ${fileName}`;
+            }
+            case 'list_directory': {
+                const path = args.path || '';
+                return `List  ${path}`;
+            }
+            case 'search_files': {
+                return `Search  "${args.pattern || args.query}"${args.path ? `  in ${args.path}` : ''}`;
+            }
+            case 'run_command': {
+                return `$ ${args.command || ''}`;
+            }
+            case 'git': {
+                return `git ${args.operation || ''}${args.message ? ` "${args.message}"` : ''}`;
+            }
+            case 'npm': {
+                return `npm ${args.operation || ''}${args.package ? ` ${args.package}` : ''}`;
+            }
+            default:
+                return summary.replace(/Executed \w+ with args: \{.*\}/s, `${tool}`);
+        }
+    } catch {
+        return summary;
+    }
+};
+
 const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, getToolIcon: (t: string) => string, isLive?: boolean }) => {
     const [logsOpen, setLogsOpen] = React.useState(false);
     const hasLogs = step.logs && step.logs.length > 0;
@@ -59,21 +106,22 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
         }
     }, [isLive, step.status, step.tool]);
 
+    const personaIcon = step.persona === 'planner' ? '🗺️' : 
+                        step.persona === 'researcher' ? '🔍' :
+                        step.persona === 'executor' ? '🛠️' :
+                        step.persona === 'reviewer' ? '⚖️' : '🤖';
+    const personaColor = step.persona === 'planner' ? '#cba6f7' : 
+                         step.persona === 'researcher' ? '#89b4fa' :
+                         step.persona === 'executor' ? '#a6e3a1' :
+                         step.persona === 'reviewer' ? '#f9e2af' : '#9399b2';
+
     const handleClick = () => {
         if (canOpenLogs) {
             setLogsOpen(o => !o);
         }
     };
 
-    // Determine phase badge
-    const getPhaseLabel = (phase?: string) => {
-        switch (phase) {
-            case 'planning': return '📋 PLANNING';
-            case 'execution': return '⚙️ EXECUTION';
-            case 'summary': return '📊 SUMMARY';
-            default: return '';
-        }
-    };
+    const displaySummary = formatStepSummary(step.tool, step.summary);
 
     return (
         <div className={`agent-step ${step.status}`}>
@@ -82,35 +130,53 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
                 onClick={handleClick}
                 style={{ 
                     cursor: canOpenLogs ? 'pointer' : 'default',
-                    userSelect: 'none'
+                    userSelect: 'none',
+                    display: 'flex',
+                    alignItems: 'center'
                 }}
             >
+                {step.persona && (
+                    <span style={{ 
+                        fontSize: '9px', 
+                        background: `${personaColor}15`, 
+                        color: personaColor, 
+                        padding: '1px 5px', 
+                        borderRadius: '3px',
+                        border: `1px solid ${personaColor}33`,
+                        marginRight: '8px',
+                        fontWeight: 'bold',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '3px'
+                    }}>
+                        {personaIcon} {step.persona.toUpperCase()}
+                    </span>
+                )}
                 {isLive && step.status === 'running' ? (
                     <div className="spinner" style={{ width: 10, height: 10 }}></div>
                 ) : (
                     <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
                 )}
-                <span className="agent-step-summary">{step.summary}</span>
-                {step.planPhase && (
-                    <span style={{ 
-                        fontSize: '9px', 
-                        opacity: 0.6, 
-                        marginLeft: '8px',
-                        padding: '2px 6px',
-                        background: 'rgba(0,0,0,0.2)',
-                        borderRadius: '3px'
-                    }}>
-                        {getPhaseLabel(step.planPhase)}
-                    </span>
-                )}
+                <span className="agent-step-summary">{displaySummary}</span>
                 {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                {step.status === 'failed' && <span style={{ color: 'var(--error-color)', fontSize: 12 }}>✗</span>}
                 {canOpenLogs && (
-                    <span style={{ marginLeft: 'auto', fontSize: '10px', opacity: 0.7, paddingLeft: 6 }}>
+                    <span style={{ marginLeft: 'auto', fontSize: '10px', opacity: 0.5, paddingLeft: 6 }}>
                         {logsOpen ? '▲' : '▼'}
                     </span>
                 )}
             </div>
             {step.data && <EditDetails data={step.data} />}
+            {step.result && step.result.includes('file:///') && (
+                <div style={{ padding: '8px 12px' }}>
+                    <img 
+                      src={step.result.split('URL: ')[1] || step.result.match(/file:\/\/\/[^\s]+/)?.[0]} 
+                      alt="Generated Asset" 
+                      style={{ maxWidth: '100%', borderRadius: '4px', border: '1px solid #313244', cursor: 'pointer' }}
+                      onClick={() => window.open(step.result?.split('URL: ')[1])}
+                    />
+                </div>
+            )}
             {canOpenLogs && logsOpen && <LogContainer logs={step.logs && step.logs.length > 0 ? step.logs : ['(No logs yet)']} />}
         </div>
     );
@@ -392,6 +458,11 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
                             code({ className, children, ...props }) {
                                 const match = /language-(\w+)/.exec(className || '');
                                 const codeString = String(children).replace(/\n$/, '');
+                                
+                                if (match && match[1] === 'mermaid') {
+                                    return <MermaidDiagram chart={codeString} />;
+                                }
+
                                 return match ? (
                                     <SyntaxHighlighter
                                         style={vscDarkPlus as any}
@@ -532,12 +603,12 @@ export const ChatPanel = ({
         }
 
         // Broad fallback: if the content is being typed and no tools/code are yet present, it's reasoning
-        if (content.length > 0 && !content.includes('"tool":') && !content.includes('```')) {
-            const cleanText = content.replace(/\[\/THOUGHT\]|<\/think>|\[THOUGHT\]|<think>/gi, '').trim();
+        if (content.length > 0 && !content.includes('```')) {
+            const cleanText = content.replace(/\[\/THOUGHT\]|<\/think>|\[THOUGHT\]|<think>|\[REASONING\]|\[\/REASONING\]/gi, '').trim();
             // Show only the last two sentences or last 15 words to keep it "live"
             const words = cleanText.split(/\s+/);
             if (words.length > 15) return '...' + words.slice(-15).join(' ');
-            return cleanText;
+            return cleanText || null;
         }
         
         return null;
@@ -660,12 +731,16 @@ export const ChatPanel = ({
                                     boxShadow: '0 0 8px var(--accent-primary)',
                                     flexShrink: 0
                                 }}></div>
-                                <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                    <span style={{ fontWeight: 600, color: 'var(--accent-primary)', marginRight: '6px' }}>THINKING:</span>
-                                    <span className="live-thought-text" style={{ fontStyle: 'italic', opacity: 1, maxWidth: 'none' }}>
-                                        {activeThought || (agentSteps.length > 0 ? (agentSteps[agentSteps.length - 1].summary || 'Processing...') : (agentSteps.length > 0 && agentSteps[agentSteps.length-1].status === 'awaiting_permission' ? 'Awaiting your permission' : 'Analyzing context...'))}
-                                    </span>
-                                </div>
+                                    <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        <span style={{ fontWeight: 600, color: 'var(--accent-primary)', marginRight: '6px' }}>THINKING:</span>
+                                        <span className="live-thought-text" style={{ fontStyle: 'italic', opacity: 1, maxWidth: 'none' }}>
+                                            {activeThought || (agentSteps.length > 0 ? (
+                                                agentSteps.find((s: any) => s.status === 'running')?.summary || 
+                                                [...agentSteps].reverse().find((s: any) => s.status === 'done')?.summary || 
+                                                'Initiating plan...'
+                                            ) : 'Analyzing context...')}
+                                        </span>
+                                    </div>
                             </div>
                         </div>
                     )}

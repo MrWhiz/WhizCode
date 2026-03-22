@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { ai, vector, cache, errorRecovery, mcp, system } from '../../lib/tauri-api';
 
 interface LearningInsight {
   type: 'pattern' | 'preference' | 'strategy' | 'error';
@@ -93,9 +94,6 @@ export const AIInsightsPanel: React.FC = () => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const ipc = (window as any).ipcRenderer;
-      if (!ipc) return;
-
       const [
         insightsData, 
         metricsData, 
@@ -105,27 +103,27 @@ export const AIInsightsPanel: React.FC = () => {
         errorData,
         mcpData
       ] = await Promise.all([
-        ipc.invoke('ai:get-learning-insights'),
-        ipc.invoke('ai:get-learning-metrics'),
-        ipc.invoke('ai:get-context-memory-stats'),
-        ipc.invoke('vector:get-index-stats'),
-        ipc.invoke('cache:get-stats'),
-        ipc.invoke('error-recovery:get-statistics'),
-        ipc.invoke('mcp:get-marketplace')
+        ai.getLearningInsights(),
+        ai.getLearningMetrics(),
+        ai.getContextMemoryStats(),
+        vector.getIndexStats(),
+        cache.getStats(),
+        errorRecovery.getStatistics(),
+        mcp.getMarketplace()
       ]);
 
       setInsights(insightsData || []);
       setMetrics(metricsData);
       setMemoryStats(memoryData);
       setVectorStats(vectorData);
-      setCacheStats(cacheData);
+      setCacheStats(cacheStats as any);
       setErrorStats(errorData);
       setMcpMarketplace(mcpData);
 
       // Get code metrics if workspace is available
-      const workspacePath = await ipc.invoke('get-workspace-path');
+      const workspacePath = await system.getWorkspacePath();
       if (workspacePath) {
-        const codeMetricsData = await ipc.invoke('ai:get-code-metrics', workspacePath);
+        const codeMetricsData = await ai.getCodeMetrics(workspacePath);
         setCodeMetrics(codeMetricsData);
       }
     } catch (error) {

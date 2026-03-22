@@ -7,11 +7,10 @@ import { FileTree } from './components/Explorer/FileTree'
 import { SearchPanel } from './components/Explorer/SearchPanel'
 import { SourceControlPanel } from './components/Explorer/SourceControlPanel'
 import { EditorArea } from './components/Editor/EditorArea'
-import { TerminalPane } from './components/Terminal/TerminalPane'
-import { MultiTerminalPane } from './components/Terminal/MultiTerminalPane'
 import { ChatPanel } from './components/Chat/ChatPanel'
 import { BrainDashboard } from './components/Brain/BrainDashboard'
 import { SpecsPanel } from './components/Specs/SpecsPanel'
+import { WebPreview } from './components/Preview/WebPreview'
 import SystemPerformance from './components/Explorer/SystemPerformance'
 
 // Types
@@ -34,7 +33,6 @@ import {
   hooks,
   codeIntelligence
 } from './lib/tauri-api'
-
 import { 
   loadAppState, 
   saveAppState, 
@@ -79,11 +77,8 @@ function App() {
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [activeFileId, setActiveFileId] = useState<string | null>(savedState.activeFileId)
   const [openFiles, setOpenFiles] = useState<OpenFileProps[]>([])
-  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | 'brain-health' | 'specs' | null>(savedState.activeView)
+  const [activeView, setActiveView] = useState<'explorer' | 'search' | 'source-control' | 'brain-health' | 'specs' | 'preview' | null>(savedState.activeView as any)
   const [sidebarWidth, setSidebarWidth] = useState(savedState.sidebarWidth)
-  const [isTerminalOpen, setIsTerminalOpen] = useState(savedState.isTerminalOpen)
-  const [terminalHeight, setTerminalHeight] = useState(savedState.terminalHeight)
-  const [terminalKey, setTerminalKey] = useState(0)
   const [isChatOpen, setIsChatOpen] = useState(savedState.isChatOpen)
   const [chatWidth, setChatWidth] = useState(savedState.chatWidth)
 
@@ -141,6 +136,16 @@ function App() {
           streamingContentRef.current += token
           const currentContent = streamingContentRef.current
           setLiveStreamingContent(currentContent)
+          
+          setMessages(prev => {
+            const streamMsgIdx = prev.findIndex(m => (m as any).__id === STREAMING_MSG_ID)
+            if (streamMsgIdx >= 0) {
+              const next = [...prev]
+              next[streamMsgIdx] = { ...next[streamMsgIdx], content: currentContent }
+              return next
+            }
+            return [...prev, { role: 'assistant', content: currentContent, __id: STREAMING_MSG_ID } as any]
+          })
         })
       } catch (error) {
         console.error('Failed to setup Tauri event listeners:', error)
@@ -212,13 +217,13 @@ function App() {
   useEffect(() => {
     setupUIStatePersistence(
       sidebarWidth,
-      terminalHeight,
+      0,
       chatWidth,
-      isTerminalOpen,
+      false,
       isChatOpen,
       activeView
     )
-  }, [sidebarWidth, terminalHeight, chatWidth, isTerminalOpen, isChatOpen, activeView])
+  }, [sidebarWidth, chatWidth, isChatOpen, activeView])
 
   // Persist workspace state whenever it changes
   useEffect(() => {
@@ -286,14 +291,12 @@ function App() {
 
     // Panel sizes and visibility
     localStorage.setItem('sidebarWidth', String(sidebarWidth))
-    localStorage.setItem('isTerminalOpen', String(isTerminalOpen))
-    localStorage.setItem('terminalHeight', String(terminalHeight))
     localStorage.setItem('isChatOpen', String(isChatOpen))
     localStorage.setItem('chatWidth', String(chatWidth))
   }, [
     modelProvider, model, openaiKey, geminiKey, bedrockRegion, bedrockAccessKey, bedrockSecretKey,
     isAutopilotMode, azureLoginUrl, azureEmbeddingUrl, azureCompletionUrl, azureUsername, azurePassword,
-    sidebarWidth, isTerminalOpen, terminalHeight, isChatOpen, chatWidth
+    sidebarWidth, isChatOpen, chatWidth
   ])
 
   const checkAzureToken = useCallback(async () => {
@@ -345,11 +348,6 @@ function App() {
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+` to toggle terminal
-      if (e.ctrlKey && e.key === '`') {
-        e.preventDefault()
-        setIsTerminalOpen(prev => !prev)
-      }
       // Ctrl+S to save
       if (e.ctrlKey && e.key === 's') {
         e.preventDefault()
@@ -407,12 +405,25 @@ function App() {
 
     const setupFileChangeListener = async () => {
       try {
-        unlistenFileChanged = await events.onFileChanged(({ path, content }: { path: string; content: string }) => {
+        unlistenFileChanged = await events.onFileChanged(({ path, content }) => {
+          // Trigger Explorer refresh
+          setRefreshKey(prev => prev + 1)
+
           // Update the file in openFiles if it's currently open
           setOpenFiles(prev => {
             const fileExists = prev.some(f => f.path === path)
             if (fileExists) {
-              return prev.map(f => f.path === path ? { ...f, content } : f)
+              if (content !== undefined) {
+                return prev.map(f => f.path === path ? { ...f, content } : f)
+              } else {
+                // If content not provided, re-read it
+                fs.readFile(path).then(newContent => {
+                  setOpenFiles(current => 
+                    current.map(f => f.path === path ? { ...f, content: newContent } : f)
+                  )
+                }).catch(err => console.error('Failed to reload changed file:', path, err))
+                return prev
+              }
             }
             return prev
           })
@@ -487,22 +498,6 @@ function App() {
     const onMouseMove = (moveEvent: MouseEvent) => {
       const newWidth = startWidth + (moveEvent.clientX - startX)
       setSidebarWidth(Math.max(160, Math.min(newWidth, 600)))
-    }
-    const onMouseUp = () => {
-      document.removeEventListener('mousemove', onMouseMove)
-      document.removeEventListener('mouseup', onMouseUp)
-    }
-    document.addEventListener('mousemove', onMouseMove)
-    document.addEventListener('mouseup', onMouseUp)
-  }
-
-  const handleTerminalResize = (e: React.MouseEvent) => {
-    e.preventDefault()
-    const startY = e.clientY
-    const startHeight = terminalHeight
-    const onMouseMove = (moveEvent: MouseEvent) => {
-      const newHeight = Math.max(100, startHeight - (moveEvent.clientY - startY))
-      setTerminalHeight(Math.min(newHeight, window.innerHeight - 100))
     }
     const onMouseUp = () => {
       document.removeEventListener('mousemove', onMouseMove)
@@ -702,14 +697,25 @@ function App() {
     streamingContentRef.current = ''
 
     try {
+      // Guard: workspace must be open before running agent
+      if (!workspacePath) {
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: '⚠️ No workspace open. Please open a folder first (File → Open Folder) to use the agent.'
+        }])
+        setIsLoading(false)
+        return
+      }
+
       const activeFile = openFiles.find(f => f.path === activeFileId)
-      const result = await agent.executeLoop({
+      console.log('[AGENT] Executing loop with workspacePath:', workspacePath)
+      const result = await agent.executeLoopStreaming({
         task: userMsg.content,
         model: {
           provider: modelProvider,
           model: model,
         },
-        workspacePath,
+        workspace_path: workspacePath,
         activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
       })
       const response = result?.response || 'No response'
@@ -792,6 +798,8 @@ function App() {
       case 'run_tests': return '🧪'
       case 'indexing_workspace': return '📦'
       case 'continue_iterations': return '🔄'
+      case 'search_web': return '🌐'
+      case 'read_url_content': return '📖'
       case 'planning': return '📋'
       case 'learning': return '🧠'
       default: return '🛠️'
@@ -854,13 +862,7 @@ function App() {
     },
     {
       name: 'View', items: [
-        { label: 'Toggle Terminal', action: 'toggle-terminal', shortcut: 'Ctrl+`' },
         { label: 'Toggle Sidebar', action: 'toggle-sidebar', shortcut: 'Ctrl+B' }
-      ]
-    },
-    {
-      name: 'Terminal', items: [
-        { label: 'New Terminal', action: 'new-terminal', shortcut: 'Ctrl+Shift+`' }
       ]
     },
     { name: 'Help', items: [{ label: 'About', action: 'about' }] }
@@ -880,10 +882,6 @@ function App() {
             window.close()
           } else if (action === 'about') {
             setIsAboutOpen(true)
-          } else if (action === 'new-terminal') {
-            setIsTerminalOpen(true)
-          } else if (action === 'toggle-terminal') {
-            setIsTerminalOpen(prev => !prev)
           } else if (action === 'toggle-sidebar') {
             setActiveView(prev => prev ? null : 'explorer')
           } else if (action === 'open-folder') {
@@ -1103,6 +1101,9 @@ function App() {
               {activeView === 'specs' && (
                 <SpecsPanel />
               )}
+              {activeView === 'preview' && (
+                  <WebPreview url={workspacePath ? "http://localhost:5173" : "https://google.com"} />
+              )}
             </aside>
             <div className="sidebar-resize-handle" onMouseDown={handleSidebarResize} />
           </>
@@ -1122,7 +1123,6 @@ function App() {
                 dialog.openFolder().then((result: any) => {
                   if (result && !result.canceled && result.filePaths?.length > 0) {
                     const folderPath = result.filePaths[0]
-                    // Clear old workspace: close all open files and reset state
                     setOpenFiles([])
                     setActiveFileId(null)
                     setWorkspacePath(folderPath)
@@ -1136,8 +1136,6 @@ function App() {
                 }).catch((error: any) => {
                   console.error('Error opening folder:', error)
                 })
-              } else if (action === 'new-terminal') {
-                setIsTerminalOpen(true)
               }
             }}
             fileErrors={fileErrors}
@@ -1145,11 +1143,6 @@ function App() {
             onValidation={handleValidation}
           />
 
-          <MultiTerminalPane
-            isOpen={isTerminalOpen}
-            height={terminalHeight}
-            onHeightChange={setTerminalHeight}
-          />
         </div>
 
         <ChatPanel

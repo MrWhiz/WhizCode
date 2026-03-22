@@ -2,6 +2,7 @@ import { useRef, useEffect } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
+import { terminal as terminalApi, events } from '../../lib/tauri-api'
 
 interface TerminalPaneProps {
     terminalId: string
@@ -14,9 +15,8 @@ export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
         if (!terminalRef.current) return
         let term: Terminal | null = null
         let observer: ResizeObserver | null = null
-        const ipc = (window as any).ipcRenderer
         let unmounted = false
-        let onIncomingData: any
+        let unlistenData: (() => void) | null = null
         let handleResize: any
 
         try {
@@ -60,15 +60,18 @@ export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
             term.loadAddon(fitAddon)
 
             // Set up data handler BEFORE opening terminal
-            if (ipc) {
-                onIncomingData = (_event: any, data: string, id: string) => {
-                    if (id === terminalId && term) {
-                        term.write(data)
-                    }
+            const setupListeners = async () => {
+                try {
+                    unlistenData = await events.onTerminalData(terminalId, (data: string) => {
+                        if (term) {
+                            term.write(data)
+                        }
+                    })
+                } catch (err) {
+                    console.error('Failed to setup terminal data listener:', err)
                 }
-
-                ipc.on('terminal:incomingData', onIncomingData)
             }
+            setupListeners()
 
             term.open(terminalRef.current)
 
@@ -88,29 +91,6 @@ export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
                 })
             }
 
-            // Register link matcher for URLs with Ctrl+click support
-            // Note: registerLinkMatcher is not available in current xterm.js version
-            // const urlRegex = /(https?:\/\/[^\s]+|file:\/\/[^\s]+)/g
-            // if (term.registerLinkMatcher) {
-            //     term.registerLinkMatcher(
-            //         urlRegex,
-            //         (event: MouseEvent, uri: string) => {
-            //             // Only open on Ctrl+click or Cmd+click
-            //             if (event.ctrlKey || event.metaKey) {
-            //                 console.log('[TERMINAL] Opening link:', uri)
-            //                 ipc.send('terminal:openLink', uri)
-            //             }
-            //         },
-            //         {
-            //             priority: 1,
-            //             willLinkActivate: (event: MouseEvent, uri: string) => {
-            //                 // Show link is clickable on Ctrl+hover
-            //                 return event.ctrlKey || event.metaKey
-            //             }
-            //         }
-            //     )
-            // }
-
             // Initial fit
             setTimeout(() => {
                 if (!unmounted) {
@@ -118,34 +98,36 @@ export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
                 }
             }, 50)
 
-            if (ipc) {
-                term.onData((data: string) => {
-                    ipc.send('terminal:keystroke', data, terminalId)
+            term.onData((data: string) => {
+                terminalApi.writeToTerminal(terminalId, data).catch((err: unknown) => {
+                    console.error('Terminal write error:', err)
                 })
+            })
 
-                handleResize = () => {
-                    if (unmounted || !term) return
-                    try {
-                        fitAddon.fit()
-                        ipc.send('terminal:resize', term.cols, term.rows, terminalId)
-                    } catch (err) {
+            handleResize = () => {
+                if (unmounted || !term) return
+                try {
+                    fitAddon.fit()
+                    terminalApi.resizeTerminal(terminalId, term.cols, term.rows).catch((err: unknown) => {
                         console.error('Terminal resize error:', err)
-                    }
+                    })
+                } catch (err: unknown) {
+                    console.error('Terminal resize error:', err)
                 }
+            }
 
-                // Delayed resize to ensure container is ready
-                setTimeout(handleResize, 100)
-                window.addEventListener('resize', handleResize)
+            // Delayed resize to ensure container is ready
+            setTimeout(handleResize, 100)
+            window.addEventListener('resize', handleResize)
 
-                // Observe container size changes
-                observer = new ResizeObserver(() => {
-                    if (!unmounted) {
-                        handleResize()
-                    }
-                })
-                if (terminalRef.current) {
-                    observer.observe(terminalRef.current)
+            // Observe container size changes
+            observer = new ResizeObserver(() => {
+                if (!unmounted) {
+                    handleResize()
                 }
+            })
+            if (terminalRef.current) {
+                observer.observe(terminalRef.current)
             }
         } catch (err: any) {
             console.error('Terminal initialization error:', err)
@@ -154,8 +136,8 @@ export const TerminalPane = ({ terminalId }: TerminalPaneProps) => {
         return () => {
             unmounted = true
             try {
-                if (ipc && onIncomingData) {
-                    ipc.off('terminal:incomingData', onIncomingData)
+                if (unlistenData) {
+                    unlistenData()
                 }
                 if (handleResize) {
                     window.removeEventListener('resize', handleResize)

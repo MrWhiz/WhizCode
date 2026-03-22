@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 
 interface SystemStats {
   cpuUsage: number;
@@ -21,16 +22,22 @@ const SystemPerformance: React.FC = () => {
   const [stats, setStats] = useState<SystemStats | null>(null);
 
   useEffect(() => {
-    const ipc = (window as any).ipcRenderer;
-    if (!ipc) return;
+    let unlisten: (() => void) | null = null;
 
-    const handler = (_event: any, newStats: SystemStats) => {
-      setStats(newStats);
+    const setupListener = async () => {
+      try {
+        unlisten = await listen('system:status', (event: any) => {
+          setStats(event.payload as SystemStats);
+        });
+      } catch (err) {
+        console.error('Failed to setup system:status listener:', err);
+      }
     };
 
-    ipc.on('system:status', handler);
+    setupListener();
+
     return () => {
-      // IPC off might be needed but let's see how it's handled in this project
+      if (unlisten) unlisten();
     };
   }, []);
 

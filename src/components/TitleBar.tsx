@@ -1,6 +1,4 @@
-import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
-import { useState, useEffect } from 'react'
-import { saveAppState } from '../lib/appState'
+import { useState } from 'react'
 
 interface MenuItem {
     label?: string
@@ -23,57 +21,6 @@ interface TitleBarProps {
 }
 
 export const TitleBar = ({ menus, activeMenu, toggleMenu, handleMenuHover, handleMenuAction }: TitleBarProps) => {
-    const [isMaximized, setIsMaximized] = useState(false)
-
-    useEffect(() => {
-        const checkMaximized = async () => {
-            try {
-                const appWindow = WebviewWindow.getCurrent()
-                const maximized = await appWindow.isMaximized()
-                setIsMaximized(maximized)
-            } catch (error) {
-                console.error('Failed to check maximized state:', error)
-            }
-        }
-
-        checkMaximized()
-    }, [])
-
-    const handleMinimize = async () => {
-        try {
-            const appWindow = WebviewWindow.getCurrent()
-            await appWindow.minimize()
-        } catch (error) {
-            console.error('Failed to minimize:', error)
-        }
-    }
-
-    const handleMaximize = async () => {
-        try {
-            const appWindow = WebviewWindow.getCurrent()
-            if (isMaximized) {
-                await appWindow.unmaximize()
-                setIsMaximized(false)
-                saveAppState({ isMaximized: false })
-            } else {
-                await appWindow.maximize()
-                setIsMaximized(true)
-                saveAppState({ isMaximized: true })
-            }
-        } catch (error) {
-            console.error('Failed to maximize:', error)
-        }
-    }
-
-    const handleClose = async () => {
-        try {
-            const appWindow = WebviewWindow.getCurrent()
-            await appWindow.close()
-        } catch (error) {
-            console.error('Failed to close:', error)
-        }
-    }
-
     return (
         <div className="title-bar glass">
             <div className="title-bar-left">
@@ -111,56 +58,6 @@ export const TitleBar = ({ menus, activeMenu, toggleMenu, handleMenuHover, handl
             </div>
             <div className="title-bar-center">
                 <span>WhizCode</span>
-            </div>
-            <div className="title-bar-right" style={{ display: 'flex', gap: '8px', alignItems: 'center', paddingRight: '8px' }}>
-                <button
-                    onClick={handleMinimize}
-                    style={{
-                        background: 'none',
-                        border: 'none',
-                        color: 'rgba(255,255,255,0.7)',
-                        cursor: 'pointer',
-                        padding: '4px 8px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        fontSize: '16px'
-                    }}
-                    title="Minimize"
-                >
-                    −
-                </button>
-                <button
-                    onClick={handleMaximize}
-                    style={{
-                        background: 'none',
-                        border: 'none',
-                        color: 'rgba(255,255,255,0.7)',
-                        cursor: 'pointer',
-                        padding: '4px 8px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        fontSize: '16px'
-                    }}
-                    title={isMaximized ? 'Restore' : 'Maximize'}
-                >
-                    {isMaximized ? '❐' : '□'}
-                </button>
-                <button
-                    onClick={handleClose}
-                    style={{
-                        background: 'none',
-                        border: 'none',
-                        color: 'rgba(255,255,255,0.7)',
-                        cursor: 'pointer',
-                        padding: '4px 8px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        fontSize: '16px'
-                    }}
-                    title="Close"
-                >
-                    ✕
-                </button>
             </div>
         </div>
     )

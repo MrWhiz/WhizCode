@@ -141,6 +141,22 @@ export const fs = {
       throw handleError(error)
     }
   },
+
+  async revealInExplorer(path: string): Promise<void> {
+    try {
+      return await invoke('reveal_in_folder', { path })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async openTerminal(path: string): Promise<void> {
+    try {
+      return await invoke('open_terminal_at', { path })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
 }
 
 // Search Commands
@@ -170,9 +186,14 @@ export const search = {
 
 // Terminal Commands
 export const terminal = {
-  async createTerminal(shellType: string): Promise<string> {
+  async createTerminal(shellType: string, cwd?: string): Promise<string> {
     try {
-      return await invoke('create_terminal', { shell_type: shellType })
+      return await invoke('terminal_create', { 
+        config: {
+          shell_type: shellType,
+          cwd: cwd || null
+        }
+      })
     } catch (error) {
       throw handleError(error)
     }
@@ -180,7 +201,7 @@ export const terminal = {
 
   async writeToTerminal(terminalId: string, data: string): Promise<void> {
     try {
-      return await invoke('write_to_terminal', { terminal_id: terminalId, data })
+      return await invoke('terminal_write', { terminal_id: terminalId, data })
     } catch (error) {
       throw handleError(error)
     }
@@ -192,7 +213,7 @@ export const terminal = {
     rows: number
   ): Promise<void> {
     try {
-      return await invoke('resize_terminal', { terminal_id: terminalId, cols, rows })
+      return await invoke('terminal_resize', { terminal_id: terminalId, cols, rows })
     } catch (error) {
       throw handleError(error)
     }
@@ -200,7 +221,7 @@ export const terminal = {
 
   async closeTerminal(terminalId: string): Promise<void> {
     try {
-      return await invoke('close_terminal', { terminal_id: terminalId })
+      return await invoke('terminal_close', { id: terminalId })
     } catch (error) {
       throw handleError(error)
     }
@@ -208,7 +229,7 @@ export const terminal = {
 
   async getAvailableShells(): Promise<ShellInfo[]> {
     try {
-      return await invoke('get_available_shells')
+      return await invoke('terminal_get_available_shells')
     } catch (error) {
       throw handleError(error)
     }
@@ -216,7 +237,7 @@ export const terminal = {
 
   async getDefaultShell(): Promise<string> {
     try {
-      return await invoke('get_default_shell')
+      return await invoke('terminal_get_default_shell')
     } catch (error) {
       throw handleError(error)
     }
@@ -238,6 +259,16 @@ export const system = {
       return await invoke('open_external', { url })
     } catch (error) {
       throw handleError(error)
+    }
+  },
+
+  async getWorkspacePath(): Promise<string | null> {
+    try {
+      const w: WorkspaceInfo | null = await invoke('get_workspace')
+      return w ? w.path : null
+    } catch (error) {
+      console.warn('Failed to get workspace path:', error)
+      return null
     }
   },
 }
@@ -272,9 +303,9 @@ export const workspace = {
 
 // Event Listeners
 export const events = {
-  async onFileChanged(callback: (data: { path: string; content: string }) => void): Promise<() => void> {
+  async onFileChanged(callback: (data: { path: string; content?: string }) => void): Promise<() => void> {
     const unlisten = await listen('file:changed', (event) => {
-      callback(event.payload as { path: string; content: string })
+      callback(event.payload as { path: string; content?: string })
     })
     return unlisten
   },
@@ -341,9 +372,10 @@ function handleError(error: unknown): TauriError {
 
 // Diagnostics Commands
 export const diagnostics = {
-  async check(filePath: string, workspacePath: string, content?: string): Promise<any[]> {
+  async check(filePath: string, content: string, language: string): Promise<any[]> {
     try {
-      return await invoke('diagnostics_check', { file_path: filePath, workspace_path: workspacePath, content })
+      const report = await invoke<any>('diagnostics_check_file', { file_path: filePath, content, language })
+      return report.diagnostics || []
     } catch (error) {
       throw handleError(error)
     }
@@ -410,11 +442,14 @@ export const agent = {
 
   async executeLoopStreaming(options: any): Promise<any> {
     try {
+      const wsPath = options.workspace_path || options.workspacePath || null
+      const activeFile = options.active_file || options.activeFile || null
+      console.log('[API] Invoking execute_agent_loop_streaming, workspace_path =', wsPath)
       return await invoke('execute_agent_loop_streaming', {
         task: options.task,
         model: options.model,
-        workspace_path: options.workspacePath,
-        active_file: options.activeFile,
+        workspace_path: wsPath,
+        active_file: activeFile,
       })
     } catch (error) {
       throw handleError(error)

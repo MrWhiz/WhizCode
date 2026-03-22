@@ -3,8 +3,7 @@ import { useRef, useEffect, useState } from 'react'
 import type { OpenFileProps } from '../../types'
 import { WhizLogo } from '../Branding/WhizLogo'
 import { MarkdownRenderer } from './MarkdownRenderer'
-
-
+import { diagnostics as diagnosticsApi } from '../../lib/tauri-api'
 
 interface EditorAreaProps {
     openFiles: OpenFileProps[];
@@ -81,26 +80,24 @@ export const EditorArea = ({
                 return;
             }
             
-            const ipc = (window as any).ipcRenderer;
-            if (!ipc) {
-                setDiagnostics([]);
-                return;
-            }
-
             try {
                 // Add timeout to prevent hanging
-                const timeoutPromise = new Promise((_, reject) => 
+                const timeoutPromise = new Promise<any[]>((_, reject) => 
                     setTimeout(() => reject(new Error('Diagnostics check timeout')), 3000)
                 );
                 
                 const diags = await Promise.race([
-                    ipc.invoke('diagnostics:check', activeFileId, workspacePath, activeFile?.content),
+                    diagnosticsApi.check(activeFileId, activeFile?.content || '', getLanguage(activeFile?.name || '')),
                     timeoutPromise
                 ]);
                 
                 const diagnosticsArray = Array.isArray(diags) ? diags : [];
                 setDiagnostics(diagnosticsArray);
-            } catch (error) {
+            } catch (error: any) {
+                // Ignore cancelation errors (often from Monaco or Tauri during quick switches)
+                if (error?.type === 'cancelation' || error?.msg?.includes('canceled')) {
+                    return;
+                }
                 console.error('Error fetching diagnostics:', error);
                 setDiagnostics([]);
             }

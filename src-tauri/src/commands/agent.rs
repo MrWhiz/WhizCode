@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use std::sync::Arc;
-use parking_lot::Mutex;
+use tokio::sync::oneshot;
+use parking_lot::Mutex as PlMutex;
+use std::sync::Mutex as StdMutex;
 
-// Global cancellation token for agent execution
+// Global permission channel to wait for user input
 lazy_static::lazy_static! {
-    static ref AGENT_CANCEL_TOKEN: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    static ref AGENT_CANCEL_TOKEN: Arc<PlMutex<bool>> = Arc::new(PlMutex::new(false));
+    pub static ref PERMISSION_TX: StdMutex<Option<oneshot::Sender<bool>>> = StdMutex::new(None);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -183,6 +186,12 @@ pub fn is_agent_cancelled() -> bool {
 }
 
 #[tauri::command]
-pub async fn agent_permission_response(_approved: bool, _request_id: Option<String>) -> Result<()> {
+pub async fn agent_permission_response(approved: bool, _request_id: Option<String>) -> Result<()> {
+    if let Some(tx) = PERMISSION_TX.lock().unwrap().take() {
+        let _ = tx.send(approved);
+        eprintln!("Permission response received: approved={}", approved);
+    } else {
+        eprintln!("Received permission response but no one was waiting for it!");
+    }
     Ok(())
 }

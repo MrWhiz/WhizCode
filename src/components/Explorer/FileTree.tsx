@@ -1,7 +1,24 @@
-import { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import type { FileEntry } from '../../types'
 import { fs, events } from '../../lib/tauri-api'
+import Popup from '../UI/Popup'
+import type { PopupType } from '../UI/Popup'
+import { 
+    FiFile, 
+    FiFolder, 
+    FiChevronRight, 
+    FiChevronDown, 
+    FiMoreVertical, 
+    FiPlus, 
+    FiFolderPlus, 
+    FiTrash2, 
+    FiEdit2, 
+    FiCopy, 
+    FiCornerUpRight, 
+    FiTerminal, 
+    FiExternalLink 
+} from 'react-icons/fi'
 
 interface ContextMenu {
     x: number
@@ -9,28 +26,30 @@ interface ContextMenu {
     entry: FileEntry
 }
 
-const FileTreeItem = ({ 
-    entry, 
-    level = 0, 
-    onFileOpen, 
-    refreshKey, 
-    onContextMenu, 
-    collapseAll = false, 
-    fileFilter = '', 
-    fileErrors = {}, 
+interface FileTreeItemProps {
+    entry: FileEntry
+    level?: number
+    onFileOpen: (path: string, name: string) => void
+    refreshKey: number
+    onContextMenu: (e: React.MouseEvent, entry: FileEntry) => void
+    collapseAll?: boolean
+    fileFilter?: string
+    fileErrors?: Record<string, number>
+    gitStatus?: { branch: string, changes: { file: string, status: string }[] } | null
+    workspacePath?: string
+}
+
+const FileTreeItem: React.FC<FileTreeItemProps> = ({
+    entry,
+    level = 0,
+    onFileOpen,
+    refreshKey,
+    onContextMenu,
+    collapseAll = false,
+    fileFilter = '',
+    fileErrors = {},
     gitStatus = null,
     workspacePath = ''
-}: { 
-    entry: FileEntry, 
-    level?: number, 
-    onFileOpen: (path: string, name: string) => void, 
-    refreshKey: number,
-    onContextMenu: (e: React.MouseEvent, entry: FileEntry) => void,
-    collapseAll?: boolean,
-    fileFilter?: string,
-    fileErrors?: Record<string, number>,
-    gitStatus?: { branch: string, changes: { file: string, status: string }[] } | null,
-    workspacePath?: string
 }) => {
     const [expanded, setExpanded] = useState(false)
     const [children, setChildren] = useState<FileEntry[]>([])
@@ -39,7 +58,6 @@ const FileTreeItem = ({
         if (entry.isDirectory) {
             try {
                 const res = await fs.readDirectory(entry.path)
-                // Sort: folders first, then files, both alphabetically
                 const sorted = res.sort((a, b) => {
                     if (a.isDirectory === b.isDirectory) {
                         return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
@@ -118,58 +136,30 @@ const FileTreeItem = ({
         return iconColors[ext || ''] || '#519aba';
     }
 
-    const getGitStatus = () => {
-        if (!gitStatus || !gitStatus.changes) {
-            return null;
-        }
+    const getGitStatusSymbol = () => {
+        if (!gitStatus || !gitStatus.changes) return null;
         
-        const changes = gitStatus.changes;
-        
-        // Normalize paths by removing Windows UNC prefix (\\?\)
-        const normalizePath = (p: string) => {
-            return p.replace(/\\/g, '/').replace(/^\/\?\//, '').toLowerCase();
-        };
-        
-        // Convert absolute path to relative path from workspace root
+        const normalizePath = (p: string) => p.replace(/\\/g, '/').replace(/^\/\?\//, '').toLowerCase();
         let relativePath = entry.path;
         if (workspacePath) {
             const wsPath = normalizePath(workspacePath);
             const entryPath = normalizePath(entry.path);
-            
             if (entryPath.startsWith(wsPath)) {
                 relativePath = entryPath.substring(wsPath.length).replace(/^\//, '');
-            } else {
-                relativePath = entryPath;
             }
-        } else {
-            relativePath = normalizePath(entry.path);
         }
         
-        // Find exact match for this file/folder
-        const match = changes.find(c => {
-            const gitFilePath = normalizePath(c.file);
-            return gitFilePath === relativePath;
-        });
-        
-        if (match) {
-            return match.status;
-        }
+        const match = gitStatus.changes.find(c => normalizePath(c.file) === relativePath);
+        if (match) return match.status;
 
         if (entry.isDirectory) {
-            // Check if any git change is inside this directory
-            const hasChangesInside = changes.some(c => {
-                const gitFilePath = normalizePath(c.file);
-                return gitFilePath.startsWith(relativePath + '/');
-            });
-            if (hasChangesInside) {
-                return 'M';
-            }
+            const hasChangesInside = gitStatus.changes.some(c => normalizePath(c.file).startsWith(relativePath + '/'));
+            if (hasChangesInside) return 'M';
         }
-        
         return null;
     }
 
-    const gStatus = getGitStatus();
+    const gStatus = getGitStatusSymbol();
     const statusColor = gStatus === 'M' ? '#e2c08d' : (gStatus === 'A' || gStatus === '??' ? '#73c991' : undefined);
 
     return (
@@ -203,27 +193,12 @@ const FileTreeItem = ({
                 
                 <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px' }}>
                     {gStatus && (
-                        <span style={{ 
-                            fontSize: '10px', 
-                            color: statusColor, 
-                            fontWeight: 'bold',
-                            padding: '0 4px',
-                            opacity: 0.8
-                        }}>
+                        <span style={{ fontSize: '10px', color: statusColor, fontWeight: 'bold', padding: '0 4px', opacity: 0.8 }}>
                             {gStatus === '??' ? 'U' : gStatus}
                         </span>
                     )}
                     {totalErrorCount > 0 && (
-                        <span style={{ 
-                            padding: '1px 5px', 
-                            backgroundColor: '#f14c4c', 
-                            color: 'white', 
-                            borderRadius: '10px', 
-                            fontSize: '9px',
-                            fontWeight: 'bold',
-                            minWidth: '14px',
-                            textAlign: 'center'
-                        }}>
+                        <span style={{ padding: '1px 5px', backgroundColor: '#f14c4c', color: 'white', borderRadius: '10px', fontSize: '9px', fontWeight: 'bold', minWidth: '14px', textAlign: 'center' }}>
                             {totalErrorCount}
                         </span>
                     )}
@@ -254,7 +229,19 @@ const FileTreeItem = ({
     )
 }
 
-export const FileTree = ({ 
+interface FileTreeProps {
+    path: string
+    onFileOpen: (path: string, name: string) => void
+    onFileDeleted?: (deletedPath: string) => void
+    onFileRenamed?: (oldPath: string, newPath: string) => void
+    refreshKey?: number
+    collapseAll?: boolean
+    fileFilter?: string
+    fileErrors?: Record<string, number>
+    gitStatus?: { branch: string, changes: { file: string, status: string }[] } | null
+}
+
+export const FileTree: React.FC<FileTreeProps> = ({ 
     path, 
     onFileOpen, 
     onFileDeleted, 
@@ -264,16 +251,6 @@ export const FileTree = ({
     fileFilter = '',
     fileErrors = {},
     gitStatus = null
-}: { 
-    path: string, 
-    onFileOpen: (path: string, name: string) => void,
-    onFileDeleted?: (deletedPath: string) => void,
-    onFileRenamed?: (oldPath: string, newPath: string) => void,
-    refreshKey?: number,
-    collapseAll?: boolean,
-    fileFilter?: string,
-    fileErrors?: Record<string, number>,
-    gitStatus?: { branch: string, changes: { file: string, status: string }[] } | null
 }) => {
     const [files, setFiles] = useState<FileEntry[]>([])
     const [refreshKey, setRefreshKey] = useState(0)
@@ -281,10 +258,40 @@ export const FileTree = ({
     const [newItemDialog, setNewItemDialog] = useState<{ type: 'file' | 'folder', parentPath: string } | null>(null)
     const [newItemName, setNewItemName] = useState('')
 
+    // Popup state
+    const [popupState, setPopupState] = useState<{
+        isOpen: boolean;
+        title: string;
+        message: string;
+        type: PopupType;
+        onConfirm?: () => void;
+    }>({
+        isOpen: false,
+        title: '',
+        message: '',
+        type: 'info'
+    })
+
+    const showPopup = (title: string, message: string, type: PopupType = 'info', onConfirm?: () => void) => {
+        setPopupState({
+            isOpen: true,
+            title,
+            message,
+            type,
+            onConfirm: onConfirm ? () => {
+                onConfirm()
+                closePopup()
+            } : undefined
+        })
+    }
+
+    const closePopup = () => {
+        setPopupState(prev => ({ ...prev, isOpen: false }))
+    }
+
     const fetchFiles = useCallback(async () => {
         try {
             const res = await fs.readDirectory(path)
-            // Sort: folders first, then files, both alphabetically
             const sorted = res.sort((a, b) => {
                 if (a.isDirectory === b.isDirectory) {
                     return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
@@ -294,20 +301,16 @@ export const FileTree = ({
             setFiles(sorted)
         } catch (error) {
             console.error('Failed to read directory:', path, error)
-            if (error instanceof Error) {
-                console.error('Error details:', error.message)
-            }
             setFiles([])
         }
     }, [path])
 
     useEffect(() => {
         fetchFiles()
-    }, [path, externalRefreshKey])
+    }, [path, externalRefreshKey, fetchFiles])
 
     useEffect(() => {
         let unlistenFileChanged: (() => void) | null = null
-
         const setupListener = async () => {
             try {
                 unlistenFileChanged = await events.onFileChanged(() => {
@@ -318,36 +321,21 @@ export const FileTree = ({
                 console.error('Failed to setup file change listener:', error)
             }
         }
-
         setupListener()
-
-        return () => {
-            if (unlistenFileChanged) {
-                unlistenFileChanged()
-            }
-        }
-    }, [])
+        return () => { if (unlistenFileChanged) unlistenFileChanged() }
+    }, [fetchFiles])
 
     const handleContextMenu = (e: React.MouseEvent, entry: FileEntry) => {
-        setContextMenu({
-            x: e.clientX,
-            y: e.clientY,
-            entry
-        })
+        setContextMenu({ x: e.clientX, y: e.clientY, entry })
     }
 
     const handleRootContextMenu = (e: React.MouseEvent) => {
         e.preventDefault()
-        setContextMenu({
-            x: e.clientX,
-            y: e.clientY,
-            entry: { name: '', path, isDirectory: true }
-        })
+        setContextMenu({ x: e.clientX, y: e.clientY, entry: { name: '', path, isDirectory: true } })
     }
 
     const handleMenuAction = async (action: string) => {
         if (!contextMenu) return
-
         const entry = contextMenu.entry
         setContextMenu(null)
 
@@ -359,34 +347,47 @@ export const FileTree = ({
                 setNewItemDialog({ type: 'folder', parentPath: entry.isDirectory ? entry.path : path })
                 break
             case 'rename':
+                // For now, rename still uses prompt as it's an input. 
+                // In a future version, this could be an in-line editor or a full Modal.
                 const newName = prompt('Enter new name:', entry.name)
                 if (newName && newName !== entry.name) {
                     try {
-                        const newPath = entry.path.substring(0, entry.path.lastIndexOf('\\') + 1) + newName
+                        const lastSlash = Math.max(entry.path.lastIndexOf('/'), entry.path.lastIndexOf('\\'));
+                        const parentPath = entry.path.substring(0, lastSlash + 1);
+                        const newPath = parentPath + newName
                         await fs.renameFile(entry.path, newPath)
                         onFileRenamed?.(entry.path, newPath)
                         fetchFiles()
+                        setRefreshKey(prev => prev + 1)
                     } catch (error) {
-                        console.error('Failed to rename file:', error)
-                        alert('Failed to rename file')
+                        showPopup('Rename Failed', error instanceof Error ? error.message : String(error), 'error')
                     }
                 }
                 break
             case 'delete':
-                if (confirm(`Are you sure you want to delete ${entry.name}?`)) {
-                    try {
-                        if (entry.isDirectory) {
-                            await fs.deleteDirectory(entry.path)
-                        } else {
-                            await fs.deleteFile(entry.path)
+                showPopup(
+                    'Delete Item',
+                    `Are you sure you want to delete ${entry.name}?`,
+                    'confirm',
+                    async () => {
+                        try {
+                            if (entry.isDirectory) {
+                                await fs.deleteDirectory(entry.path)
+                            } else {
+                                await fs.deleteFile(entry.path)
+                            }
+                            onFileDeleted?.(entry.path)
+                            fetchFiles()
+                            setRefreshKey(prev => prev + 1)
+                        } catch (error) {
+                            let message = error instanceof Error ? error.message : String(error)
+                            if (message.includes('os error 32') || message.includes('used by another process')) {
+                                message = 'The directory is being used by another process. Please close any active processes in this folder and try again.'
+                            }
+                            showPopup('Delete Failed', message, 'error')
                         }
-                        onFileDeleted?.(entry.path)
-                        fetchFiles()
-                    } catch (error) {
-                        console.error('Failed to delete:', error)
-                        alert('Failed to delete')
                     }
-                }
+                )
                 break
             case 'copyPath':
                 navigator.clipboard.writeText(entry.path)
@@ -396,32 +397,39 @@ export const FileTree = ({
                 navigator.clipboard.writeText(relPath)
                 break
             case 'revealInExplorer':
-                // TODO: Implement shell reveal in Tauri
-                console.log('Reveal in explorer:', entry.path)
+                try { await fs.revealInExplorer(entry.path) } catch (error) { 
+                    showPopup('Reveal Failed', String(error), 'error')
+                }
                 break
             case 'openInTerminal':
-                // TODO: Implement terminal open in Tauri
-                console.log('Open in terminal:', entry.isDirectory ? entry.path : path)
+                try {
+                    let dirPath = entry.path;
+                    if (!entry.isDirectory) {
+                        const lastSlash = Math.max(entry.path.lastIndexOf('/'), entry.path.lastIndexOf('\\'));
+                        dirPath = lastSlash !== -1 ? entry.path.substring(0, lastSlash) : entry.path;
+                    }
+                    await fs.openTerminal(dirPath)
+                } catch (error) { 
+                    showPopup('Terminal Failed', String(error), 'error')
+                }
                 break
         }
     }
 
     const handleCreateItem = async () => {
         if (!newItemDialog || !newItemName) return
-
         try {
-            const itemPath = newItemDialog.parentPath + '/' + newItemName
-            if (newItemDialog.type === 'file') {
-                await fs.createFile(itemPath)
-            } else {
-                await fs.createDirectory(itemPath)
-            }
+            const separator = newItemDialog.parentPath.includes('\\') ? '\\' : '/'
+            const parent = newItemDialog.parentPath.replace(/[/\\]$/, '')
+            const itemPath = `${parent}${separator}${newItemName}`
+            if (newItemDialog.type === 'file') await fs.createFile(itemPath)
+            else await fs.createDirectory(itemPath)
             setNewItemDialog(null)
             setNewItemName('')
             fetchFiles()
+            setRefreshKey(prev => prev + 1)
         } catch (error) {
-            console.error('Failed to create item:', error)
-            alert('Failed to create item')
+            showPopup('Creation Failed', error instanceof Error ? error.message : String(error), 'error')
         }
     }
 
@@ -445,78 +453,42 @@ export const FileTree = ({
                 />
             ))}
             
-            <div 
-                className="explorer-empty-space"
-                style={{ flex: 1, minHeight: '100px' }}
-                onClick={() => setContextMenu(null)}
-            />
+            <div className="explorer-empty-space" style={{ flex: 1, minHeight: '100px' }} onClick={() => setContextMenu(null)} />
 
             {contextMenu && createPortal(
-                <div 
-                    className="context-menu"
+                <div className="context-menu glass-dark animate-fade-in"
                     style={{ 
                         position: 'fixed', 
                         left: Math.min(contextMenu.x, window.innerWidth - 200),
-                        top: Math.min(contextMenu.y, window.innerHeight - 250),
+                        top: Math.min(contextMenu.y, window.innerHeight - 350),
                         zIndex: 1000,
-                        boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-                        border: '1px solid var(--glass-border)',
                         minWidth: '200px'
                     }}
-                    onClick={(e) => e.stopPropagation()}
-                >
-                    {!contextMenu.entry.isDirectory && contextMenu.entry.name && (
-                        <>
-                            <div className="context-menu-item" onClick={() => handleMenuAction('open')}>
-                                <span className="context-menu-icon">📄</span>
-                                Open
-                            </div>
-                            <div className="context-menu-separator"></div>
-                        </>
-                    )}
-                    
+                    onClick={(e) => e.stopPropagation()}>
                     <div className="context-menu-item" onClick={() => handleMenuAction('newFile')}>
-                        <span className="context-menu-icon">📄</span>
-                        New File
+                        <FiFile className="context-menu-icon" /> New File
                     </div>
                     <div className="context-menu-item" onClick={() => handleMenuAction('newFolder')}>
-                        <span className="context-menu-icon">📁</span>
-                        New Folder
+                        <FiFolderPlus className="context-menu-icon" /> New Folder
                     </div>
-                    
                     {contextMenu.entry.name && (
                         <>
-                            <div className="context-menu-separator"></div>
-                            
+                            <div className="context-menu-separator" />
                             <div className="context-menu-item" onClick={() => handleMenuAction('rename')}>
-                                <span className="context-menu-icon">✏️</span>
-                                Rename
+                                <FiEdit2 className="context-menu-icon" /> Rename
                             </div>
-                            <div className="context-menu-item" onClick={() => handleMenuAction('delete')}>
-                                <span className="context-menu-icon">🗑️</span>
-                                Delete
+                            <div className="context-menu-item danger" onClick={() => handleMenuAction('delete')}>
+                                <FiTrash2 className="context-menu-icon" /> Delete
                             </div>
-                            
-                            <div className="context-menu-separator"></div>
-                            
+                            <div className="context-menu-separator" />
                             <div className="context-menu-item" onClick={() => handleMenuAction('copyPath')}>
-                                <span className="context-menu-icon">📋</span>
-                                Copy Path
+                                <FiCopy className="context-menu-icon" /> Copy Path
                             </div>
-                            <div className="context-menu-item" onClick={() => handleMenuAction('copyRelativePath')}>
-                                <span className="context-menu-icon">📋</span>
-                                Copy Relative Path
-                            </div>
-                            
-                            <div className="context-menu-separator"></div>
-                            
                             <div className="context-menu-item" onClick={() => handleMenuAction('revealInExplorer')}>
-                                <span className="context-menu-icon">🔍</span>
-                                Reveal in Explorer
+                                <FiExternalLink className="context-menu-icon" /> Reveal in Explorer
                             </div>
                             <div className="context-menu-item" onClick={() => handleMenuAction('openInTerminal')}>
-                                <span className="context-menu-icon">⚡</span>
-                                Open in Terminal
+                                <FiTerminal className="context-menu-icon" /> Open in Terminal
                             </div>
                         </>
                     )}
@@ -525,8 +497,9 @@ export const FileTree = ({
             )}
 
             {newItemDialog && (
-                <div className="new-item-dialog">
+                <div className="new-item-dialog glass animate-fade-in" style={{ padding: '8px' }}>
                     <input
+                        className="new-item-input"
                         type="text"
                         value={newItemName}
                         onChange={(e) => setNewItemName(e.target.value)}
@@ -539,6 +512,15 @@ export const FileTree = ({
                     />
                 </div>
             )}
+
+            <Popup
+                isOpen={popupState.isOpen}
+                onClose={closePopup}
+                onConfirm={popupState.onConfirm}
+                title={popupState.title}
+                message={popupState.message}
+                type={popupState.type}
+            />
         </div>
     )
 }

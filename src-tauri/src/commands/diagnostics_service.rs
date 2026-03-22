@@ -262,19 +262,12 @@ impl DiagnosticsService {
 #[tauri::command]
 pub async fn diagnostics_check_file(
     file_path: String,
-    _content: String,
+    content: String,
     language: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<DiagnosticsService>>>,
 ) -> Result<DiagnosticReport> {
-    eprintln!("Checking diagnostics for: {} ({})", file_path, language);
-    Ok(DiagnosticReport {
-        file_path,
-        diagnostics: vec![],
-        checked_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        language,
-    })
+    let service = state.lock().unwrap();
+    service.check_file(file_path, content, language)
 }
 
 #[tauri::command]

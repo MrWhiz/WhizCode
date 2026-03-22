@@ -4,28 +4,25 @@ WhizCode is a modern, autonomous AI coding assistant with a VS Code-inspired int
 
 ## ✨ Features
 
-### 🤖 Autonomous AI Agent
-- **Strategic Planning** - Intelligent task decomposition and execution planning
-- **Context Memory** - Persistent learning from past interactions and patterns
-- **Adaptive Learning** - Behavioral adaptation based on success patterns
-- **Code Intelligence** - Deep semantic code analysis and understanding
-- **Enhanced MCP Integration** - Comprehensive powers marketplace and tool ecosystem
-- **Vector Search Engine** - Semantic code search and contextual recommendations
-- **Advanced Error Recovery** - Multi-layered error diagnosis and recovery strategies
-- **Tool Result Caching** - Intelligent caching for performance optimization
-- **Autonomous behavior** - Acts autonomously without forced approval steps
-- **Single model simplicity** - One model handles all reasoning and coding tasks
-- **Visible thinking process** - See the agent's reasoning when helpful
-- **Smart loop prevention** - Automatic detection and correction of repetitive actions
-- **Natural conversation flow** - Minimal, conversational responses
-
+### 🤖 Autonomous Multi-Agent System
+- **Sub-Agent Orchestration** - Complex tasks are routed through specialized personas: `STRATEGIC PLANNER`, `RESEARCHER`, `EXECUTOR`, and `REVIEWER`.
+- **Knowledge Distillation (The Brain)** - Automatically extracts overarching architectural rules and stores them in `.whizcode/knowledge` for cross-session context.
+- **Structured Workflows & Modular Skills** - Define custom SOPs in `.whizcode/workflows/*.md` for the agent to follow precisely during strategic planning.
+- **Adaptive Learning** - Behavioral adaptation based on success patterns.
+- **Code Intelligence** - Deep semantic code analysis and understanding.
+- **Enhanced MCP Integration** - Comprehensive marketplace and tool ecosystem.
+- **Vector Search Engine** - Semantic code search and contextual RAG recommendations.
+- **Advanced Error Recovery** - Autonomous multi-layered error diagnosis and self-healing.
+- **Live Preview Environment** - Agent can instantly render and interact with frontend code (React/Vite).
+- **Rich Media & Tech Graphics** - Native support for AI-generated architecture `mermaid` diagrams and UI mockups.
+- **Visible Thinking Process** - Watch the agent's reasoning live via a transparent, animated Glassmorphism UI.
 ### 🛠️ Comprehensive Tool Suite
-- **File Operations**: Read, write, edit, delete files with exact indentation matching
-- **Code Analysis**: Semantic search, dependency analysis, TypeScript validation
-- **Search & Discovery**: Pattern search, fuzzy file finding, grep-style search
-- **Terminal Integration**: Run commands with approval system
-- **Refactoring Tools**: Semantic rename, smart file relocation, multi-file edits
-- **Project Management**: Test execution, validation, blast radius analysis
+- **File Operations**: Read, write, edit, delete files with exact indentation matching.
+- **Code Analysis**: Semantic search, dependency analysis, TypeScript validation.
+- **Web Browsing**: `search_web` and `read_url_content` for live API research.
+- **Rich Media**: `generate_image` for UI prototyping and native `MermaidDiagram` support.
+- **Terminal Integration**: Run background processes and compilation checks.
+- **Project Management**: Built-in "Feature Specs" tab for interactive AI-driven product management and checklist tracking.
 
 ### 🎨 Professional IDE Experience
 - **VS Code-inspired UI** - Familiar dark theme interface with activity bar
@@ -36,17 +33,12 @@ WhizCode is a modern, autonomous AI coding assistant with a VS Code-inspired int
 - **Search Panel** - Project-wide search with results preview
 
 ### 🔧 Advanced Capabilities
-- **Strategic Planning System** - Intelligent task decomposition with parallel execution
-- **Context Memory & Learning** - Persistent memory of patterns, preferences, and strategies
-- **Code Intelligence Engine** - Deep semantic analysis with refactoring suggestions
-- **Adaptive Behavior** - AI learns from interactions and adapts approach
-- **Error Recovery System** - Multi-layered fallback strategies for robust execution
-- **Context Awareness** - Automatic diagnostics and git diff inclusion
-- **Autopilot/Supervised Modes** - User control over file operation autonomy
-- **Sub-Agent System** - Specialized agents for different tasks
-- **Hooks System** - Event-driven automation and workflows
-- **Steering Files** - Custom instructions and coding guidelines
-- **File Synchronization** - Real-time sync between explorer and editor
+- **Multi-Persona Planning System** - Orchestrates tasks via specialized phases instead of single monolithic LLM requests.
+- **Context Memory & 'Brain Health'** - A dedicated dashboard to monitor vector indexing, distilled interactions, and self-healing recovery rates.
+- **Code Intelligence Engine** - Deep semantic analysis with refactoring suggestions.
+- **Feature Specs Dashboard** - Break down large requests into tracked, AI-managed task lists.
+- **Autopilot/Supervised Modes** - User control over file operation autonomy.
+- **Custom Workflow Protocol** - Agent dynamically discovers custom company standard workflows located in your workspace.
 
 ## 🚀 Quick Start
 
@@ -110,18 +102,18 @@ WhizCode is a modern, autonomous AI coding assistant with a VS Code-inspired int
 
 ## 🏗️ Architecture
 
-### Single Model System
-WhizCode uses a unified approach with one model handling all tasks:
+## 🏗️ Architecture
 
-**Unified Model (Brain + Hands 🧠🛠️)**
-- Analyzes requests and makes decisions
-- Plans approach and strategy
-- Generates code and executes tools
-- Handles precise syntax and formatting
-- Understands context and requirements
-- Best: Versatile models (qwen2.5-coder, deepseek-coder, gpt-4o, claude-3.5-sonnet)
+### Multi-Agent Orchestration
+WhizCode has evolved past monolithic LLM execution. It now uses a phased orchestration pipeline:
 
-This simplified approach reduces complexity while maintaining high performance.
+**The Orchestrator Loop (🧠 + 🛠️)**
+- **Strategic Planner**: Analyzes requests and outputs a rigid JSON execution plan.
+- **Researcher**: Investigates unknown APIs via Web Search and checks internal Context Memory.
+- **Executor**: Generates code, edits files, and interacts with the terminal.
+- **Reviewer**: Audits changes for compilation errors and logic bugs before proceeding.
+
+This multi-stage approach drastically reduces hallucinations and improves code reliability.
 
 ### Core Components
 
@@ -129,49 +121,38 @@ This simplified approach reduces complexity while maintaining high performance.
 ┌─────────────────────────────────────────┐
 │              React Frontend             │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-│  │Explorer │ │ Editor  │ │  Chat   │   │
-│  │AI Insights│        │         │   │
-│  └─────────┘ └─────────┘ └─────────┘   │
-└─────────────────┬───────────────────────┘
-                  │ Tauri API
-┌─────────────────▼───────────────────────┐
-│           Tauri Backend (Rust)          │
-│  ┌─────────────────────────────────┐   │
-│  │    Enhanced Agent Loop          │   │
-│  │  ┌──────────┐ ┌──────────────┐ │   │
-│  │  │ Primary  │ │ Tool Model   │ │   │
-│  │  │  Model   │ │   (Coding)   │ │   │
-│  │  └──────────┘ └──────────────┘ │   │
-│  │  ┌──────────┐ ┌──────────────┐ │   │
-│  │  │Strategic │ │ Context      │ │   │
-│  │  │Planner   │ │ Memory       │ │   │
-│  │  └──────────┘ └──────────────┘ │   │
-│  │  ┌──────────┐ ┌──────────────┐ │   │
-│  │  │Learning  │ │ Code         │ │   │
-│  │  │System    │ │ Intelligence │ │   │
-│  │  └──────────┘ └──────────────┘ │   │
-│  └─────────────────────────────────┘   │
-│  ┌─────────────────────────────────┐   │
-│  │           Services              │   │
-│  │ • File Operations               │   │
-│  │ • Code Analysis                 │   │
-│  │ • Terminal Integration          │   │
-│  │ • Sub-Agent System              │   │
-│  └─────────────────────────────────┘   │
-└─────────────────────────────────────────┘
+│  │Explorer │ │ Editor  │ │Live Prev│   │
+│  │Brain/Spec│ └───┬─────┘ └───────┬─┘   │
+│  └─────────┘     │               │     │
+└──────────────────┼───────────────┼─────┘
+                   │    Tauri API  │
+┌──────────────────▼───────────────▼────┐
+│           Tauri Backend (Rust)        │
+│  ┌─────────────────────────────────┐  │
+│  │    Multi-Persona Agent Loop     │  │
+│  │  ┌──────────┐ ┌──────────────┐  │  │
+│  │  │ Planner  │ │  Researcher  │  │  │
+│  │  └──────────┘ └──────────────┘  │  │
+│  │  ┌──────────┐ ┌──────────────┐  │  │
+│  │  │ Executor │ │   Reviewer   │  │  │
+│  │  └──────────┘ └──────────────┘  │  │
+│  └─────────────────────────────────┘  │
+│  ┌─────────────────────────────────┐  │
+│  │           Core Services         │  │
+│  │ • RAG / Vector DB               │  │
+│  │ • Distillation (Brain)          │  │
+│  │ • Workflows / Skills Engine     │  │
+│  │ • Image / Media Generation      │  │
+│  └─────────────────────────────────┘  │
+└───────────────────────────────────────┘
 ```
 
 ### Key Services
-- **Strategic Planner**: Intelligent task decomposition with parallel execution optimization
-- **Context Memory**: Persistent learning from interactions, patterns, and user preferences  
-- **Learning System**: Adaptive behavior based on success patterns and error recovery
-- **Code Intelligence**: Deep semantic analysis with refactoring suggestions and metrics
-- **IndexingService**: Semantic code search with vector embeddings
-- **CodeGraphService**: Dependency analysis with Tree-sitter
-- **DiffService**: Transactional multi-file changes with rollback
-- **HooksSystem**: Event-driven automation and workflows
-- **SteeringSystem**: Custom instructions and guidelines
-- **SubAgentSystem**: Specialized agents for different tasks
+- **Knowledge Distillation**: Persistent extraction of structural context between conversation resets.
+- **Error Recovery System**: Multi-layered fallback strategies for compiler-level healing.
+- **Code Intelligence**: AST analysis and cross-file refactoring tracking.
+- **IndexingService**: Semantic code search using local `.whizcode` vector embeddings.
+- **Feature Specs Dashboard**: UI-driven tracking of agent-generated implementation checklists.
 
 ## 🎛️ Configuration Options
 
@@ -210,15 +191,21 @@ Model: anthropic.claude-3-5-sonnet-20241022-v2:0 (AWS Bedrock)
 
 ## 🔧 Advanced Features
 
-### AI Insights Panel
-Access advanced AI capabilities through the new AI Insights panel in the activity bar:
+### Brain Health Dashboard
+Access cognitive diagnostics through the Brain Health panel in the activity bar:
 
-- **Learning Insights**: View patterns, preferences, strategies, and error analysis
-- **Learning Metrics**: Track success rates, response times, and improvement trends  
-- **Code Quality**: Monitor complexity, maintainability, coupling, and technical debt
-- **Memory Statistics**: See accumulated knowledge including patterns and strategies
+- **Context Memory & RAG Stats**: View exactly how many code patterns and chunks are indexed.
+- **Hero Recovery**: Track the AI's success rate at autonomously fixing compiler/logic errors.
+- **Knowledge Distillation**: Monitor overarching project rules the AI has extracted into `.whizcode/knowledge`.
 
-The AI continuously learns from your interactions and adapts its behavior for better performance over time.
+### Feature Specs Panel
+Turn abstract ideas into structured development plans:
+- Request the AI to "Create a spec for feature X".
+- WhizCode generates a full markdown specification and breaks it down into an interactive checkbox task list.
+- The agent sequentially executes tasks from the checklist, reporting back progress.
+
+### Live Preview Environment
+Web preview integrations allow WhizCode to build React/Vite applications and instantly verify the visual output side-by-side with the editor.
 
 ### Context Menu Operations
 Right-click in the file explorer for:
@@ -271,9 +258,7 @@ WhizCode/
 │   └── tauri.conf.json    # Tauri config
 ├── docs/                  # Documentation
 │   ├── SECURITY.md        # Security implementation
-│   ├── BUILD_OPTIMIZATION.md
-│   ├── DISTRIBUTION_GUIDE.md
-│   └── FINAL_SIZE_REPORT.md
+│   └── LICENSE_GUIDE.md   # License details
 ├── public/                # Static assets
 └── package.json           # Dependencies & scripts
 ```
@@ -315,15 +300,7 @@ WhizCode includes comprehensive security measures:
 
 See [docs/SECURITY.md](docs/SECURITY.md) for detailed security implementation.
 
-## 📦 Build Optimization
-
-WhizCode is optimized for minimal size and maximum performance:
-- **Code Splitting** - Large libraries split into separate chunks
-- **Terser Minification** - Aggressive minification with console removal
-- **Whitelist-Only Dependencies** - Only runtime dependencies included
-- **Maximum Compression** - NSIS uses best compression algorithm
-
-See [docs/BUILD_OPTIMIZATION.md](docs/BUILD_OPTIMIZATION.md) for optimization details.
+WhizCode is optimized for minimal size and maximum performance through Tauri's native backend and Vite's efficient bundling.
 
 ## 📄 License
 
@@ -379,14 +356,12 @@ ollama pull <model-name>
 - Click "Stop" and rephrase request if stuck
 
 ### Build Issues
-- Clear `dist/` and `dist-electron/` directories
+- Clear `dist/` directory
 - Run `npm install` to ensure dependencies are installed
-- Check Node.js version compatibility
+- Check Node.js and Rust version compatibility
 
 ### Installer Issues
-- Verify all 5 parts are present (if using split installer)
-- Check file sizes match original split
-- Try manual rejoin with Command Prompt
+- Ensure you have the necessary Tauri build dependencies installed for your platform.
 
 ### Performance Optimization
 

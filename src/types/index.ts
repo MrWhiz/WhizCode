@@ -8,6 +8,7 @@ export interface AgentStep {
     logs?: string[];
     data?: any;
     requestId?: string;
+    persona?: 'planner' | 'researcher' | 'executor' | 'reviewer' | string;
     planPhase?: 'planning' | 'execution' | 'summary';
 }
 

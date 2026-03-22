@@ -1,11 +1,11 @@
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
-use crate::error::Result;
+use crate::error::{Result, ApiError};
 use crate::utils;
 
 #[derive(Serialize, Deserialize)]
@@ -15,6 +15,11 @@ pub struct FileEntry {
     pub path: String,
     pub isDirectory: bool,
     pub size: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+struct FileChangedPayload {
+    path: String,
 }
 
 #[tauri::command]
@@ -40,13 +45,14 @@ pub async fn read_file(
     
     tokio::fs::read_to_string(&resolved)
         .await
-        .map_err(|e| e.into())
+        .map_err(ApiError::from)
 }
 
 #[tauri::command]
 pub async fn write_file(
     path: String,
     content: String,
+    handle: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<()> {
     let workspace = {
@@ -63,7 +69,12 @@ pub async fn write_file(
     
     tokio::fs::write(&resolved, content)
         .await
-        .map_err(|e| e.into())
+        .map_err(ApiError::from)?;
+
+    // Emit event to trigger UI refresh
+    handle.emit("file:changed", FileChangedPayload { path: path.clone() }).map_err(|e| e.to_string())?;
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -85,7 +96,7 @@ pub async fn read_directory(
     
     let mut entries = Vec::new();
     let mut dir = tokio::fs::read_dir(&resolved).await
-        .map_err(|e| format!("Failed to read directory {}: {}", resolved.display(), e))?;
+        .map_err(|e| ApiError::from(e))?;
     
     while let Some(entry) = dir.next_entry().await? {
         let metadata = entry.metadata().await?;
@@ -133,7 +144,7 @@ pub async fn read_directory_recursive(
             continue;
         }
         
-        let metadata = entry.metadata().map_err(|e| format!("Failed to get metadata: {}", e))?;
+        let metadata = entry.metadata().map_err(|e| ApiError::from(e))?;
         entries.push(FileEntry {
             name: entry.file_name().to_string_lossy().to_string(),
             path: entry.path().to_string_lossy().to_string(),
@@ -148,6 +159,7 @@ pub async fn read_directory_recursive(
 #[tauri::command]
 pub async fn create_file(
     path: String,
+    handle: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<()> {
     let workspace = {
@@ -164,12 +176,16 @@ pub async fn create_file(
     
     tokio::fs::write(&resolved, "")
         .await
-        .map_err(|e| e.into())
+        .map_err(ApiError::from)?;
+
+    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn create_directory(
     path: String,
+    handle: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<()> {
     let workspace = {
@@ -186,12 +202,16 @@ pub async fn create_directory(
     
     tokio::fs::create_dir_all(&resolved)
         .await
-        .map_err(|e| e.into())
+        .map_err(ApiError::from)?;
+
+    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_file(
     path: String,
+    handle: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<()> {
     let workspace = {
@@ -206,14 +226,40 @@ pub async fn delete_file(
     let workspace_path = PathBuf::from(&workspace);
     let resolved = utils::validate_path_in_workspace(&file_path, &workspace_path)?;
     
-    tokio::fs::remove_file(&resolved)
-        .await
-        .map_err(|e| e.into())
+    #[cfg(target_os = "windows")]
+    {
+        let mut retries = 0;
+        let max_retries = 3;
+        loop {
+            match tokio::fs::remove_file(&resolved).await {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) => {
+                    if retries >= max_retries {
+                        return Err(ApiError::from(e));
+                    }
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(ApiError::from(e)),
+            }
+        }
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio::fs::remove_file(&resolved)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    
+    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_directory(
     path: String,
+    handle: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<()> {
     let workspace = {
@@ -228,15 +274,41 @@ pub async fn delete_directory(
     let workspace_path = PathBuf::from(&workspace);
     let resolved = utils::validate_path_in_workspace(&dir_path, &workspace_path)?;
     
-    tokio::fs::remove_dir_all(&resolved)
-        .await
-        .map_err(|e| e.into())
+    #[cfg(target_os = "windows")]
+    {
+        let mut retries = 0;
+        let max_retries = 10;
+        loop {
+            match tokio::fs::remove_dir_all(&resolved).await {
+                Ok(_) => break,
+                Err(e) if e.to_string().contains("used by another process") || e.to_string().contains("Access is denied") || e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) => {
+                    if retries >= max_retries {
+                        return Err(ApiError::from(e));
+                    }
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(ApiError::from(e)),
+            }
+        }
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio::fs::remove_dir_all(&resolved)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    
+    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn rename_file(
     old_path: String,
     new_path: String,
+    handle: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
 ) -> Result<()> {
     let workspace = {
@@ -254,9 +326,35 @@ pub async fn rename_file(
     let resolved_old = utils::validate_path_in_workspace(&old, &workspace_path)?;
     let resolved_new = utils::validate_path_in_workspace(&new, &workspace_path)?;
     
-    tokio::fs::rename(&resolved_old, &resolved_new)
-        .await
-        .map_err(|e| e.into())
+    #[cfg(target_os = "windows")]
+    {
+        let mut retries = 0;
+        let max_retries = 3;
+        loop {
+            match tokio::fs::rename(&resolved_old, &resolved_new).await {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) => {
+                    if retries >= max_retries {
+                        return Err(ApiError::from(e));
+                    }
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(ApiError::from(e)),
+            }
+        }
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio::fs::rename(&resolved_old, &resolved_new)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    
+    handle.emit("file:changed", FileChangedPayload { path: old_path }).map_err(|e| e.to_string())?;
+    handle.emit("file:changed", FileChangedPayload { path: new_path }).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]

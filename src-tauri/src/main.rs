@@ -33,6 +33,7 @@ fn main() {
         .manage(Arc::new(std::sync::Mutex::new(commands::memory::MemoryService::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::planner::WhizCodePlanner::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::hooks::HooksManager::new())))
+        .manage(Arc::new(std::sync::Mutex::new(commands::code_intelligence::CodeIntelligence::new())))
         .invoke_handler(tauri::generate_handler![
             // File operations
             commands::fs::read_file,
@@ -128,6 +129,8 @@ fn main() {
             // System operations
             commands::system::get_system_info,
             commands::system::open_external,
+            commands::system::reveal_in_folder,
+            commands::system::open_terminal_at,
             
             // Workspace operations
             commands::workspace::set_workspace,
@@ -161,9 +164,17 @@ fn main() {
             commands::ai::ai_get_learning_metrics,
             commands::ai::ai_get_code_metrics,
             commands::ai::ai_get_context_memory_stats,
+            commands::distillation::distill_session,
+            commands::assets::generate_image,
+            commands::workflows::list_workflows,
+            commands::workflows::list_skills,
+            
+            // Web Search operations
+            commands::web_search::search_web,
+            commands::web_search::read_url_content,
             
             // Vector operations
-            commands::vector::vector_get_index_stats,
+            commands::vector_search::vector_get_index_stats,
             
             // Specs operations
             commands::specs::specs_list,

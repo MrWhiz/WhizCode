@@ -738,66 +738,97 @@ body {
 .agent-steps {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 8px;
+  gap: 3px;
+  margin-top: 6px;
 }
 
 .agent-step {
-  margin-top: 8px;
-  border-radius: var(--radius-md);
-  background: rgba(0, 0, 0, 0.2) !important;
-  border: 1px solid var(--border-color) !important;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025) !important;
+  border: 1px solid rgba(255, 255, 255, 0.06) !important;
   overflow: hidden;
+  transition: border-color 0.15s;
+}
+
+.agent-step.running {
+  border-color: rgba(59, 130, 246, 0.35) !important;
+  background: rgba(59, 130, 246, 0.04) !important;
+}
+
+.agent-step.done {
+  background: rgba(255, 255, 255, 0.018) !important;
+}
+
+.agent-step.failed {
+  border-color: rgba(248, 81, 73, 0.35) !important;
+  background: rgba(248, 81, 73, 0.04) !important;
+}
+
+.agent-step.pending {
+  opacity: 0.5;
 }
 
 .agent-step-header {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
+  padding: 6px 10px;
 }
 
 .agent-step-icon {
-  font-size: 14px;
+  font-size: 12px;
+  flex-shrink: 0;
+  opacity: 0.8;
 }
 
 .agent-step-summary {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  font-family: 'Consolas', 'Courier New', monospace;
+  letter-spacing: 0;
+}
+
+.agent-step.done .agent-step-summary {
+  color: var(--text-secondary);
+  font-weight: 400;
 }
 
 .agent-step-check {
-  color: var(--accent-primary);
-  font-size: 12px;
+  color: #3fb950;
+  font-size: 11px;
+  flex-shrink: 0;
 }
 
 .agent-step.running .agent-step-header {
   color: var(--accent-primary);
 }
 
-.agent-step.done .agent-step-header {
-  color: var(--text-secondary);
-}
-
 .agent-step-logs {
   font-size: 11px;
   color: var(--text-secondary);
   font-family: 'Consolas', 'Courier New', monospace;
-  background-color: var(--bg-tertiary);
-  padding: 8px;
-  border-radius: 4px;
-  max-height: 150px;
+  background-color: rgba(0,0,0,0.25);
+  padding: 8px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  max-height: 200px;
   overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .log-line {
   display: block;
   margin-bottom: 2px;
+  line-height: 1.5;
 }
 
 .agent-step-details {
-  margin-top: 8px;
+  padding: 0 10px 8px;
 }
 
 .details-toggle {

@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { git } from '../../lib/tauri-api'
 
 interface GitStatus {
     branch: string
@@ -23,44 +24,26 @@ export const SourceControlPanel = ({ workspacePath }: SourceControlPanelProps) =
     const refreshStatus = async () => {
         if (!workspacePath) return
         setIsLoading(true)
-        const ipc = (window as any).ipcRenderer
-        if (ipc) {
-            try {
-                const status = await ipc.invoke('git:status', workspacePath)
-                setGitStatus(status)
-            } catch (err) {
-                console.error('Git status error:', err)
-                setGitStatus(null)
-            }
+        try {
+            const status = await git.getStatus(workspacePath)
+            setGitStatus(status)
+        } catch (err) {
+            console.error('Git status error:', err)
+            setGitStatus(null)
         }
         setIsLoading(false)
     }
 
     const handleCommit = async () => {
         if (!commitMessage.trim() || !workspacePath) return
-        const ipc = (window as any).ipcRenderer
-        if (ipc) {
-            try {
-                await ipc.invoke('git:commit', { path: workspacePath, message: commitMessage })
-                setCommitMessage('')
-                refreshStatus()
-            } catch (err) {
-                console.error('Git commit error:', err)
-            }
-        }
+        // TODO: wire up git:commit Tauri command when available
+        console.warn('git commit not yet implemented via Tauri API')
     }
 
     const handleStage = async (file: string) => {
         if (!workspacePath) return
-        const ipc = (window as any).ipcRenderer
-        if (ipc) {
-            try {
-                await ipc.invoke('git:stage', { path: workspacePath, file })
-                refreshStatus()
-            } catch (err) {
-                console.error('Git stage error:', err)
-            }
-        }
+        // TODO: wire up git:stage Tauri command when available
+        console.warn('git stage not yet implemented via Tauri API', file)
     }
 
     const getStatusIcon = (status: string) => {

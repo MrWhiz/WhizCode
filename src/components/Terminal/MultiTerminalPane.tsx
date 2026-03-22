@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { TerminalPane } from './TerminalPane'
 import type { TerminalType } from '../../types'
+import { terminal as terminalApi } from '../../lib/tauri-api'
 
 interface Terminal {
   id: string
@@ -25,20 +26,14 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
   const menuRef = useRef<HTMLDivElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
 
-  const ipc = (window as any).ipcRenderer
-
   // Initialize with default terminal
   useEffect(() => {
     if (isOpen && terminals.length === 0) {
-      if (ipc) {
-        ipc.invoke('terminal:getDefaultShell').then((defaultShell: TerminalType) => {
-          createNewTerminal(defaultShell);
-        }).catch(() => {
-          createNewTerminal('bash');
-        });
-      } else {
+      terminalApi.getDefaultShell().then((defaultShell) => {
+        createNewTerminal(defaultShell as TerminalType);
+      }).catch(() => {
         createNewTerminal('bash');
-      }
+      });
     }
   }, [isOpen])
 
@@ -81,17 +76,17 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
     setShowShellMenu(false)
 
     // Notify backend
-    if (ipc) {
-      ipc.send('terminal:create', { id, type })
-    }
+    terminalApi.createTerminal(type, undefined).catch((err: unknown) => {
+        console.error('Failed to create terminal:', err);
+    });
   }
 
   const closeTerminal = (id: string, e: React.MouseEvent) => {
     e.stopPropagation()
 
-    if (ipc) {
-      ipc.send('terminal:close', id)
-    }
+    terminalApi.closeTerminal(id).catch((err: unknown) => {
+        console.error('Failed to close terminal:', err);
+    });
 
     setTerminals(prev => prev.filter(t => t.id !== id))
 

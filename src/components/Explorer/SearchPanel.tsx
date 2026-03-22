@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { search } from '../../lib/tauri-api'
 
 interface SearchPanelProps {
     workspacePath: string | null
@@ -16,20 +17,12 @@ export const SearchPanel = ({ workspacePath, onFileOpen }: SearchPanelProps) => 
         if (!searchQuery.trim() || !workspacePath) return
         
         setIsSearching(true)
-        const ipc = (window as any).ipcRenderer
-        if (ipc) {
-            try {
-                const results = await ipc.invoke('search:files', {
-                    path: workspacePath,
-                    query: searchQuery,
-                    include: includePattern,
-                    exclude: excludePattern
-                })
-                setSearchResults(results || [])
-            } catch (err) {
-                console.error('Search error:', err)
-                setSearchResults([])
-            }
+        try {
+            const results = await search.searchFiles(searchQuery, includePattern || undefined)
+            setSearchResults(results || [])
+        } catch (err) {
+            console.error('Search error:', err)
+            setSearchResults([])
         }
         setIsSearching(false)
     }

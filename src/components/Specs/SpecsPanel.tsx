@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { specs } from '../../lib/tauri-api';
 
 interface SpecSummary {
   name: string;
@@ -26,7 +27,7 @@ interface SpecDetail {
 }
 
 export const SpecsPanel: React.FC = () => {
-  const [specs, setSpecs] = useState<SpecSummary[]>([]);
+  const [specsList, setSpecsList] = useState<SpecSummary[]>([]);
   const [selectedSpec, setSelectedSpec] = useState<SpecDetail | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -37,8 +38,8 @@ export const SpecsPanel: React.FC = () => {
   const loadSpecs = async () => {
     setIsLoading(true);
     try {
-      const result = await (window as any).electron.invoke('specs:list');
-      setSpecs(result);
+      const result = await specs.list();
+      setSpecsList(result);
     } catch (err) {
       console.error('Failed to load specs:', err);
     } finally {
@@ -49,7 +50,7 @@ export const SpecsPanel: React.FC = () => {
   const loadSpecDetail = async (slug: string) => {
     setIsLoading(true);
     try {
-      const result = await (window as any).electron.invoke('specs:get', slug);
+      const result = await specs.get(slug);
       setSelectedSpec(result);
     } catch (err) {
       console.error('Failed to load spec detail:', err);
@@ -114,13 +115,13 @@ export const SpecsPanel: React.FC = () => {
 
       <div className="specs-list">
         {isLoading && <div className="loading">Loading specs...</div>}
-        {!isLoading && specs.length === 0 && (
+        {!isLoading && specsList.length === 0 && (
           <div className="empty-state">
             <p>No specs found.</p>
             <p className="hint">Ask the AI to "create a spec for..."</p>
           </div>
         )}
-        {specs.map((spec) => (
+        {specsList.map((spec) => (
           <div 
             key={spec.slug} 
             className="spec-card"

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { ai, vector, errorRecovery, system } from '../../lib/tauri-api';
 
 interface BrainMetric {
   label: string;
@@ -27,19 +28,16 @@ export const BrainDashboard: React.FC = () => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const ipc = (window as any).ipcRenderer;
-      if (!ipc) return;
-
       const [
         memoryStats,
         vectorStats,
         errorStats,
         learningMetrics
       ] = await Promise.all([
-        ipc.invoke('ai:get-context-memory-stats'),
-        ipc.invoke('vector:get-index-stats'),
-        ipc.invoke('error-recovery:get-statistics'),
-        ipc.invoke('ai:get-learning-metrics')
+        ai.getContextMemoryStats(),
+        vector.getIndexStats(),
+        errorRecovery.getStatistics(),
+        ai.getLearningMetrics()
       ]);
 
       // Synthesize health data

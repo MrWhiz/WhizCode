@@ -5,6 +5,16 @@ import { WhizLogo } from '../Branding/WhizLogo'
 import { MarkdownRenderer } from './MarkdownRenderer'
 import { diagnostics as diagnosticsApi } from '../../lib/tauri-api'
 
+// Reusable debounce utility
+function useDebounce<T>(value: T, delayMs: number): T {
+    const [debounced, setDebounced] = useState<T>(value);
+    useEffect(() => {
+        const t = setTimeout(() => setDebounced(value), delayMs);
+        return () => clearTimeout(t);
+    }, [value, delayMs]);
+    return debounced;
+}
+
 interface EditorAreaProps {
     openFiles: OpenFileProps[];
     activeFileId: string | null;
@@ -72,6 +82,10 @@ export const EditorArea = ({
         }
     }, [activeFile?.content, activeFileId]);
 
+    // Debounce content so diagnostics don't fire on every single keystroke.
+    // 500ms is a comfortable pause that feels instant but won't flood the IPC bridge.
+    const debouncedContent = useDebounce(activeFile?.content, 500);
+
     // Fetch diagnostics for the active file
     useEffect(() => {
         const fetchDiagnostics = async () => {
@@ -81,21 +95,27 @@ export const EditorArea = ({
             }
             
             try {
-                // Add timeout to prevent hanging
+                const diagnosticsPromise = diagnosticsApi.check(activeFileId, debouncedContent || '', getLanguage(activeFile?.name || ''))
+                    .catch(error => {
+                        if (error?.type === 'cancelation' || 
+                            error?.msg?.includes('canceled') || 
+                            error?.message?.includes('canceled')) {
+                            return [];
+                        }
+                        throw error;
+                    });
+
                 const timeoutPromise = new Promise<any[]>((_, reject) => 
                     setTimeout(() => reject(new Error('Diagnostics check timeout')), 3000)
                 );
                 
-                const diags = await Promise.race([
-                    diagnosticsApi.check(activeFileId, activeFile?.content || '', getLanguage(activeFile?.name || '')),
-                    timeoutPromise
-                ]);
-                
-                const diagnosticsArray = Array.isArray(diags) ? diags : [];
-                setDiagnostics(diagnosticsArray);
+                const diags = await Promise.race([diagnosticsPromise, timeoutPromise]);
+                setDiagnostics(Array.isArray(diags) ? diags : []);
             } catch (error: any) {
-                // Ignore cancelation errors (often from Monaco or Tauri during quick switches)
-                if (error?.type === 'cancelation' || error?.msg?.includes('canceled')) {
+                if (error?.type === 'cancelation' || 
+                    error?.msg?.includes('canceled') || 
+                    error?.message?.includes('canceled') ||
+                    error?.message === 'Diagnostics check timeout') {
                     return;
                 }
                 console.error('Error fetching diagnostics:', error);
@@ -104,7 +124,8 @@ export const EditorArea = ({
         };
 
         fetchDiagnostics();
-    }, [activeFileId, workspacePath, activeFile?.content]);
+        // Use debouncedContent instead of activeFile?.content to avoid firing on every keystroke
+    }, [activeFileId, workspacePath, debouncedContent]);
 
     // Update error markers when diagnostics change
     useEffect(() => {
@@ -187,28 +208,31 @@ export const EditorArea = ({
             }
         });
 
-        // Listen for all marker changes to update explorer count for ALL models
-        const markerListener = monaco.editor.onDidChangeMarkers((uris: readonly any[]) => {
+        // Debounce validation callbacks to avoid flooding message queue when many
+        // markers change rapidly (e.g. Monaco's own internal type-checking passes).
+        let markerDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+        let pendingUris: any[] = [];
+
+        const flushMarkerUpdates = () => {
+            const urisBatch = pendingUris.splice(0);
             const processedPaths = new Set<string>();
-            uris.forEach((uri: any) => {
+            urisBatch.forEach((uri: any) => {
                 const markers = monaco.editor.getModelMarkers({ resource: uri });
                 const errorCount = markers.filter((m: any) => m.severity === monaco.MarkerSeverity.Error).length;
-                
-                // Get path and strip leading slash for Windows
                 let rawPath = uri.fsPath || uri.path || '';
-                if (rawPath.startsWith('/') && rawPath.includes(':')) {
-                    rawPath = rawPath.substring(1);
-                }
-                
-                // Only report each unique path once in this batch
+                if (rawPath.startsWith('/') && rawPath.includes(':')) rawPath = rawPath.substring(1);
                 const normPath = rawPath.replace(/\\/g, '/').toLowerCase();
                 if (!processedPaths.has(normPath)) {
                     processedPaths.add(normPath);
-                    if (onValidation) {
-                        onValidation(rawPath, errorCount);
-                    }
+                    if (onValidation) onValidation(rawPath, errorCount);
                 }
             });
+        };
+
+        const markerListener = monaco.editor.onDidChangeMarkers((uris: readonly any[]) => {
+            pendingUris.push(...uris);
+            if (markerDebounceTimer) clearTimeout(markerDebounceTimer);
+            markerDebounceTimer = setTimeout(flushMarkerUpdates, 300);
         });
 
         // Register the command (globally)
@@ -220,6 +244,7 @@ export const EditorArea = ({
         });
 
         return () => {
+            if (markerDebounceTimer) clearTimeout(markerDebounceTimer);
             provider.dispose();
             markerListener.dispose();
             if (command && typeof command.dispose === 'function') {

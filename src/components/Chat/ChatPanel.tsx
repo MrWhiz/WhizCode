@@ -524,9 +524,10 @@ export const ChatPanel = ({
     const [countdown, setCountdown] = React.useState<number | null>(null);
     const [currentPhase, setCurrentPhase] = React.useState<string>('analyzing');
     const [phaseStartTime, setPhaseStartTime] = React.useState<number>(Date.now());
+    const [elapsedSeconds, setElapsedSeconds] = React.useState<number>(0);
 
     React.useEffect(() => {
-        const unlistenPhase = window.__TAURI_INVOKE__?.('listen', {
+        const unlistenPhase = (window as any).__TAURI_INVOKE__?.('listen', {
             event: 'agent:phase',
             handler: (event: any) => {
                 const phase = event.payload?.phase || 'analyzing';
@@ -552,14 +553,19 @@ export const ChatPanel = ({
         }
     }, [isLoading]);
 
-    // Update elapsed time every second
+    // Update elapsed time every second — use a real counter instead of a
+    // no-op setState trick which forces unnecessary re-renders.
     React.useEffect(() => {
-        if (!isLoading) return;
+        if (!isLoading) {
+            setElapsedSeconds(0);
+            return;
+        }
+        setElapsedSeconds(0);
         const timer = setInterval(() => {
-            setPhaseStartTime(prev => prev); // Trigger re-render
+            setElapsedSeconds(s => s + 1);
         }, 1000);
         return () => clearInterval(timer);
-    }, [isLoading]);
+    }, [isLoading, phaseStartTime]);
 
     const onPermissionClick = (approved: boolean, idx: number) => {
         setRespondedSteps(prev => ({ ...prev, [idx]: true }));
@@ -755,7 +761,7 @@ export const ChatPanel = ({
                                         </span>
                                     </div>
                                     <span style={{ fontSize: '10px', color: 'var(--text-secondary)', marginLeft: '8px', whiteSpace: 'nowrap' }}>
-                                        {Math.round((Date.now() - phaseStartTime) / 1000)}s
+                                        {elapsedSeconds}s
                                     </span>
                             </div>
                         </div>

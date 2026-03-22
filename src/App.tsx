@@ -64,6 +64,8 @@ function App() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const [activeMenu, setActiveMenu] = useState<string | null>(null)
+  // FIX #9: ask_user mid-task clarification dialog
+  const [askUserPrompt, setAskUserPrompt] = useState<{ question: string; requestId: string } | null>(null)
 
   // Auto-scroll to bottom only if user was already near bottom
   useEffect(() => {
@@ -119,11 +121,12 @@ function App() {
               return [...prev, step]
             }
 
-            // Fallback: match on tool + iteration regardless of status direction
-            // This handles: running → done, running → failed, done → done, etc.
+            // Fallback: match on tool + iteration + summary
+            // This correctly handles parallel tools (e.g. 2 'read_file's in iteration 1 with different arguments)
             const existingIdx = prev.findIndex(s =>
               s.tool === step.tool &&
-              s.iteration === step.iteration
+              s.iteration === step.iteration &&
+              s.summary === step.summary
             )
 
             if (existingIdx >= 0) {
@@ -171,10 +174,17 @@ function App() {
 
     setupListeners()
 
+    // FIX #9: listen for ask_user clarification events
+    let unlistenAskUser: (() => void) | null = null
+    agent.events.onAgentAskUser((data) => {
+      setAskUserPrompt(data)
+    }).then(fn => { unlistenAskUser = fn }).catch(() => {})
+
     return () => {
       if (unlistenStep) unlistenStep()
       if (unlistenStream) unlistenStream()
       if (unlistenError) unlistenError()
+      if (unlistenAskUser) unlistenAskUser()
     }
   }, [])
 
@@ -677,20 +687,30 @@ function App() {
     const normWorkspacePath = normalizePath(workspacePath);
 
     try {
+      // Handle diagnostics promise independently to avoid unhandled rejection on timeout
+      const diagnosticsPromise = diagnostics.check(normFilePath, content, getLanguage(filePath))
+        .catch(error => {
+          if (error?.type === 'cancelation' || error?.msg?.includes('canceled') || error?.message?.includes('canceled')) {
+            return []
+          }
+          throw error
+        })
+
       // Add timeout to prevent hanging
       const timeoutPromise = new Promise<any[]>((_, reject) =>
         setTimeout(() => reject(new Error('Diagnostics timeout')), 3000)
       );
 
       const result = await Promise.race([
-        diagnostics.check(normFilePath, normWorkspacePath, content),
+        diagnosticsPromise,
         timeoutPromise
       ]);
 
       const count = Array.isArray(result) ? result.length : 0;
-      console.log(`[APP] File ${normFilePath.split('/').pop()} has ${count} errors`);
+      console.log(`[APP] File ${filePath.split(/[/\\]/).pop()} has ${count} errors`);
       return count;
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.message === 'Diagnostics timeout') return 0
       console.error('Error checking file diagnostics:', error)
       return 0
     }
@@ -739,14 +759,22 @@ function App() {
 
       const activeFile = openFiles.find(f => f.path === activeFileId)
       console.log('[AGENT] Executing loop with workspacePath:', workspacePath)
+
+      // FIX #1: pass conversation history so the LLM has multi-turn memory
+      // Filter out the streaming placeholder and the initial greeting
+      const conversationHistory = messages
+        .filter(m => !(m as any).__id && m.content !== 'Hello! I\'m your WhizCode agent. Open a folder to get started.')
+        .slice(-20) // cap at 20 turns to avoid bloating the prompt
+
       const result = await agent.executeLoopStreaming({
         task: userMsg.content,
         model: {
           provider: modelProvider,
           model: model,
         },
-        workspace_path: workspacePath,
+        workspacePath: workspacePath,
         activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
+        conversationHistory,
       })
       const response = result?.response || 'No response'
       const steps = result?.steps || []
@@ -819,9 +847,10 @@ function App() {
     switch (tool) {
       case 'read_file': return '📄'
       case 'write_file': return '✏️'
-      case 'edit_file': case 'replace_lines': case 'insert_code': return '🔧'
+      case 'edit_file': case 'multi_edit_file': case 'replace_lines': case 'insert_code': return '🔧'
       case 'list_directory': return '📂'
       case 'search_files': return '🔍'
+      case 'grep_search': return '🔎'
       case 'run_command': return '⚡'
       case 'apply_diffs': return '🚀'
       case 'validate_project': return '🛡️'
@@ -832,6 +861,7 @@ function App() {
       case 'read_url_content': return '📖'
       case 'planning': return '📋'
       case 'learning': return '🧠'
+      case 'ask_user': return '💬'
       default: return '🛠️'
     }
   }
@@ -927,7 +957,7 @@ function App() {
                 })
                 setMessages([])
                 setAgentSteps([])
-                agent.reset()
+                agent.reset().catch(() => {})
               }
             }).catch((error: any) => {
               console.error('Error opening folder:', error)
@@ -1011,7 +1041,7 @@ function App() {
                               })
                               setMessages([])
                               setAgentSteps([])
-                              agent.reset()
+                              agent.reset().catch(() => {})
                             }
                           }).catch((error: any) => {
                             console.error('Error opening folder:', error)
@@ -1161,7 +1191,7 @@ function App() {
                     })
                     setMessages([])
                     setAgentSteps([])
-                    agent.reset()
+                    agent.reset().catch(() => {})
                   }
                 }).catch((error: any) => {
                   console.error('Error opening folder:', error)
@@ -1371,6 +1401,53 @@ function App() {
             </button>
             <div style={{ marginTop: '16px', fontSize: '10px', color: 'rgba(255,255,255,0.3)' }}>
               Powered by WhizCore Engine • 2026 MrWhiz
+            </div>
+          </div>
+        </div>
+      )}
+      {/* FIX #9: ask_user mid-task clarification dialog */}
+      {askUserPrompt && (
+        <div className="modal-overlay" style={{ zIndex: 9999 }}>
+          <div className="modal-dialog" style={{
+            maxWidth: '420px',
+            borderRadius: '16px',
+            background: 'rgba(30,30,30,0.97)',
+            backdropFilter: 'blur(24px)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+            padding: '28px',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px' }}>
+              <span style={{ fontSize: '22px' }}>💬</span>
+              <strong style={{ fontSize: '15px', color: 'var(--text-primary)' }}>Agent needs your input</strong>
+            </div>
+            <p style={{ fontSize: '14px', color: 'rgba(255,255,255,0.75)', lineHeight: 1.6, marginBottom: '22px' }}>
+              {askUserPrompt.question}
+            </p>
+            <div className="modal-buttons" style={{ display: 'flex', gap: '10px' }}>
+              <button
+                className="btn-primary"
+                style={{ flex: 1, padding: '10px', borderRadius: '8px', fontWeight: 600 }}
+                onClick={() => {
+                  agent.sendPermissionResponse(true, askUserPrompt.requestId).catch(() => {})
+                  setAskUserPrompt(null)
+                }}
+              >
+                ✅ Yes / Proceed
+              </button>
+              <button
+                style={{
+                  flex: 1, padding: '10px', borderRadius: '8px', fontWeight: 600,
+                  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)',
+                  color: 'var(--text-secondary)', cursor: 'pointer'
+                }}
+                onClick={() => {
+                  agent.sendPermissionResponse(false, askUserPrompt.requestId).catch(() => {})
+                  setAskUserPrompt(null)
+                }}
+              >
+                ❌ No / Skip
+              </button>
             </div>
           </div>
         </div>

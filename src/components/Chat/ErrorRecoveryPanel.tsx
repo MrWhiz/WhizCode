@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { useErrorRecovery, RecoveryAttempt, RecoveryStrategy } from '@/hooks/useErrorRecovery';
+import { useErrorRecovery } from '../../hooks/useErrorRecovery';
+import type { RecoveryAttempt, RecoveryStrategy } from '../../hooks/useErrorRecovery';
 import './ErrorRecoveryPanel.css';
 
 interface ErrorRecoveryPanelProps {

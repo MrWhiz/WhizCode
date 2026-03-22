@@ -419,9 +419,16 @@ function handleError(error: unknown): TauriError {
     return error
   }
 
-  // Handle Tauri invoke errors
+  // Handle Tauri cancellation or specific result objects
   if (error && typeof error === 'object') {
     const err = error as any
+    if (err.type === 'cancelation' || err.msg?.includes('canceled')) {
+      const te = new TauriError('CANCELATION', err.msg || 'Operation canceled')
+      ;(te as any).type = 'cancelation'
+      ;(te as any).msg = err.msg
+      return te
+    }
+    
     if (err.message) {
       return new TauriError('TAURI_ERROR', err.message, JSON.stringify(err))
     }
@@ -510,14 +517,20 @@ export const agent = {
 
   async executeLoopStreaming(options: any): Promise<any> {
     try {
-      const wsPath = options.workspacePath || null
+      const wsPath = options.workspacePath || options.workspace_path || null
       const activeFile = options.activeFile || null
-      console.log('[API] Invoking execute_agent_loop_streaming, workspacePath =', wsPath)
+      // FIX #1: Send conversation history so the LLM has multi-turn memory
+      const conversationHistory = (options.conversationHistory || []).map((m: any) => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        content: typeof m.content === 'string' ? m.content : String(m.content ?? ''),
+      }))
+      console.log('[API] Invoking execute_agent_loop_streaming, workspacePath =', wsPath, 'history turns =', conversationHistory.length)
       return await invoke('execute_agent_loop_streaming', {
         task: options.task,
         model: options.model,
         workspacePath: wsPath,
         activeFile: activeFile,
+        conversationHistory: conversationHistory,
       })
     } catch (error) {
       throw handleError(error)
@@ -562,8 +575,19 @@ export const agent = {
       })
       return unlisten
     },
-  },
-}
+
+    // FIX #9: mid-task ask_user clarification requests
+    async onAgentAskUser(callback: (data: { question: string; requestId: string }) => void): Promise<() => void> {
+      const unlisten = await listen('agent:step', (event) => {
+        const step = event.payload as any
+        if (step?.tool === 'ask_user' && step?.status === 'awaiting_permission') {
+          callback({ question: step.summary, requestId: step.requestId || '' })
+        }
+      })
+      return unlisten
+    },
+  }, // end events
+} // end agent
 
 // Ollama Commands
 export const ollama = {

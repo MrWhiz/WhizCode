@@ -1,0 +1,5430 @@
+import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
+import path, { join, dirname, isAbsolute, normalize, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { exec, spawn, execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import * as fs from 'node:fs/promises'
+import { validatePathInWorkspace, sanitizeShellInput, encryptData, decryptData, validateStringInput, validateFilePath } from './securityUtils'
+import * as os from 'node:os'
+// Remove cross-fetch as global fetch is available in modern Electron/Node
+import { createRequire } from 'node:module'
+import * as chokidar from 'chokidar'
+import { IndexingService } from './indexService'
+import { CodeGraphService } from './graphService'
+import { DiffService, type FileChange } from './diffService'
+import { getSubAgentConfig, listSubAgents } from './subAgents'
+import { HooksManager } from './hooksSystem'
+import { SteeringManager } from './steeringSystem'
+import { SpecsManager } from './specsSystem'
+import { MCPManager } from './mcpService'
+import { MemoryManager } from './memoryService'
+
+const _require = createRequire(import.meta.url)
+const pty = _require('node' + '-pty')
+
+import { HistoryManager } from './historyService'
+import { StrategicPlanner, type PlanningContext, type ExecutionPlan } from './strategicPlanner'
+import { ContextMemory } from './contextMemory'
+import { LearningSystem } from './learningSystem'
+import { CodeIntelligence } from './codeIntelligence'
+import { EnhancedMCPSystem } from './enhancedMCPSystem'
+import { VectorSearchSystem } from './vectorSearchSystem'
+import { ErrorRecoverySystem } from './errorRecoverySystem'
+import { ToolResultCache } from './toolResultCache'
+import { ProcessManager } from './processManager'
+import { setupTerminalHandlers } from './terminalHandlers'
+import { KnowledgeService, type KnowledgeItem } from './knowledgeService'
+import { PromptManager } from './promptManager'
+import { SystemStatusService } from './systemStatus'
+
+const execAsync = promisify(exec)
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+
+// RESOLVE ACCESS DENIED (0x5) ERRORS: Set explicit local paths for caches
+// This prevents Electron from trying to write to restricted system/Temp folders
+const appDataPath = join(app.getPath('userData'), 'whizcode-core');
+app.setPath('userData', appDataPath);
+app.setPath('cache', join(appDataPath, 'Cache'));
+
+// ── AZURE GATEWAY TOKEN MANAGEMENT ─────────────────────────────────────
+let azureTokenCache: { token: string, expires: number } | null = null;
+const AZURE_TOKEN_FILE = join(appDataPath, 'azure-token.json');
+
+async function loadAzureToken() {
+  if (azureTokenCache) return azureTokenCache;
+  try {
+    const data = await fs.readFile(AZURE_TOKEN_FILE, 'utf-8');
+    const parsed = JSON.parse(data);
+    if (parsed && parsed.token && parsed.expires && parsed.expires > Date.now()) {
+      try {
+        azureTokenCache = {
+          token: decryptData(parsed.token),
+          expires: parsed.expires
+        };
+        return azureTokenCache;
+      } catch (e) {
+        console.warn('[AZURE] Failed to decrypt token, clearing cache');
+        await fs.unlink(AZURE_TOKEN_FILE).catch(() => {});
+        return null;
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+async function getAzureToken(loginUrl: string, username: string, password: string, forceRefresh = false) {
+  const cached = await loadAzureToken();
+  if (cached && !forceRefresh && cached.expires > Date.now()) {
+    return cached.token;
+  }
+
+  console.log(`[AZURE] Fetching new token from ${loginUrl}...`);
+  const response = await fetch(loginUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Azure Gateway Login failed: ${response.status} ${await response.text()}`);
+  }
+
+  const data: any = await response.json();
+  const token = data.token || data.access_token || data.jwt || data.id_token;
+  if (!token) throw new Error('Azure Gateway login successful but no token found in response');
+
+  // Cache for 23.5 hours (assuming 24h validity)
+  const expires = Date.now() + 23.5 * 60 * 60 * 1000;
+  azureTokenCache = { token, expires };
+
+  try {
+    await fs.writeFile(AZURE_TOKEN_FILE, JSON.stringify({ token: encryptData(token), expires }), 'utf-8');
+  } catch (e) {
+    console.error('[AZURE] Failed to persist token:', e);
+  }
+
+  return token;
+}
+
+// Error analysis and guidance function
+function analyzeCommandError(errorOutput: string, command: string): string {
+  const error = errorOutput.toLowerCase();
+  let guidance = '';
+
+  if (error.includes('operation cancelled')) {
+    guidance = 'The command was cancelled, likely because it tried to show an interactive prompt (like "Overwrite existing files?") and stdin was closed. ' +
+      'If you are using create-vite or similar, ensure the target directory is empty or choose a new name. ' +
+      'You can use "list_directory" to check if the folder already exists.';
+    return `ERROR: Operation cancelled.\n${guidance}`;
+  }
+
+  // Common error patterns and guidance
+  if (error.includes('enoent') || error.includes('no such file or directory')) {
+    if (command.includes('npm create vite') || command.includes('npm create vite@latest')) {
+      // Check for malformed paths in the error
+      const pathMatch = error.match(/path: ['"]([^'"]+)['"]/i);
+      if (pathMatch && pathMatch[1].includes('\\') && pathMatch[1].split('\\').length > 5) {
+        guidance = 'The path appears malformed. The create-vite command might be interpreting the path incorrectly. Try using a simpler path without spaces or use quotes. Example: npm create vite@latest "my-app" --template react-ts';
+      } else {
+        guidance = 'The vite command may not be installed. Try: npx -y create-vite@latest my-app --template react-ts';
+      }
+    } else if (command.includes('npm install') || command.includes('npm i ')) {
+      guidance = 'npm might not be installed or not in PATH. Check if npm is installed with: npm --version';
+    } else if (command.includes('mkdir') || command.includes('cd ')) {
+      guidance = 'The directory path might contain spaces or special characters. Try using quotes around paths with spaces.';
+    }
+  }
+
+  if (error.includes('command not found') || error.includes('is not recognized')) {
+    if (command.includes('npm ') && command.includes('create')) {
+      guidance = 'npm create command not found. Try: npx create-vite@latest my-app --template react-ts';
+    } else if (command.includes('npx ')) {
+      guidance = 'npx might not be installed or in PATH. Try using npm directly or check npx installation.';
+    }
+  }
+
+  if (error.includes('permission denied') || error.includes('eacces')) {
+    guidance = 'Permission denied. Try running with administrator/sudo privileges or check file permissions.';
+  }
+
+  if (error.includes('eaddrinuse') || error.includes('address already in use')) {
+    guidance = 'Port is already in use. Try a different port or kill the process using the port.';
+  }
+
+  if (error.includes('eaddrinuse') || error.includes('already in use')) {
+    guidance = 'Port is already in use. Try a different port or kill the process using the port.';
+  }
+
+  if (error.includes('enoent') && error.includes('fatal: not a git repository')) {
+    guidance = 'Not a git repository. Initialize git with: git init';
+  }
+
+  if (error.includes('module not found') || error.includes('cannot find module')) {
+    const moduleMatch = error.match(/cannot find module ['"]([^'"]+)['"]/i);
+    if (moduleMatch) {
+      guidance = `Module not found: ${moduleMatch[1]}. Try: npm install ${moduleMatch[1]}`;
+    } else {
+      guidance = 'Module not found. Try running: npm install';
+    }
+  }
+
+  if (error.includes('syntax error') || error.includes('syntaxerror')) {
+    guidance = 'Syntax error in command or script. Check for typos or missing arguments.';
+  }
+
+  if (error.includes('econnrefused') || error.includes('connection refused')) {
+    guidance = 'Connection refused. Check if the server/port is running and accessible.';
+  }
+
+  if (error.includes('econnreset') || error.includes('connection reset')) {
+    guidance = 'Connection was reset. Check network connectivity or server status.';
+  }
+
+  if (error.includes('eaddrinuse') || error.includes('address already in use')) {
+    guidance = 'Address already in use. Try a different port or kill the process using the port.';
+  }
+
+  if (error.includes('eacces') || error.includes('permission denied')) {
+    guidance = 'Permission denied. Try running with elevated privileges or check file permissions.';
+  }
+
+  if (error.includes('enoent') && error.includes('no such file or directory')) {
+    if (command.includes('cd ') && command.includes('mkdir')) {
+      guidance = 'Directory does not exist. Check the path or create parent directories first.';
+    } else {
+      guidance = 'File or directory not found. Check the path and try again.';
+    }
+  }
+
+  if (error.includes('command not found') || error.includes('is not recognized')) {
+    if (command.includes('npm ') || command.includes('npx ')) {
+      guidance = 'npm/npx not found. Make sure Node.js and npm are installed and in PATH.';
+    } else {
+      guidance = 'Command not found. Check if the command exists and is in your PATH.';
+    }
+  }
+
+  if (error.includes('eexist') || error.includes('file already exists')) {
+    guidance = 'File or directory already exists. Use a different name or remove the existing one.';
+  }
+
+  if (error.includes('enotempty') || error.includes('directory not empty')) {
+    guidance = 'Directory is not empty. Remove or move files first.';
+  }
+
+  if (error.includes('eisdir') || error.includes('is a directory')) {
+    guidance = 'Expected a file but found a directory, or vice versa.';
+  }
+
+  if (error.includes('eacces') || error.includes('permission denied')) {
+    guidance = 'Permission denied. Check file permissions or run with elevated privileges.';
+  }
+
+  if (error.includes('etimedout') || error.includes('timeout')) {
+    guidance = 'Connection timed out. Check network connectivity or server status.';
+  }
+
+  if (error.includes('econnreset') || error.includes('connection reset')) {
+    guidance = 'Connection was reset. Check network or server.';
+  }
+
+  if (error.includes('ehostunreach') || error.includes('host unreachable')) {
+    guidance = 'Host unreachable. Check network or host availability.';
+  }
+
+  if (error.includes('enetunreach') || error.includes('network unreachable')) {
+    guidance = 'Network unreachable. Check network connection.';
+  }
+
+  if (error.includes('econnaborted') || error.includes('connection aborted')) {
+    guidance = 'Connection was aborted. Check network or server.';
+  }
+
+  // Add the original error and guidance
+  let result = errorOutput;
+  if (guidance) {
+    result += `\n\n[ERROR ANALYSIS]\n${guidance}\n\nSuggested fix: ${guidance}`;
+  }
+
+  return result;
+}
+
+process.env.APP_ROOT = join(__dirname, '..')
+// Suppress noisy deprecation warnings that distract from dev logs
+process.env.NODE_NO_WARNINGS = '1';
+app.commandLine.appendSwitch('no-warnings');
+
+// Optional: Fix for certain GPU drivers on Windows causing blank screens/crashes
+if (process.env.WHIZCODE_DISABLE_GPU === '1') {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch('disable-gpu');
+}
+// Force disk cache to be local to the app data directory
+app.commandLine.appendSwitch('disk-cache-dir', join(appDataPath, 'disk-cache'));
+
+export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
+export const MAIN_DIST = join(process.env.APP_ROOT, 'dist-electron')
+export const RENDERER_DIST = join(process.env.APP_ROOT, 'dist')
+
+process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? join(process.env.APP_ROOT, 'public') : RENDERER_DIST
+
+let win: BrowserWindow | null
+
+function safeSend(channel: string, ...args: any[]) {
+  if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+    try {
+      win.webContents.send(channel, ...args);
+    } catch (e) {
+      console.error(`[IPC_ERROR] safeSend failed for channel ${channel}`, e);
+    }
+  }
+}
+
+let terminalManager: any = null
+let indexingService: IndexingService | null = null
+let graphService: CodeGraphService | null = null
+const diffService = new DiffService();
+let workspaceWatcher: chokidar.FSWatcher | null = null;
+let pendingPermissionResolvers: Map<string, (decision: { approved: boolean }) => void> = new Map()
+let permissionRequestCounter = 0;
+let abortRequested = false;
+let agentAbortController: AbortController | null = null;
+const backgroundProcesses = new Map<string, any>();
+let promptManager: PromptManager | null = null;
+let currentWorkspacePath: string | null = null;
+let hooksManager: HooksManager | null = null;
+let steeringManager: SteeringManager | null = null;
+let specsManager: SpecsManager | null = null;
+let mcpManager: MCPManager | null = null;
+let memoryManager: MemoryManager | null = null;
+let knowledgeService: KnowledgeService | null = null;
+
+let currentHistoryManager: HistoryManager | null = null;
+
+// Enhanced AI systems
+let strategicPlanner: StrategicPlanner | null = null;
+let contextMemory: ContextMemory | null = null;
+let learningSystem: LearningSystem | null = null;
+let indexingPromise: Promise<void> | null = null;
+let codeIntelligence: CodeIntelligence | null = null;
+
+// High-priority systems
+let enhancedMCPSystem: EnhancedMCPSystem | null = null;
+let vectorSearchSystem: VectorSearchSystem | null = null;
+let errorRecoverySystem: ErrorRecoverySystem | null = null;
+let toolResultCache: ToolResultCache | null = null;
+let currentConversationId: string = Date.now().toString();
+
+// Import timeout utilities
+import { CircularBuffer } from './timeoutUtils';
+import { diagnosticsService } from './diagnosticsService';
+
+// Rolling buffer of PTY terminal output — fed into agent context on each request
+// Using CircularBuffer to prevent unbounded memory growth (max 10000 lines)
+const terminalOutputBuffer = new CircularBuffer<string>(10000);
+
+// Ollama Configuration
+const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
+const MODEL_NAME = 'qwen2.5-coder:latest'; // Unified model for all tasks
+
+// Workspace persistence
+const WORKSPACE_STORAGE_FILE = join(app.getPath('userData'), 'last-workspace.json');
+const WINDOW_BOUNDS_FILE = join(app.getPath('userData'), 'window-bounds.json');
+
+async function saveLastWorkspace(workspacePath: string) {
+  try {
+    await fs.writeFile(WORKSPACE_STORAGE_FILE, JSON.stringify({ lastWorkspace: workspacePath }), 'utf-8');
+  } catch (e) {
+    console.error('Failed to save last workspace:', e);
+  }
+}
+
+async function loadLastWorkspace(): Promise<string | null> {
+  try {
+    const data = await fs.readFile(WORKSPACE_STORAGE_FILE, 'utf-8');
+    const parsed = JSON.parse(data);
+    return parsed.lastWorkspace || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function saveWindowBounds() {
+  try {
+    if (!win) return;
+    const bounds = win.getBounds();
+    await fs.writeFile(WINDOW_BOUNDS_FILE, JSON.stringify(bounds), 'utf-8');
+  } catch (e) {
+    console.error('Failed to save window bounds:', e);
+  }
+}
+
+async function loadWindowBounds(): Promise<{ x: number; y: number; width: number; height: number } | null> {
+  try {
+    const data = await fs.readFile(WINDOW_BOUNDS_FILE, 'utf-8');
+    return JSON.parse(data);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function createWindow() {
+  console.log('[WINDOW] Creating window...');
+  const savedBounds = await loadWindowBounds();
+
+  win = new BrowserWindow({
+    x: savedBounds?.x,
+    y: savedBounds?.y,
+    width: savedBounds?.width || 1200,
+    height: savedBounds?.height || 800,
+    minWidth: 800,
+    minHeight: 600,
+    show: false,
+    icon: join(process.env.VITE_PUBLIC!, 'icon.png'),
+    webPreferences: {
+      preload: join(__dirname, 'preload.mjs'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webviewTag: true,
+      spellcheck: true
+    },
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#1e1e1e', // VSCode Dark Theme 
+      symbolColor: '#cccccc',
+      height: 30
+    },
+    backgroundColor: '#1e1e1e'
+  })
+
+  console.log('[WINDOW] Window created, setting up event handlers and security hooks...');
+
+  // ── SECURITY HARDENING ───────────────────────────────────────────────────
+
+  // Prevent navigation to untrusted sites
+  win.webContents.on('will-navigate', (event, navigationUrl) => {
+    const parsedUrl = new URL(navigationUrl);
+    // Allow only local files and authorized API endpoints if strictly necessary
+    if (parsedUrl.protocol !== 'file:' && !navigationUrl.startsWith('http://localhost')) {
+      event.preventDefault();
+      console.warn(`[SECURITY] Blocked unauthorized navigation to: ${navigationUrl}`);
+    }
+  });
+
+  // Restrict opening new windows to verified protocols only
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      // Open in system browser instead of a new Electron window 
+      shell.openExternal(url);
+    } else {
+      console.warn(`[SECURITY] Blocked unauthorized window open request: ${url}`);
+    }
+    return { action: 'deny' };
+  });
+
+  // Lock down webview sessions
+  win.webContents.on('will-attach-webview', (_event, webPreferences, _params) => {
+    // Strip node integration from any webview
+    delete (webPreferences as any).nodeIntegration;
+    delete (webPreferences as any).nodeIntegrationInSubFrames;
+    // Enable isolation and sandboxing
+    (webPreferences as any).contextIsolation = true;
+    (webPreferences as any).sandbox = true;
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Initialize terminal handlers with a function to get current workspace path
+  terminalManager = setupTerminalHandlers(win, () => currentWorkspacePath);
+
+  // Save window bounds when moved or resized
+  win.on('resize', () => saveWindowBounds());
+  win.on('move', () => saveWindowBounds());
+
+  // Show maximized once ready
+  win.once('ready-to-show', () => {
+    console.log('[WINDOW] Window ready to show, maximizing and showing...');
+    win?.maximize();
+    win?.show();
+  });
+
+  // Open DevTools automatically if in dev environment
+  console.log('[WINDOW] VITE_DEV_SERVER_URL:', VITE_DEV_SERVER_URL);
+  if (VITE_DEV_SERVER_URL) {
+    console.log('[WINDOW] Loading dev server URL:', VITE_DEV_SERVER_URL);
+    win.loadURL(VITE_DEV_SERVER_URL)
+  } else {
+    console.log('[WINDOW] Loading production file:', join(RENDERER_DIST, 'index.html'));
+    win.loadFile(join(RENDERER_DIST, 'index.html'))
+  }
+
+  // Load last workspace after window is ready
+  win.webContents.on('did-finish-load', async () => {
+    console.log('[WINDOW] Window content loaded');
+    const lastWorkspace = await loadLastWorkspace();
+    if (lastWorkspace) {
+      try {
+        // Check if the path still exists
+        await fs.access(lastWorkspace);
+        currentWorkspacePath = lastWorkspace;
+        setupWorkspaceWatcher(lastWorkspace);
+        safeSend('workspace:restored', lastWorkspace);
+      } catch (e) {
+        console.log('Last workspace no longer exists:', lastWorkspace);
+      }
+    }
+  });
+
+  // Initialize and start system status service
+  const systemStatusService = new SystemStatusService(win.webContents);
+  systemStatusService.start(3000);
+
+  win.on('closed', () => {
+    systemStatusService.stop();
+  });
+}
+
+app.on('window-all-closed', async () => {
+  // Cleanup enhanced AI systems
+  if (contextMemory) {
+    try {
+      contextMemory.endSession();
+      await contextMemory.saveMemory();
+      console.log('[CLEANUP] Saved context memory');
+    } catch (error) {
+      console.warn('[CLEANUP] Failed to save context memory:', error);
+    }
+  }
+
+  // Cleanup high-priority systems
+  if (enhancedMCPSystem) {
+    try {
+      await enhancedMCPSystem.shutdown();
+      console.log('[CLEANUP] Enhanced MCP system shutdown');
+    } catch (error) {
+      console.warn('[CLEANUP] Failed to shutdown MCP system:', error);
+    }
+  }
+
+  if (toolResultCache) {
+    try {
+      toolResultCache.shutdown();
+      console.log('[CLEANUP] Tool cache shutdown');
+    } catch (error) {
+      console.warn('[CLEANUP] Failed to shutdown tool cache:', error);
+    }
+  }
+
+  if (terminalManager) {
+    try {
+      terminalManager.clearAll();
+      console.log('[CLEANUP] Terminals killed');
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+  }
+
+  if (process.platform !== 'darwin') {
+    app.quit()
+    win = null
+  }
+})
+
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow()
+  }
+})
+
+app.whenReady().then(createWindow)
+
+// ====== AGENTIC CODING FRAMEWORK ======
+
+// Directories and extensions to skip when scanning the workspace
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'dist-electron', '.next', '__pycache__', '.venv', 'venv', '.cache', 'coverage', '.idea', '.vscode', 'build', 'out', 'bin', 'obj']);
+const BINARY_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.zip', '.tar', '.gz', '.exe', '.dll', '.so', '.dylib', '.lock', '.pdf', '.bin', '.pyc', '.node']);
+
+/**
+ * Checks if a file is likely binary by reading a small chunk and looking for NULL bytes
+ */
+async function isBinaryFile(filePath: string): Promise<boolean> {
+  try {
+    const fd = await Promise.race([
+      fs.open(filePath, 'r'),
+      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('File open timed out')), 2000))
+    ]);
+    try {
+      const buffer = Buffer.alloc(1024);
+      const { bytesRead } = await Promise.race([
+        fd.read(buffer, 0, 1024, 0),
+        new Promise<any>((_, reject) => setTimeout(() => reject(new Error('File read timed out')), 2000))
+      ]);
+      for (let i = 0; i < bytesRead; i++) {
+        if (buffer[i] === 0) return true; // NULL byte found
+      }
+      return false;
+    } finally {
+      await fd.close();
+    }
+  } catch (error) {
+    console.warn(`[BINARY_CHECK] Error checking if file is binary: ${error}`);
+    // If we can't determine, assume it's not binary to allow reading
+    return false;
+  }
+}
+
+async function readDirectoryRecursive(dirPath: string, maxFiles = 2000): Promise<{ path: string }[]> {
+  const results: { path: string }[] = [];
+
+  // Use a stack-based iterative approach to avoid recursion overhead
+  const stack: string[] = [dirPath];
+
+  while (stack.length > 0 && results.length < maxFiles) {
+    const currentPath = stack.pop()!;
+    try {
+      const entries = await fs.readdir(currentPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (results.length >= maxFiles) break;
+        const fullPath = join(currentPath, entry.name);
+
+        if (entry.isDirectory()) {
+          // Efficiently skip noise
+          if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+            stack.push(fullPath);
+          }
+        } else {
+          const ext = '.' + entry.name.split('.').pop()?.toLowerCase();
+          if (!BINARY_EXTS.has(ext)) {
+            results.push({ path: fullPath });
+          }
+        }
+      }
+    } catch { /* skip unreadable */ }
+  }
+  return results;
+}
+
+// List directory contents (non-recursive, with metadata)
+async function listDirectory(dirPath: string): Promise<string> {
+  try {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    const lines: string[] = [];
+    for (const entry of entries) {
+      const fullPath = join(dirPath, entry.name);
+      try {
+        const stat = await fs.stat(fullPath);
+        const type = entry.isDirectory() ? 'DIR ' : 'FILE';
+        const size = entry.isDirectory() ? '' : ` (${stat.size} bytes)`;
+        lines.push(`${type} ${entry.name}${size}`);
+      } catch {
+        lines.push(`???? ${entry.name}`);
+      }
+    }
+    return lines.join('\n') || '(empty directory)';
+  } catch (e: any) {
+    return `Error listing directory: ${e.message}`;
+  }
+}
+
+// Search files for a pattern (grep-like)
+async function searchFiles(rootDir: string, pattern: string, includeGlob?: string): Promise<string> {
+  const results: string[] = [];
+  const maxResults = 50;
+  const regex = new RegExp(pattern, 'gi');
+
+  async function walk(currentPath: string) {
+    if (results.length >= maxResults) return;
+    try {
+      const entries = await fs.readdir(currentPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (results.length >= maxResults) break;
+        const fullPath = join(currentPath, entry.name);
+        if (entry.isDirectory()) {
+          if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+            await walk(fullPath);
+          }
+        } else {
+          // Apply include filter if specified
+          if (includeGlob) {
+            const ext = entry.name.split('.').pop()?.toLowerCase();
+            const filterExt = includeGlob.replace('*.', '').toLowerCase();
+            if (ext !== filterExt) continue;
+          }
+          const ext = '.' + entry.name.split('.').pop()?.toLowerCase();
+          if (BINARY_EXTS.has(ext)) continue;
+          try {
+            const stat = await fs.stat(fullPath);
+            if (stat.size > 100_000) continue;
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const lines = content.split('\n');
+            for (let i = 0; i < lines.length; i++) {
+              if (regex.test(lines[i])) {
+                const relPath = fullPath.replace(rootDir, '').replace(/^[\\/]/, '');
+                results.push(`${relPath}:${i + 1}: ${lines[i].trim()}`);
+                if (results.length >= maxResults) break;
+              }
+              regex.lastIndex = 0; // reset regex state
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  await walk(rootDir);
+  return results.length > 0 ? results.join('\n') : `No matches found for "${pattern}".`;
+}
+
+// ====== HELPER FUNCTIONS FOR NEW TOOLS ======
+
+// Fast fuzzy file search
+async function fuzzyFindFile(workspacePath: string, query: string, maxResults = 10, returnObjects = false): Promise<any> {
+  const results: { path: string; score: number; fullPath: string }[] = [];
+  const queryLower = query.toLowerCase().replace(/^[\\/]/, '');
+
+  async function walk(currentPath: string) {
+    if (results.length >= (maxResults * 2)) return; // Search a bit more than requested
+    try {
+      const entries = await fs.readdir(currentPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = join(currentPath, entry.name);
+        if (entry.isDirectory()) {
+          if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+            await walk(fullPath);
+          }
+        } else {
+          const fileName = entry.name.toLowerCase();
+          const relPath = fullPath.replace(workspacePath, '').replace(/^[\\/]/, '');
+
+          // Calculate match score
+          let score = 0;
+          if (fileName === queryLower) score = 100; // Exact match
+          else if (fileName.startsWith(queryLower)) score = 80; // Prefix match
+          else if (fileName.includes(queryLower)) score = 50; // Contains match
+          else if (relPath.toLowerCase().includes(queryLower)) score = 30; // Path contains match
+
+          if (score > 0) {
+            results.push({ path: relPath, score, fullPath });
+          }
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  await walk(workspacePath);
+  results.sort((a, b) => b.score - a.score);
+
+  if (returnObjects) return results.slice(0, maxResults);
+
+  if (results.length === 0) return `No files found matching "${query}".`;
+  return results.slice(0, maxResults).map(r => `- ${r.path} (score: ${r.score})`).join('\n');
+}
+
+// Get TypeScript/ESLint diagnostics
+async function getDiagnostics(filePath: string, workspacePath: string | null): Promise<string> {
+  const resolvedPath = resolvePath(filePath, workspacePath);
+
+  try {
+    // Check if file exists
+    await fs.access(resolvedPath);
+
+    // Check for tsconfig.json
+    const tsconfigPath = join(workspacePath || '.', 'tsconfig.json');
+    try {
+      await fs.access(tsconfigPath);
+
+      // Run tsc to get diagnostics
+      const { stdout, stderr } = await execAsync(`npx tsc --noEmit --pretty false "${resolvedPath}"`, {
+        cwd: workspacePath || '.',
+        maxBuffer: 1024 * 1024 * 10
+      });
+
+      if (stdout) return `TypeScript Diagnostics for ${filePath}:\n${stdout}`;
+      if (stderr) return `TypeScript Diagnostics for ${filePath}:\n${stderr}`;
+      return `✅ No TypeScript errors in ${filePath}`;
+    } catch {
+      // No tsconfig.json, try ESLint
+      try {
+        const { stdout, stderr } = await execAsync(`npx eslint "${resolvedPath}"`, {
+          cwd: workspacePath || '.',
+          maxBuffer: 1024 * 1024 * 10
+        });
+
+        if (stdout) return `ESLint Diagnostics for ${filePath}:\n${stdout}`;
+        if (stderr) return `ESLint Diagnostics for ${filePath}:\n${stderr}`;
+        return `✅ No ESLint errors in ${filePath}`;
+      } catch {
+        return `No configuration found (tsconfig.json or .eslintrc). Skipping diagnostics.`;
+      }
+    }
+  } catch {
+    return `❌ File not found: ${filePath}`;
+  }
+}
+
+// Fast grep search with line numbers
+async function grepSearch(workspacePath: string, pattern: string, includePattern?: string, maxResults = 50): Promise<string> {
+  const results: string[] = [];
+  const regex = new RegExp(pattern, 'gi');
+
+  async function walk(currentPath: string) {
+    if (results.length >= maxResults) return;
+    try {
+      const entries = await fs.readdir(currentPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (results.length >= maxResults) break;
+        const fullPath = join(currentPath, entry.name);
+        if (entry.isDirectory()) {
+          if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+            await walk(fullPath);
+          }
+        } else {
+          // Apply include filter if specified
+          if (includePattern) {
+            const ext = entry.name.split('.').pop()?.toLowerCase();
+            const filterExt = includePattern.replace('*.', '').toLowerCase();
+            if (ext !== filterExt) continue;
+          }
+
+          const ext = '.' + entry.name.split('.').pop()?.toLowerCase();
+          if (BINARY_EXTS.has(ext)) continue;
+
+          try {
+            const stat = await fs.stat(fullPath);
+            if (stat.size > 500_000) continue; // Skip very large files
+
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const lines = content.split('\n');
+
+            for (let i = 0; i < lines.length; i++) {
+              if (regex.test(lines[i])) {
+                const relPath = fullPath.replace(workspacePath, '').replace(/^[\\/]/, '');
+                results.push(`${relPath}:${i + 1}: ${lines[i].trim()}`);
+                if (results.length >= maxResults) break;
+              }
+              regex.lastIndex = 0;
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  await walk(workspacePath || '.');
+  return results.length > 0 ? results.join('\n') : `No matches found for "${pattern}".`;
+}
+
+// Read multiple files at once
+async function readMultipleFiles(files: string[], workspacePath: string | null): Promise<string> {
+  const results: { path: string; content: string; error?: string }[] = [];
+
+  for (const filePath of files) {
+    const resolvedPath = resolvePath(filePath, workspacePath);
+    try {
+      const isBinary = await isBinaryFile(resolvedPath);
+      if (isBinary) {
+        results.push({ path: filePath, content: '', error: 'Binary file' });
+        continue;
+      }
+
+      const content = await fs.readFile(resolvedPath, 'utf-8');
+      const lines = content.split('\n');
+      results.push({
+        path: filePath,
+        content: lines.map((line, i) => `${i + 1}: ${line}`).join('\n')
+      });
+    } catch (e: any) {
+      results.push({ path: filePath, content: '', error: e.message });
+    }
+  }
+
+  return results.map(r =>
+    r.error
+      ? `❌ ${r.path}: ${r.error}`
+      : `📄 ${r.path}:\n${r.content.substring(0, 5000)}${r.content.length > 5000 ? '\n... (truncated)' : ''}`
+  ).join('\n\n' + '='.repeat(50) + '\n\n');
+}
+
+// Rename symbol with reference updates
+async function semanticRename(
+  _filePath: string,
+  oldName: string,
+  newName: string,
+  workspacePath: string | null
+): Promise<string> {
+  try {
+    // First, find all references
+    const references: { path: string; line: number; content: string }[] = [];
+
+    async function findReferences(currentPath: string) {
+      try {
+        const entries = await fs.readdir(currentPath, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = join(currentPath, entry.name);
+          if (entry.isDirectory()) {
+            if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+              await findReferences(fullPath);
+            }
+          } else {
+            const ext = '.' + entry.name.split('.').pop()?.toLowerCase();
+            if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext)) continue;
+
+            try {
+              const content = await fs.readFile(fullPath, 'utf-8');
+              const lines = content.split('\n');
+              const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const regex = new RegExp(`\\b${escapedOldName}\\b`, 'g');
+
+              for (let i = 0; i < lines.length; i++) {
+                if (regex.test(lines[i])) {
+                  references.push({
+                    path: fullPath.replace(workspacePath || '', '').replace(/^[\\/]/, ''),
+                    line: i + 1,
+                    content: lines[i].trim()
+                  });
+                }
+              }
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* skip */ }
+    }
+
+    await findReferences(workspacePath || '.');
+
+    if (references.length === 0) {
+      return `No references found for "${oldName}".`;
+    }
+
+    // Now rename in all files
+    let renamedCount = 0;
+    for (const ref of references) {
+      const fullPath = join(workspacePath || '.', ref.path);
+      try {
+        let content = await fs.readFile(fullPath, 'utf-8');
+        const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const newContent = content.replace(new RegExp(`\\b${escapedOldName}\\b`, 'g'), newName);
+        if (newContent !== content) {
+          await fs.writeFile(fullPath, newContent, 'utf-8');
+          renamedCount++;
+        }
+      } catch { /* skip */ }
+    }
+
+    return `✅ Renamed "${oldName}" to "${newName}" in ${renamedCount} locations.\n\nFound ${references.length} references total.`;
+  } catch (e: any) {
+    return `❌ Error renaming symbol: ${e.message}`;
+  }
+}
+
+// Move file with import updates
+async function smartRelocate(
+  sourcePath: string,
+  destinationPath: string,
+  workspacePath: string | null
+): Promise<string> {
+  const resolvedSource = resolvePath(sourcePath, workspacePath);
+  const resolvedDest = resolvePath(destinationPath, workspacePath);
+
+  try {
+    // Check source exists
+    await fs.access(resolvedSource);
+
+    // Create destination directory if needed
+    const destDir = dirname(resolvedDest);
+    await fs.mkdir(destDir, { recursive: true });
+
+    // Read source content
+    const content = await fs.readFile(resolvedSource, 'utf-8');
+
+    // Update imports in the file being moved
+    let newContent = content;
+    const oldImportPath = sourcePath.replace(workspacePath || '', '').replace(/^[\\/]/, '').replace(/\\/g, '/');
+    const newImportPath = destinationPath.replace(workspacePath || '', '').replace(/^[\\/]/, '').replace(/\\/g, '/');
+
+    // Update relative imports in the moved file
+    const relativeImportRegex = new RegExp(`(['"])\\.\\.?/${oldImportPath.replace('.', '\\.')}`, 'g');
+    newContent = newContent.replace(relativeImportRegex, `$1../${newImportPath}`);
+
+    // Write to new location
+    await fs.writeFile(resolvedDest, newContent, 'utf-8');
+
+    // Update imports in other files
+    let importsUpdated = 0;
+    async function updateImports(currentPath: string) {
+      try {
+        const entries = await fs.readdir(currentPath, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = join(currentPath, entry.name);
+          if (entry.isDirectory()) {
+            if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+              await updateImports(fullPath);
+            }
+          } else {
+            const ext = '.' + entry.name.split('.').pop()?.toLowerCase();
+            if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext)) continue;
+
+            try {
+              let fileContent = await fs.readFile(fullPath, 'utf-8');
+              const importRegex = new RegExp(`(['"])\\.\\.?/${oldImportPath.replace('.', '\\.')}`, 'g');
+
+              if (importRegex.test(fileContent)) {
+                fileContent = fileContent.replace(importRegex, `$1../${newImportPath}`);
+                await fs.writeFile(fullPath, fileContent, 'utf-8');
+                importsUpdated++;
+              }
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* skip */ }
+    }
+
+    await updateImports(workspacePath || '.');
+
+    // Delete old file
+    await fs.unlink(resolvedSource);
+
+    return `✅ Moved ${sourcePath} to ${destinationPath}.\nUpdated ${importsUpdated} import statements.`;
+  } catch (e: any) {
+    return `❌ Error relocating file: ${e.message}`;
+  }
+}
+
+// Resolve a path from the agent (could be relative) to an absolute path
+function resolvePath(agentPath: string, workspacePath: string | null, cwd?: string): string {
+  if (!agentPath) return agentPath;
+  // If already absolute, use as-is
+  const normalizedAgentPath = agentPath.trim();
+  if (normalizedAgentPath.match(/^[A-Za-z]:[\\/]/) || normalizedAgentPath.startsWith('/') || normalizedAgentPath.startsWith('\\')) {
+    return normalizedAgentPath;
+  }
+
+  const baseDir = cwd && workspacePath ? join(workspacePath, cwd) : workspacePath;
+  // Otherwise resolve relative to workspace
+  if (baseDir) {
+    return join(baseDir, agentPath);
+  }
+  return agentPath;
+}
+
+// Helper method to check if a command is a development server command
+function isDevServerCommand(command: string): boolean {
+  const commandLower = command.toLowerCase();
+  const devPatterns = [
+    'npm run dev',
+    'npm start',
+    'yarn dev',
+    'yarn start',
+    'pnpm dev',
+    'pnpm start',
+    'vite',
+    'webpack-dev-server',
+    'next dev',
+    'react-scripts start',
+    'vue-cli-service serve',
+    'ng serve',
+    'nuxt dev',
+    'gatsby develop',
+    'serve',
+    'http-server'
+  ];
+
+  return devPatterns.some(pattern => commandLower.includes(pattern));
+}
+
+// Helper method to format process check results
+function formatProcessCheckResult(checkResult: any): string {
+  let summary = '';
+
+  if (checkResult.processes.length > 0) {
+    summary += `Running processes (${checkResult.processes.length}):\n`;
+    checkResult.processes.forEach((proc: any) => {
+      summary += `• PID ${proc.pid}: ${proc.type} - ${proc.command.substring(0, 60)}${proc.command.length > 60 ? '...' : ''}\n`;
+    });
+  }
+
+  if (checkResult.conflictingPorts.length > 0) {
+    summary += `\nPorts in use: ${checkResult.conflictingPorts.join(', ')}`;
+  }
+
+  return summary.trim();
+}
+
+// ====== SYSTEM PROMPTS ======
+
+const WHIZCODE_SYSTEM_PROMPT = `
+## IDENTITY
+You are WhizCode, a powerful autonomous software engineering partner designed by the Advanced Agentic Coding team. Your mission is to build, debug, and maintain software by DIRECTLY using the tools provided to you. You are a highly proactive, helpful, and technically precise collaborator who prioritizes both technical excellence and premium design.
+
+## WEB APPLICATION DEVELOPMENT (ANTIGRAVITY STANDARDS)
+### Design Aesthetics
+1. **Rich Aesthetics**: Every application should "WOW" the user. Use modern, vibrant colors, sleek dark modes, and curated typography (e.g., Google Fonts like Inter, Outfit, or Roboto). Avoid generic browser defaults.
+2. **Premium Visuals**: Use smooth gradients, glassmorphism (transparency with blur), and high-quality UI elements.
+3. **Dynamic Elements**: Implement responsive layouts, hover effects, and subtle micro-animations to make the interface feel alive.
+4. **No Placeholders**: Never use generic placeholders. If an image or asset is needed, use the **generate_image** tool to create a high-quality mockup or asset.
+
+### Implementation Workflow
+Follow this systematic approach when building web applications:
+1. **Plan and Understand**: Outline features, draw inspiration from modern designs, and plan the architecture.
+2. **Build the Foundation**: Implement the core design system and CSS tokens/utilities.
+3. **Create Components**: Build modular, reusable components using the established design system.
+4. **Assemble Pages**: Incorporate components into the main app layout, ensuring responsive design and routing.
+5. **Polish and Optimize**: Review user experience, optimize transitions, and ensure smooth interactions.
+
+### SEO & Semantic HTML
+- **Semantic Structure**: Use appropriate HTML5 semantic elements (main, section, article, nav).
+- **Heading Hierarchy**: Ensure one <h1> per page and logical nesting (h2, h3).
+- **Meta Tags**: Always include descriptive <title> tags and compelling <meta description> tags for each page.
+
+## CAPABILITIES & TOOLS
+- **Autonomous Operability**: Direct access to file system, shell execution, and indexing services.
+- **Advanced Context**: Use "Specs" and historical **"Knowledge Items"** to build deep architectural context before starting work.
+- **Surgical Precision**: Read before editing. Verify after writing. Use multi-replace for non-contiguous changes.
+
+## RULES & CONSTRAINTS
+- **BE PROACTIVE**: Never give the user manual steps. If a file needs creation or a command needs running, DO IT yourself immediately.
+- **CWD AWARENESS**: If working in a nested project (e.g. after create-vite), ALWAYS use the "cwd" parameter in ALL tools.
+- **PARALLEL PARADIGM**: You SHOULD output multiple JSON tool blocks in a single response to perform tasks simultaneously (e.g., reading 3 files at once).
+- **ENVIRONMENT ISOLATION**: Always set up virtual environments (Python) or run npm install (Node) when starting new projects.
+- **INTERNAL REASONING**: Use [THOUGHT] tags for your reasoning BEFORE outputting tool calls or your final response.
+
+## RESPONSE STYLE
+- **Professional & Collaborative**: Talk like a senior engineer: concise, helpful, and action-oriented.
+- **Minimal Fluff**: State what you are doing, then do it. After completion, provide a 2-3 sentence summary.
+- **Task Conclusion**: Include "TASK COMPLETE" in your final response when the user request is fully addressed.
+
+## OUTPUT FORMAT (STRICT)
+⚠️ CRITICAL - OUTPUT TOOL CALLS IN JSON FORMAT ONLY ⚠️
+{"tool": "read_file", "path": "src/main.ts"}
+{"tool": "write_file", "path": "src/app.ts", "content": "..."}
+{"tool": "run_command", "command": "npm install", "cwd": "my-app"}
+{"tool": "generate_image", "prompt": "Modern dashboard UI, glassmorphism, dark mode, vibrant blue accents"}
+{"tool": "search_web", "query": "latest React Router v7 data loading patterns"}
+
+## ANTI-LOOP INSTRUCTIONS
+- **DO NOT REPEAT FAILED ACTIONS**: If you attempt a \`replace_file_content\` or \`run_command\` and it fails or produces an error, DO NOT attempt the exact same action again.
+- **CHANGE STRATEGY**: If you are stuck, read the surrounding code, use grep/search, or ask the user for clarification. Repeating identical tool calls will trigger an emergency abort.
+
+<system_context>
+Operating System: ${process.platform}
+Shell: ${process.platform === 'win32' ? 'cmd.exe (Windows)' : 'bash'}
+Current Date: ${new Date().toLocaleDateString()}
+</system_context>
+
+<windows_shell_rules>
+- Use Windows-compatible commands. quote paths with spaces.
+- NEVER "cd" as a standalone command; use the "cwd" tool parameter.
+- Use relative paths within the workspace.
+</windows_shell_rules>
+`;
+
+let conversationHistory: any[] = [];
+let workspaceManifest: string = '';
+
+let workspaceContextLoaded = false;
+
+// ====== LLM PROVIDER CALLS ======
+async function callAI(messages: any[], modelConfig: {
+  provider: string,
+  model: string,
+  openaiKey?: string,
+  geminiKey?: string,
+  bedrockRegion?: string,
+  bedrockAccessKey?: string,
+  bedrockSecretKey?: string,
+  azureLoginUrl?: string,
+  azureEmbeddingUrl?: string,
+  azureCompletionUrl?: string,
+  azureUsername?: string,
+  azurePassword?: string
+}, config: any, signal?: AbortSignal, temperature: number = 0.1, onToolReady?: (tool: any) => void) {
+  const toolEmitter = onToolReady ? new LiveToolEmitter(onToolReady) : null;
+  try {
+    let response: any;
+    let data: any;
+    const {
+      provider, model, openaiKey, geminiKey,
+      bedrockRegion, bedrockAccessKey, bedrockSecretKey,
+      azureLoginUrl, azureEmbeddingUrl, azureCompletionUrl, azureUsername, azurePassword
+    } = modelConfig;
+
+    if (provider === 'openai' || provider === 'azure-gateway') {
+      const isAzure = provider === 'azure-gateway';
+      const url = isAzure ? (azureCompletionUrl || config.azureCompletionUrl) : 'https://api.openai.com/v1/chat/completions';
+      const authHeader = isAzure
+        ? `Bearer ${await getAzureToken(azureLoginUrl || config.azureLoginUrl || '', azureUsername || config.azureUsername || '', azurePassword || config.azurePassword || '')}`
+        : `Bearer ${openaiKey || config.openaiKey}`;
+
+      const formattedOpenAIMessages = messages.map(m => {
+        if (m.images && m.images.length > 0) {
+          return {
+            role: m.role,
+            content: [
+              { type: 'text', text: m.content },
+              ...m.images.map((img: string) => ({
+                type: 'image_url',
+                image_url: { url: img.startsWith('data:') ? img : `data:image/jpeg;base64,${img}` }
+              }))
+            ]
+          };
+        }
+        return { role: m.role, content: m.content };
+      });
+
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': authHeader
+        },
+        body: JSON.stringify({
+          model: model || (isAzure ? 'gpt-4o' : 'gpt-4o'),
+          messages: formattedOpenAIMessages,
+          temperature: temperature || 0.1,
+          stream: true
+        }),
+        signal
+      });
+
+      if (!response.ok) throw new Error(`${provider} HTTP Error: ${response.status} ${await response.text()}`);
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error(`${provider} stream body is null`);
+      const decoder = new TextDecoder();
+      let fullContent = '';
+      let streamBuffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        streamBuffer += decoder.decode(value, { stream: true });
+        const lines = streamBuffer.split('\n');
+        streamBuffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine || !trimmedLine.startsWith('data: ')) continue;
+
+          const dataStr = trimmedLine.substring(6);
+          if (dataStr === '[DONE]') break;
+
+          try {
+            const chunk = JSON.parse(dataStr);
+            const content = chunk.choices?.[0]?.delta?.content || '';
+            if (content) {
+              fullContent += content;
+              safeSend('agent:stream', { token: content });
+            }
+          } catch (e) {
+            // Skip parse errors for incomplete chunks
+          }
+        }
+      }
+      return fullContent;
+    } else if (provider === 'gemini') {
+      const geminiMessages = messages.filter(m => m.role !== 'system').map(m => {
+        const parts: any[] = [{ text: m.content }];
+        if (m.images && m.images.length > 0) {
+          m.images.forEach((img: string) => {
+            const base64Data = img.indexOf('base64,') !== -1 ? img.split('base64,')[1] : img;
+            parts.push({
+              inline_data: {
+                mime_type: 'image/jpeg',
+                data: base64Data
+              }
+            });
+          });
+        }
+        return { role: m.role === 'assistant' ? 'model' : m.role, parts };
+      });
+      const systemMsg = messages.find(m => m.role === 'system');
+
+      const body: any = { contents: geminiMessages };
+      if (systemMsg) {
+        body.system_instruction = { parts: [{ text: systemMsg.content }] };
+      }
+      body.generationConfig = {
+        temperature: temperature || 0.1
+      };
+
+      // Use streamGenerateContent for live feedback
+      response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model || 'gemini-1.5-flash'}:streamGenerateContent?alt=sse&key=${geminiKey || config.geminiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal
+      });
+
+      if (!response.ok) throw new Error(`Gemini HTTP Error: ${response.status} ${await response.text()}`);
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('Gemini stream body is null');
+      const decoder = new TextDecoder();
+      let fullContent = '';
+      let streamBuffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        streamBuffer += decoder.decode(value, { stream: true });
+        const lines = streamBuffer.split('\n');
+        streamBuffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine || !trimmedLine.startsWith('data: ')) continue;
+
+          try {
+            const chunk = JSON.parse(trimmedLine.substring(6));
+            const part = chunk.candidates?.[0]?.content?.parts?.[0];
+
+            if (part?.text) {
+              fullContent += part.text;
+              safeSend('agent:stream', { token: part.text });
+              toolEmitter?.append(part.text);
+            }
+            if (part?.functionCall) {
+              const toolJson = `\n{"tool": "${part.functionCall.name}", ${JSON.stringify(part.functionCall.args || {}).slice(1)}`;
+              fullContent += toolJson;
+              safeSend('agent:stream', { token: toolJson });
+              toolEmitter?.append(toolJson);
+            }
+          } catch (e) {
+            // Skip parse errors
+          }
+        }
+      }
+      return fullContent;
+    } else if (provider === 'bedrock') {
+      // ── AWS Bedrock ─────────────────────────────────────────────────
+      // Use dynamic import since this is often bundled and require might be missing/aliased
+      const { BedrockRuntimeClient, InvokeModelCommand } = await import('@aws-sdk/client-bedrock-runtime');
+
+      const accessKeyId = bedrockAccessKey || process.env.AWS_ACCESS_KEY_ID;
+      const secretAccessKey = bedrockSecretKey || process.env.AWS_SECRET_ACCESS_KEY;
+
+      // Configure AWS SDK v3
+      const client = new BedrockRuntimeClient({
+        region: bedrockRegion || 'us-east-2',
+        ...(accessKeyId && secretAccessKey ? {
+          credentials: {
+            accessKeyId: accessKeyId as string,
+            secretAccessKey: secretAccessKey as string
+          }
+        } : {})
+      } as any);
+
+      // Convert messages to Bedrock format based on model type
+      let body: any;
+      const modelId = model || 'anthropic.claude-3-5-sonnet-20241022-v2:0';
+
+      if (modelId.startsWith('anthropic.claude')) {
+        // Claude format
+        const claudeMessages = messages.filter(m => m.role !== 'system').map(m => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: m.content
+        }));
+
+        const systemMessage = messages.find(m => m.role === 'system')?.content || '';
+
+        body = {
+          anthropic_version: 'bedrock-2023-05-31',
+          max_tokens: 4000,
+          temperature: temperature || 0.1,
+          messages: claudeMessages,
+          ...(systemMessage && { system: systemMessage })
+        };
+      } else if (modelId.startsWith('meta.llama')) {
+        // Llama format
+        let prompt = '';
+        for (const msg of messages) {
+          if (msg.role === 'system') {
+            prompt += `<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n${msg.content}<|eot_id|>`;
+          } else if (msg.role === 'user') {
+            prompt += `<|start_header_id|>user<|end_header_id|>\n${msg.content}<|eot_id|>`;
+          } else if (msg.role === 'assistant') {
+            prompt += `<|start_header_id|>assistant<|end_header_id|>\n${msg.content}<|eot_id|>`;
+          }
+        }
+        prompt += '<|start_header_id|>assistant<|end_header_id|>\n';
+
+        body = {
+          prompt: prompt,
+          max_gen_len: 4000,
+          temperature: temperature || 0.1
+        };
+      }
+
+      const command = new InvokeModelCommand({
+        modelId: modelId,
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify(body)
+      });
+
+      const bedrockResponse = await client.send(command);
+      const responseBody = JSON.parse(new TextDecoder().decode(bedrockResponse.body));
+
+      if (modelId.startsWith('anthropic.claude')) {
+        return responseBody.content?.[0]?.text || '';
+      } else if (modelId.startsWith('meta.llama')) {
+        return responseBody.generation || '';
+      }
+
+      return responseBody.completion || responseBody.text || '';
+    } else {
+      // ── Ollama — Streaming mode ─────────────────────────────────────
+      const formattedOllamaMessages = messages.map(m => {
+        if (m.images && m.images.length > 0) {
+          return {
+            ...m,
+            images: m.images.map((img: string) =>
+              img.includes('base64,') ? img.split('base64,')[1] : img
+            )
+          };
+        }
+        return m;
+      });
+
+      response = await fetch(OLLAMA_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: model || MODEL_NAME,
+          messages: formattedOllamaMessages,
+          stream: true,
+          options: {
+            temperature: temperature || 0,
+            num_ctx: 32768,   // CRITICAL: default is often 2048 — far too small
+            repeat_penalty: 1.1
+          }
+        }),
+        signal
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Ollama HTTP Error: ${response.status} - ${errorText}`);
+      }
+
+      // Read the NDJSON stream and accumulate content
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('Ollama stream body is null');
+      const decoder = new TextDecoder();
+      let fullContent = '';
+      let streamBuffer = '';
+      let lastToken = ''; // Track last token to detect stuck/doubling models
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        streamBuffer += decoder.decode(value, { stream: true });
+        const lines = streamBuffer.split('\n');
+        streamBuffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const chunk = JSON.parse(line);
+            const content = chunk.message?.content || '';
+            const reasoning = chunk.message?.reasoning_content || '';
+
+            if (reasoning) {
+              const formattedReasoning = `[THOUGHT] ${reasoning} [/THOUGHT] `;
+              fullContent += formattedReasoning;
+              safeSend('agent:stream', { token: formattedReasoning });
+              toolEmitter?.append(formattedReasoning);
+            }
+
+            if (content) {
+              // Deduplicate: if this token is identical to the last one, skip it
+              // This handles quantized models that occasionally emit the same token twice in a row
+              if (content === lastToken) {
+                lastToken = '';
+                continue;
+              }
+              lastToken = content;
+              fullContent += content;
+              safeSend('agent:stream', { token: content });
+              toolEmitter?.append(content);
+            }
+
+            // Handle native tool calls (Ollama/DeepSeek native format support)
+            if (chunk.message?.tool_calls && Array.isArray(chunk.message.tool_calls)) {
+              for (const tc of chunk.message.tool_calls) {
+                if (tc.function) {
+                  const toolJson = `\n{"tool": "${tc.function.name}", ${JSON.stringify(tc.function.arguments || {}).slice(1)}`;
+                  fullContent += toolJson;
+                  safeSend('agent:stream', { token: toolJson });
+                  toolEmitter?.append(toolJson);
+                }
+              }
+            }
+
+            if (chunk.done) break;
+          } catch { /* skip malformed lines */ }
+        }
+      }
+      return fullContent;
+    }
+  } catch (error: any) {
+    if (error.name === 'AbortError') throw new Error('Task stopped by user');
+    console.error("AI Provider Error:", error);
+    throw error;
+  }
+}
+
+async function callSimpleAI(prompt: string, options?: { json?: boolean }): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+
+  try {
+    const res = await fetch(OLLAMA_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL_NAME,
+        messages: [{ role: 'user', content: prompt }],
+        stream: false,
+        ...(options?.json ? { format: 'json' } : {})
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) throw new Error(`Ollama HTTP Error: ${res.status}`);
+    const data = await res.json() as any;
+    return data.message?.content || '';
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      console.error("[SIMPLE_AI] Timeout: Simple AI request took too long (>60s)");
+    } else {
+      console.error("[SIMPLE_AI] Error:", error);
+    }
+    return "";
+  }
+}
+
+const toolWords = [
+  'read_file', 'write_file', 'edit_file', 'replace_file_content', 'multi_replace_file_content',
+  'list_directory', 'search_files', 'run_command', 'check_processes', 'command_status',
+  'send_command_input', 'create_directory', 'delete_file', 'replace_lines', 'insert_code',
+  'apply_diffs', 'validate_project', 'run_tests', 'get_blast_radius', 'semantic_search',
+  'readCode', 'editCode', 'getDiagnostics', 'grepSearch', 'fileSearch',
+  'readMultipleFiles', 'semanticRename', 'smartRelocate', 'strReplace',
+  'invokeSubAgent', 'listSubAgents', 'browser_subagent', 'webFetch', 'web_search',
+  'mcp_call', 'createSpec', 'readSpec', 'updateSpec', 'listSpecs', 'completeTask', 'learn_fact'
+];
+
+const findJsonBlocksDetailed = (text: string) => {
+  const blocks: { text: string; start: number; end: number }[] = [];
+  let start = -1;
+  let balance = 0;
+  let inQuote = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === '"' && text[i - 1] !== '\\') {
+      inQuote = !inQuote;
+    }
+    if (!inQuote) {
+      if (char === '{') {
+        if (balance === 0) start = i;
+        balance++;
+      } else if (char === '}') {
+        balance--;
+        if (balance === 0 && start !== -1) {
+          blocks.push({ text: text.substring(start, i + 1), start, end: i + 1 });
+          start = -1;
+        }
+      }
+    }
+  }
+  return blocks;
+};
+
+class LiveToolEmitter {
+  private buffer = '';
+  private processedBlocks = new Set<string>();
+  private onTool: (tool: any) => void;
+
+  constructor(onTool: (tool: any) => void) {
+    this.onTool = onTool;
+  }
+
+  append(token: string) {
+    this.buffer += token;
+    this.process();
+  }
+
+  private process() {
+    // We only process if we see at least one tool signature
+    if (!this.buffer.includes('"tool"')) return;
+
+    const blocks = findJsonBlocksDetailed(this.buffer);
+    for (const blockData of blocks) {
+      const block = blockData.text;
+      // Use the stable start position as the unique ID for this block in the stream
+      const blockId = `${blockData.start}-${block.length}`;
+      if (!this.processedBlocks.has(blockId)) {
+        try {
+          // Attempt to parse the block
+          const parsed = JSON.parse(block);
+          if (parsed && parsed.tool) {
+            this.processedBlocks.add(blockId);
+            this.onTool(parsed);
+          }
+        } catch (e) {
+          // JSON block might be incomplete if it's currently being streamed but balancer found a closing brace (e.g. nested objects)
+        }
+      }
+    }
+  }
+}
+
+function tryParseAllToolCalls(response: string): any[] {
+  if (!response) return [];
+  const trimmed = response.trim();
+  const toolCalls: any[] = [];
+
+  console.log(`[TOOL_PARSER_START] Input: "${trimmed.substring(0, 100)}..."`);
+
+  const blocks = findJsonBlocksDetailed(trimmed);
+
+  for (const blockData of blocks) {
+    const block = blockData.text;
+    try {
+      const attemptParse = (text: string): any[] | null => {
+        try {
+          const p = JSON.parse(text);
+
+          // Case 1: Standard single tool call: { "tool": "..." }
+          if (p.tool) return [p];
+
+          // Case 2: Array of tool calls: [{ "tool": "..." }, ...]
+          if (Array.isArray(p) && p.length > 0 && p[0].tool) {
+            return p.filter((t: any) => t.tool);
+          }
+
+          // Case 3: Format from some OpenAI proxies: { "tool_calls": [...] }
+          if (p.tool_calls && Array.isArray(p.tool_calls)) {
+            return p.tool_calls.filter((t: any) => t.tool);
+          }
+
+          // Case 4: DeepSeek Fallback: detect tool name from surrounding context
+          const contextText = response.substring(Math.max(0, blockData.start - 120), blockData.start);
+          const dsMatch = contextText.match(/tool_sep\s*[\|>]\s*>\s*(\w+)/) || contextText.match(/<\|tool_sep\|>\s*(\w+)/);
+          if (dsMatch && toolWords.includes(dsMatch[1])) {
+            p.tool = dsMatch[1];
+            return [p];
+          }
+
+          // Case 5: Scan for tool name in proximity
+          let bestTool = '';
+          let lastToolIdx = -1;
+          for (const word of toolWords) {
+            const idx = contextText.lastIndexOf(word);
+            if (idx > lastToolIdx) {
+              bestTool = word;
+              lastToolIdx = idx;
+            }
+          }
+          if (bestTool) {
+            p.tool = bestTool;
+            return [p];
+          }
+
+          return null;
+        } catch {
+          return null;
+        }
+      };
+
+      // 1. Try straight parse
+      let results = attemptParse(block);
+      if (results) {
+        toolCalls.push(...results);
+        continue;
+      }
+
+      // 2. Proactive JSON Fixer (Ultimate fix for smaller models/Ollama)
+      let currentTry = block;
+
+      // Fix unescaped quotes in known params
+      currentTry = currentTry.replace(/"(content|command|search|replace|path|cwd|reasoning|template)"\s*:\s*"([\s\S]*?)"(?=\s*[,}\]])/g, (_, key, val) => {
+        const escapedVal = val.replace(/(?<!\\)"/g, '\\"');
+        return `"${key}": "${escapedVal}"`;
+      });
+
+      // Fix unescaped backslashes (Windows paths)
+      currentTry = currentTry.replace(/"(path|cwd|cwd_override)"\s*:\s*"([\s\S]*?)"/g, (_, key, val) => {
+        const escapedVal = val.replace(/\\(?![\\\/bfnrtu"'])/g, '\\\\');
+        return `"${key}": "${escapedVal}"`;
+      });
+
+      // Clear out illegal control characters inside strings
+      currentTry = currentTry.replace(/[\x00-\x1F\x7F-\x9F]/g, " ");
+
+      results = attemptParse(currentTry);
+      if (results) {
+        toolCalls.push(...results);
+        continue;
+      }
+
+      const superFixed = currentTry.replace(/\\+"/g, '\\"');
+      results = attemptParse(superFixed);
+      if (results) {
+        toolCalls.push(...results);
+      }
+
+    } catch (err) {
+      console.warn(`[TOOL] Block exploration failed for: ${block.substring(0, 30)}...`, err);
+    }
+  }
+
+  // Regex fallback ONLY if no blocks found
+  if (toolCalls.length === 0) {
+    const toolMatch = /"tool"\s*:\s*"([^"]+)"/.exec(trimmed);
+    if (toolMatch) {
+      const tool = toolMatch[1];
+      const pathMatch = /"path"\s*:\s*"([^"]+)"/.exec(trimmed);
+      const commandMatch = /"command"\s*:\s*"([\s\S]*?)"(?=\s*[,}])/.exec(trimmed);
+      if (tool === 'run_command' && commandMatch) toolCalls.push({ tool, command: commandMatch[1].replace(/\\"/g, '"') });
+      else if (tool === 'read_file' && pathMatch) toolCalls.push({ tool, path: pathMatch[1] });
+    }
+  }
+
+  return toolCalls;
+}
+
+
+// Deprecated — use tryParseAllToolCalls
+function tryParseToolCall(response: string): any | null {
+  const all = tryParseAllToolCalls(response);
+  return all.length > 0 ? all[0] : null;
+}
+
+// ====== TOOL EXECUTOR ======
+
+
+// ====== TOOL EXECUTOR ======
+
+// Patterns considered destructive — blocked in autopilot mode
+const DANGEROUS_COMMAND_PATTERNS = [
+  /rm\s+-rf?\s+[\/~C-Z:\\]/i,
+  /del\s+\/[sf]/i,
+  /rmdir\s+\/s/i,
+  /format\s+[a-z]:/i,
+  /rd\s+\/s/i,
+  /DROP\s+TABLE/i,
+  /DROP\s+DATABASE/i,
+  /:\s*\(\s*\)\s*\{.*fork bomb/i,
+];
+
+// Individual tool execution timeouts (ms)
+const TOOL_TIMEOUTS: Record<string, number> = {
+  'run_command': 300000,      // 5 minutes (hard limit)
+  'browser_subagent': 300000, // 5 minutes
+  'semantic_search': 120000,  // 2 minutes
+  'mcp_call': 120000,         // 2 minutes
+  'indexing_workspace': 180000, // 3 minutes
+  'default': 60000            // 1 minute (default for read/write/edit)
+};
+
+async function executeToolCall(toolData: any, workspacePath: string | null, iteration?: number, isAutopilotMode: boolean = false, model?: { provider: string, model: string, openaiKey?: string, geminiKey?: string, bedrockRegion?: string, bedrockAccessKey?: string, bedrockSecretKey?: string }, config?: any): Promise<{ result: string; logs?: string[]; abort?: boolean; data?: any }> {
+  let resolvedPath = toolData.path ? resolvePath(toolData.path, workspacePath, toolData.cwd) : '';
+
+  // ── INTELLIGENT PATH RECOVERY ──────────────────────────────────────────
+  // If the path was resolved but doesn't exist, try to find it in the workspace
+  if (resolvedPath && workspacePath && toolData.tool !== 'run_command') {
+    try {
+      // Check if it exists natively
+      await fs.access(resolvedPath);
+    } catch {
+      // Not found, try fuzzy fallback for a 100% filename match
+      const filename = toolData.path.split(/[\\/]/).pop();
+      if (filename) {
+        try {
+          const matches = await fuzzyFindFile(workspacePath, filename, 1, true);
+          if (matches && matches.length > 0 && matches[0].score === 100) {
+            console.log(`[RECOVERY] File not found at ${resolvedPath}, but exact match found at ${matches[0].fullPath}. Using recovered path.`);
+            resolvedPath = matches[0].fullPath;
+          }
+        } catch (e) { /* ignore recovery errors */ }
+      }
+    }
+  }
+
+  console.log(`\n[TOOL] [${toolData.tool}] ${resolvedPath || toolData.command || toolData.pattern || ''}`);
+
+  // ── TOOL RESULT CACHING ──────────────────────────────────────────────
+  // Check cache first for cacheable tools
+  if (toolResultCache) {
+    const cacheMetadata = {
+      workspacePath,
+      filePath: resolvedPath || undefined,
+      iteration,
+      timestamp: new Date()
+    };
+
+    const cachedResult = await toolResultCache.get(toolData.tool, toolData, cacheMetadata);
+    if (cachedResult) {
+      console.log(`[CACHE] Using cached result for ${toolData.tool}`);
+      return { result: cachedResult };
+    }
+  }
+
+  const requestApproval = async (summary: string) => {
+    if (isAutopilotMode) return true;
+    console.log(`[APPROVAL] Requesting permission for: ${summary}`);
+
+    const requestId = `${toolData.tool}_${++permissionRequestCounter}`;
+    const PERMISSION_TIMEOUT_MS = 60000; // 60 second timeout
+
+    safeSend('agent:step', {
+      tool: toolData.tool,
+      status: 'awaiting_permission',
+      summary,
+      iteration: iteration,
+      requestId: requestId
+    });
+
+    try {
+      const decision = await new Promise<{ approved: boolean }>((resolve, reject) => {
+        const timeoutHandle = setTimeout(() => {
+          pendingPermissionResolvers.delete(requestId);
+          reject(new Error(`Permission request timed out after ${PERMISSION_TIMEOUT_MS}ms`));
+        }, PERMISSION_TIMEOUT_MS);
+
+        pendingPermissionResolvers.set(requestId, (result) => {
+          clearTimeout(timeoutHandle);
+          resolve(result);
+        });
+      });
+
+      pendingPermissionResolvers.delete(requestId);
+      console.log(`[APPROVAL] Decision received: ${decision.approved}`);
+      return decision.approved;
+    } catch (error) {
+      console.warn(`[APPROVAL] Permission request failed: ${error}`);
+      pendingPermissionResolvers.delete(requestId);
+      // Default to false on timeout
+      return false;
+    }
+  };
+
+  // Fire preToolUse hooks
+  if (hooksManager) {
+    try {
+      const preHooks = await hooksManager.triggerToolEvent('preToolUse', toolData.tool);
+      for (const hook of preHooks) {
+        if (hook.action === 'runCommand' && hook.command) {
+          console.log(`[HOOK] preToolUse → runCommand: ${hook.command}`);
+          await execAsync(hook.command, { cwd: workspacePath || '.', timeout: (hook.timeout || 30) * 1000 }).catch(e => {
+            console.warn(`[HOOK] preToolUse command failed: ${e.message}`);
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('[HOOK] preToolUse error:', e);
+    }
+  }
+
+  let toolResult: { result: string; logs?: string[]; abort?: boolean; data?: any };
+
+  const toolTimeout = TOOL_TIMEOUTS[toolData.tool] || TOOL_TIMEOUTS['default'];
+  let timeoutHappened = false;
+
+  // Monitor for long running actions (warning at 75% of timeout)
+  const monitorTimeout = setTimeout(() => {
+    if (!timeoutHappened) {
+      console.log(`[TIMEOUT] Warning: ${toolData.tool} taking longer than usual... (${toolTimeout * 0.75 / 1000}s elapsed)`);
+      safeSend('agent:step', {
+        tool: toolData.tool,
+        status: 'running',
+        summary: `⚠️ Action taking longer than usual: ${toolData.tool}`,
+        logs: [`Current execution time exceeds ${toolTimeout * 0.75 / 1000}s`, `Hard limit: ${toolTimeout / 1000}s`],
+        iteration: iteration
+      });
+    }
+  }, toolTimeout * 0.75);
+
+  try {
+    const performAction = async (): Promise<{ result: string; logs?: string[]; abort?: boolean; data?: any }> => {
+      switch (toolData.tool) {
+        case 'read_file': {
+          console.log(`[READ_FILE] Starting read_file for: ${toolData.path}`);
+          if (!toolData.path) return { result: '❌ Error: Tool "read_file" requires a "path" parameter.' };
+
+          try {
+            console.log(`[READ_FILE] Checking file access for: ${resolvedPath}`);
+            // Check if file exists first (with timeout)
+            try {
+              await Promise.race([
+                fs.access(resolvedPath),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('File access check timed out')), 2000))
+              ]);
+              console.log(`[READ_FILE] File access check passed`);
+            } catch (error) {
+              console.log(`[READ_FILE] File access check failed: ${error}`);
+              let errorMessage = `❌ Error: File not found or inaccessible: ${toolData.path}\nResolved path: ${resolvedPath}`;
+
+              // Helpful fallback: Fuzzy search if the agent guessed the path slightly wrong
+              const filename = toolData.path.split(/[\\/]/).pop();
+              if (filename && workspacePath) {
+                try {
+                  const suggestions = await fuzzyFindFile(workspacePath, filename, 3);
+                  if (suggestions && !suggestions.includes('No matches found')) {
+                    errorMessage += `\n\nDid you mean one of these existing files?\n${suggestions}`;
+                  } else {
+                    errorMessage += `\n\nUse 'list_directory' or 'search_files' to find the correct path.`;
+                  }
+                } catch (fuzzyErr) {
+                  errorMessage += `\n\nUse 'list_directory' to find files.`;
+                }
+              }
+              return { result: errorMessage };
+            }
+
+            console.log(`[READ_FILE] Checking if binary`);
+            const isBinary = await isBinaryFile(resolvedPath);
+            if (isBinary) {
+              console.log(`[READ_FILE] File is binary`);
+              return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
+            }
+            console.log(`[READ_FILE] Reading file content`);
+            const content = await fs.readFile(resolvedPath, 'utf-8');
+            const lines = content.split('\n');
+            console.log(`[READ_FILE] Successfully read ${lines.length} lines`);
+            // Add line numbers for context
+            return { result: lines.map((line, i) => `${i + 1}: ${line}`).join('\n') };
+          } catch (error) {
+            console.log(`[READ_FILE] Error: ${error}`);
+            return { result: `❌ Error reading file ${toolData.path}: ${error instanceof Error ? error.message : String(error)}` };
+          }
+        }
+
+        case 'write_file': {
+          if (!toolData.path) {
+            return { result: '❌ Error: Tool "write_file" requires a "path" parameter.' };
+          }
+
+          const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
+          const blastWarning = blastRadius.length > 0
+            ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
+            : '';
+
+          // Request approval
+          if (!(await requestApproval(`Write file: ${toolData.path}${blastWarning}`))) {
+            return { result: '❌ File write denied by user.', abort: true };
+          }
+
+          // Ensure parent directory exists
+          const dir = dirname(resolvedPath);
+          await fs.mkdir(dir, { recursive: true });
+          await fs.writeFile(resolvedPath, toolData.content, 'utf-8');
+          // Notify renderer of file change
+          safeSend('file:changed', { path: resolvedPath, content: toolData.content });
+          const lineCount = toolData.content.split('\n').length;
+
+          // Update graph automatically
+          if (graphService) graphService.updateFile(resolvedPath);
+
+          // Manifest update is handled automatically by workspace watcher
+
+          // NOTE: Auto-diagnostics removed — too slow (5-15s per write with tsc).
+          // The agent can explicitly call getDiagnostics when needed.
+          return { result: `✅ Successfully wrote ${lineCount} lines to ${toolData.path}` };
+        }
+
+        case 'edit_file': {
+          if (!toolData.path) return { result: '❌ Error: Tool "edit_file" requires a "path" parameter.' };
+          if (!toolData.edits) return { result: '❌ Error: Tool "edit_file" requires an "edits" parameter.' };
+
+          const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
+          const blastWarning = blastRadius.length > 0
+            ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
+            : '';
+
+          // Request approval
+          if (!(await requestApproval(`Edit file: ${toolData.path} (${toolData.edits?.length || 0} edits)${blastWarning}`))) {
+            return { result: '❌ File edit denied by user.', abort: true };
+          }
+
+          let content = await fs.readFile(resolvedPath, 'utf-8');
+          const edits = toolData.edits || [];
+          let editCount = 0;
+
+          for (const edit of edits) {
+            // Check for exact match
+            if (content.includes(edit.search)) {
+              content = content.replace(edit.search, edit.replace);
+              editCount++;
+            } else {
+              // Provide helpful feedback for nearly-matching strings
+              const searchTrimmed = edit.search.trim();
+              const contentTrimmed = content.replace(/\s+/g, ' ');
+
+              if (contentTrimmed.includes(searchTrimmed.replace(/\s+/g, ' '))) {
+                return {
+                  result: `❌ edit_file failed for ${toolData.path}: The search string exists but whitespace/indentation did not match exactly. 
+Please 'read_file' again to get the EXACT indentation or use the 'write_file' tool to overwrite the file if the edit is complex.
+Searched for: "${edit.search.substring(0, 50)}..."`
+                };
+              } else {
+                return { result: `❌ edit_file failed: could not find the following code block in ${toolData.path}:\n\n${edit.search}\n\nMake sure you have the latest content via 'read_file'.` };
+              }
+            }
+          }
+          await fs.writeFile(resolvedPath, content, 'utf-8');
+          // Notify renderer of file change
+          safeSend('file:changed', { path: resolvedPath, content });
+
+          // Update graph automatically
+          if (graphService) graphService.updateFile(resolvedPath);
+
+          // Manifest update is handled by the workspace watcher asynchronously
+
+          // NOTE: Auto-diagnostics removed — too slow (5-15s per edit with tsc).
+          // The agent can explicitly call getDiagnostics when needed.
+          return {
+            result: `✅ Applied ${editCount} edit(s) to ${toolData.path}`,
+            data: { path: toolData.path, edits: toolData.edits }
+          };
+        }
+
+        case 'replace_file_content': {
+          if (!toolData.path) return { result: '❌ Error: Tool "replace_file_content" requires a "path" parameter.' };
+          if (toolData.startLine === undefined || toolData.endLine === undefined) return { result: '❌ Error: "startLine" and "endLine" parameters required.' };
+          if (toolData.targetContent === undefined) return { result: '❌ Error: "targetContent" parameter required.' };
+          if (toolData.replacementContent === undefined) return { result: '❌ Error: "replacementContent" parameter required.' };
+
+          if (!(await requestApproval(`Replace lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}`))) {
+            return { result: '❌ File edit denied by user.', abort: true };
+          }
+
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+            let lines = content.split('\n');
+            const startIdx = Math.max(0, toolData.startLine - 1);
+            const endIdx = Math.min(lines.length, toolData.endLine);
+
+            let chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
+            if (chunkToReplace !== toolData.targetContent) {
+              return { result: `❌ targetContent does not match exactly the lines from ${toolData.startLine} to ${toolData.endLine} in ${toolData.path}. Make sure whitespace and indentation perfectly match.` };
+            }
+
+            const newLines = [
+              ...lines.slice(0, startIdx),
+              toolData.replacementContent,
+              ...lines.slice(endIdx)
+            ];
+            await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
+            // Notify renderer of file change
+            safeSend('file:changed', { path: resolvedPath, content: newLines.join('\n') });
+
+            // Manifest refresh handled by workspace watcher
+
+            return { result: `✅ Successfully replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
+          } catch (e: any) {
+            return { result: `❌ replace_file_content failed: ${e.message}` };
+          }
+        }
+
+        case 'multi_replace_file_content': {
+          if (!toolData.path) return { result: '❌ Error: Tool "multi_replace_file_content" requires a "path" parameter.' };
+          if (!toolData.replacements || !Array.isArray(toolData.replacements)) return { result: '❌ Error: "replacements" array required.' };
+
+          if (!(await requestApproval(`Apply ${toolData.replacements.length} replacements in ${toolData.path}`))) {
+            return { result: '❌ File edit denied by user.', abort: true };
+          }
+
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+            let lines = content.split('\n');
+
+            // Process from bottom to top so line numbering isn't messed up for earlier chunks
+            const sortedReplacements = [...toolData.replacements].sort((a: any, b: any) => b.startLine - a.startLine);
+
+            for (const rep of sortedReplacements) {
+              const startIdx = Math.max(0, rep.startLine - 1);
+              const endIdx = Math.min(lines.length, rep.endLine);
+              const chunkToReplace = lines.slice(startIdx, endIdx).join('\n');
+              if (chunkToReplace !== rep.targetContent) {
+                return { result: `❌ replacement at lines ${rep.startLine}-${rep.endLine} failed. Target content did not match exactly: \\n"${chunkToReplace.substring(0, 50)}..." vs "${rep.targetContent.substring(0, 50)}...".\\nAborting all remaining replacements.` };
+              }
+              const replacementLines = rep.replacementContent.split('\\n');
+              lines = [
+                ...lines.slice(0, startIdx),
+                ...replacementLines,
+                ...lines.slice(endIdx)
+              ];
+            }
+            await fs.writeFile(resolvedPath, lines.join('\n'), 'utf-8');
+            // Notify renderer of file change
+            safeSend('file:changed', { path: resolvedPath, content: lines.join('\n') });
+
+            // Manifest refresh handled by workspace watcher
+
+            return { result: `✅ Successfully applied ${toolData.replacements.length} non-adjacent replacements to ${toolData.path}` };
+          } catch (e: any) {
+            return { result: `❌ multi_replace_file_content failed: ${e.message}` };
+          }
+        }
+
+        case 'list_directory': {
+          return { result: await listDirectory(resolvedPath || workspacePath || '.') };
+        }
+
+        case 'search_files': {
+          const searchRoot = workspacePath || '.';
+          return { result: await searchFiles(searchRoot, toolData.pattern, toolData.include) };
+        }
+
+        case 'run_command': {
+          if (!toolData.command) return { result: '❌ Error: Tool "run_command" requires a "command" parameter.' };
+          const command = toolData.command;
+
+          // Intercept "cd ... &&" patterns — they are often signs of the agent ignoring the "cwd" parameter
+          const cdMatch = command.match(/^"?cd\s+([^&"|;]+)"?\s*(&&|;|\|)/i);
+          if (cdMatch) {
+            const targetDir = cdMatch[1].trim();
+            return {
+              result: `❌ ERROR: Use the "cwd" parameter instead of "cd" within the command string.\n` +
+                `Your command tried to 'cd' into: ${targetDir}\n` +
+                `Please resubmit using: {"tool": "run_command", "command": "${command.replace(cdMatch[0], '').trim()}", "cwd": "${targetDir}"}`
+            };
+          }
+
+          // Intercept bare "cd" commands
+          if (/^"?cd\s+/i.test(command.trim()) && !command.includes('&&') && !command.includes(';')) {
+            return {
+              result: `❌ ERROR: "cd" has no effect as a standalone command — each run_command spawns a fresh shell.\n` +
+                `Use the "cwd" parameter instead to set the working directory.\n` +
+                `Example: {"tool": "run_command", "command": "npm install", "cwd": "${command.replace(/^"?cd\s+/i, '').replace(/"/g, '').trim()}"}`
+            };
+          }
+
+          // Autopilot safety: block dangerous/destructive commands
+          if (isAutopilotMode) {
+            const isDangerous = DANGEROUS_COMMAND_PATTERNS.some(p => p.test(command));
+            if (isDangerous) {
+              console.warn(`[AUTOPILOT SAFETY] Blocked destructive command: ${command}`);
+              return {
+                result: `❌ Autopilot safety blocked this command as potentially destructive: ${command}\nRequires manual approval.`,
+                abort: true
+              };
+            }
+          }
+
+          // Support optional cwd parameter for running commands in subdirectories
+          // Resolve cwd: if agent gives an absolute path, use it directly; otherwise join with workspace
+          const rawCwd = toolData.cwd || '';
+          const isAbsoluteCwd = /^[A-Za-z]:[\\/]/.test(rawCwd) || rawCwd.startsWith('/');
+          const commandCwd = rawCwd
+            ? (isAbsoluteCwd ? rawCwd : join(workspacePath!, rawCwd))
+            : workspacePath;
+
+          // Request approval
+          if (!(await requestApproval(`Execute: ${command}${toolData.cwd ? ` (in ${toolData.cwd})` : ''}`))) {
+            return { result: '❌ Command denied by user.', abort: true };
+          }
+
+          const logs: string[] = [];
+
+          // Check for running instances before starting development servers
+          if (workspacePath && isDevServerCommand(command)) {
+            const processManager = new ProcessManager(workspacePath);
+            const checkResult = await processManager.checkForRunningInstances(workspacePath);
+
+            if (checkResult.hasRunningInstances) {
+              const summary = formatProcessCheckResult(checkResult);
+
+              // Request approval to stop existing processes
+              const stopApproval = await requestApproval(
+                `Found running instances that may conflict:\n${summary}\n\nStop these processes before starting new one?`
+              );
+
+              if (stopApproval) {
+                const stopResult = await processManager.stopProcesses(checkResult.processes);
+                logs.push(`Stopped ${stopResult.stopped} processes, ${stopResult.failed} failed`);
+                if (stopResult.errors.length > 0) {
+                  logs.push(`Errors: ${stopResult.errors.join(', ')}`);
+                }
+              } else {
+                logs.push('⚠️ Warning: Proceeding with existing processes running - may cause port conflicts');
+              }
+            }
+          }
+
+          // Transition to running if approved
+          safeSend('agent:step', {
+            tool: 'run_command',
+            status: 'running',
+            summary: `Executing: ${command}${toolData.cwd ? ` (in ${toolData.cwd})` : ''}`,
+            logs: logs,
+            iteration: iteration
+          });
+
+          try {
+            // Note: Don't write command to terminal here - the shell will echo it automatically
+            // Writing it here causes duplication since the shell echoes the command anyway
+
+            // Pre-check for directory creation commands (common source of "Operation cancelled" if dir exists)
+            if ((command.includes('create-vite') || command.includes('create vite')) && command.includes('--template')) {
+              // Try to find the project name - usually the first non-flag argument after create-vite
+              const parts = command.split(' ').filter((p: string) => p.trim());
+              let targetDirName = '';
+              for (let i = 0; i < parts.length; i++) {
+                if (parts[i].includes('create-vite') || (parts[i] === 'create' && parts[i + 1] === 'vite')) {
+                  // Skip the next part if it was 'vite'
+                  const nextIdx = parts[i] === 'create' ? i + 2 : i + 1;
+                  // Find next non-flag argument
+                  for (let j = nextIdx; j < parts.length; j++) {
+                    if (!parts[j].startsWith('-')) {
+                      targetDirName = parts[j];
+                      break;
+                    }
+                  }
+                  break;
+                }
+              }
+
+              if (targetDirName) {
+                const fullTargetDir = isAbsolute(targetDirName) ? targetDirName : join(commandCwd!, targetDirName);
+                try {
+                  await fs.access(fullTargetDir);
+                  const files = await fs.readdir(fullTargetDir);
+                  if (files.length > 0) {
+                    logs.push(`âš ï¸ Warning: Target directory is not empty: ${targetDirName}`);
+                    logs.push(`âš ï¸ This will likely cause an "Operation cancelled" error if not handled.`);
+                  }
+                } catch {
+                  // Directory doesn't exist, perfect
+                }
+              }
+            }
+
+            const fullOutput = await new Promise<string>((resolve, reject) => {
+              const isBackground = !!toolData.is_background;
+              const cmdId = toolData.bg_id || Math.random().toString(36).substring(7);
+
+              // Spawn with CI=1 if strictly non-interactive, but if it is background interactive, allow some color and standard mode
+              const spawnEnv = isBackground
+                ? { ...process.env, FORCE_COLOR: '1' }
+                : { ...process.env, CI: '1', NO_COLOR: '1', FORCE_COLOR: '0' };
+
+              const child = spawn(command, [], { cwd: commandCwd, shell: true, stdio: ['pipe', 'pipe', 'pipe'], env: spawnEnv });
+
+              if (!isBackground) {
+                child.stdin?.end();
+              }
+
+              const processState = { process: child, output: '', status: 'running', logs };
+              backgroundProcesses.set(cmdId, processState);
+
+              let isResolved = false;
+
+              if (isBackground) {
+                setTimeout(() => {
+                  if (!isResolved) {
+                    isResolved = true;
+                    resolve(`Command started in background with ID: ${cmdId}. Use command_status to check it, and send_command_input to interact.`);
+                  }
+                }, 1000);
+              }
+
+              const handleData = (data: any) => {
+                const str = data.toString();
+                processState.output += str;
+                if (terminalManager) {
+                  const terminals = terminalManager.getAllTerminals();
+                  if (terminals.length > 0) terminalManager.write(terminals[0].id, str);
+                }
+
+                const lines = str.split(/\r?\n/).filter((l: string) => l.trim().length > 0);
+                if (lines.length > 0) {
+                  logs.push(...lines);
+                  // Only keep last 100 lines for the UI to avoid lag
+                  if (logs.length > 100) logs.splice(0, logs.length - 100);
+
+                  safeSend('agent:step', {
+                    tool: 'run_command',
+                    status: 'running',
+                    summary: `Executing: ${command}`,
+                    logs: [...logs],
+                    iteration: iteration
+                  });
+
+                  // Early success detection: If it looks like a server started, 
+                  // return early so the agent doesn't stall.
+                  const successMarkers = [
+                    'ready in', 'started on', 'local:', 'network:',
+                    'listening on', 'compiled successfully', 'available at',
+                    'vitedevserver', 'server running', 'ready on', 'successfully compiled',
+                    'process started', 'server started', 'starting project at',
+                    'development server', 'starting compiler', 'starting the dev server',
+                    'running on', 'waiting for connections', 'listening at', 'metro waiting'
+                  ];
+                  const lowerStr = str.toLowerCase();
+                  if (successMarkers.some(marker => lowerStr.includes(marker))) {
+                    if (!isResolved) {
+                      setTimeout(() => { // Small delay to catch a few more lines
+                        if (isResolved) return;
+                        isResolved = true;
+                        clearTimeout(timeout);
+                        resolve(`${processState.output.trim()}\n\n[INFO]: Server/Process detected as READY and running in background.`);
+                      }, 1000);
+                    }
+                  }
+                }
+              };
+
+              child.stdout?.on('data', handleData);
+              child.stderr?.on('data', handleData);
+
+              // Safety timeout: Only kick in for truly stuck/infinite processes (10 min).
+              // Normal commands (npm install, npx create, etc.) must complete fully.
+              // Server processes are handled early via successMarkers above.
+              const timeout = setTimeout(() => {
+                if (isResolved) return;
+                isResolved = true;
+                const resultMsg = processState.output.trim() || '(No output yet)';
+                resolve(`${resultMsg}\n\n[INFO]: Command timed out after 10 minutes. It may still be running in background.`);
+              }, 600000); // 10 minute hard safety timeout
+
+              child.on('close', (code) => {
+                processState.status = 'exited';
+                if (isResolved) return;
+                clearTimeout(timeout);
+                isResolved = true;
+
+                const trimmedOutput = processState.output.trim();
+                if (code === 0) {
+                  // Some tools like create-vite exit with 0 even when cancelled/interrupted
+                  if (trimmedOutput.toLowerCase().includes('operation cancelled')) {
+                    resolve(`Error: Operation cancelled\n${trimmedOutput}`);
+                  } else {
+                    resolve(trimmedOutput || '(command completed with no output)');
+                  }
+                } else {
+                  resolve(`Command exited with code ${code}:\n${trimmedOutput}`);
+                }
+              });
+
+              child.on('error', (err) => {
+                processState.status = 'error';
+                if (isResolved) return;
+                clearTimeout(timeout);
+                isResolved = true;
+                reject(err);
+              });
+            });
+
+            if (abortRequested) return { result: '⚠️ Task stopped by user.', abort: true };
+
+            // Refresh manifest after command execution (might have created files/dirs like venv)
+            // Manifest refresh handled by workspace watcher
+
+            return { result: fullOutput, logs };
+          } catch (e: any) {
+            const errOutput = `Command failed: ${e.message}`.trim();
+            if (terminalManager) {
+              const terminals = terminalManager.getAllTerminals();
+              if (terminals.length > 0) terminalManager.write(terminals[0].id, errOutput + '\r\n');
+            }
+            return { result: errOutput, logs };
+          }
+        }
+
+        case 'check_processes': {
+          if (!workspacePath) return { result: '❌ Error: No workspace opened.' };
+
+          const processManager = new ProcessManager(workspacePath);
+          const checkResult = await processManager.checkForRunningInstances(workspacePath);
+
+          if (!checkResult.hasRunningInstances) {
+            return { result: '✅ No conflicting processes found.' };
+          }
+
+          const summary = formatProcessCheckResult(checkResult);
+          return {
+            result: `Found potentially conflicting processes:\n\n${summary}\n\nUse the run_command tool to start your development server - it will automatically handle these conflicts.`
+          };
+        }
+
+        case 'command_status': {
+          if (!toolData.CommandId) return { result: '❌ Error: Tool "command_status" requires a "CommandId" parameter.' };
+          const processState = backgroundProcesses.get(toolData.CommandId);
+          if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
+
+          let outputStr = processState.output;
+          if (toolData.OutputCharacterCount) {
+            outputStr = outputStr.slice(-Math.max(0, parseInt(toolData.OutputCharacterCount)));
+          }
+
+          return { result: `[Status: ${processState.status}]\n${outputStr}` };
+        }
+
+        case 'send_command_input': {
+          if (!toolData.CommandId) return { result: '❌ Error: Tool "send_command_input" requires a "CommandId" parameter.' };
+          if (!toolData.Input && !toolData.Terminate) return { result: '❌ Error: Requires "Input" or "Terminate".' };
+
+          const processState = backgroundProcesses.get(toolData.CommandId);
+          if (!processState) return { result: `❌ No background process found with ID: ${toolData.CommandId}` };
+
+          if (toolData.Terminate) {
+            processState.process.kill();
+            processState.status = 'terminated';
+            return { result: `✅ Terminated process ${toolData.CommandId}` };
+          }
+
+          try {
+            processState.process.stdin?.write(toolData.Input);
+
+            if (toolData.WaitMs) {
+              await new Promise(r => setTimeout(r, toolData.WaitMs));
+            } else {
+              await new Promise(r => setTimeout(r, 1000));
+            }
+
+            return { result: `✅ Input sent.\n[Status: ${processState.status}]\n${processState.output}` };
+          } catch (err: any) {
+            return { result: `❌ Error sending input: ${err.message}` };
+          }
+        }
+
+        case 'create_directory': {
+          await fs.mkdir(resolvedPath, { recursive: true });
+
+          // Manifest update is handled by the workspace watcher asynchronously
+
+          return { result: `✅ Created directory: ${toolData.path}` };
+        }
+
+        case 'delete_file': {
+          // Request approval if not in autopilot mode
+          if (!isAutopilotMode) {
+            const requestId = `delete_file_${++permissionRequestCounter}`;
+
+            safeSend('agent:step', {
+              tool: 'delete_file',
+              status: 'awaiting_permission',
+              summary: `Delete file: ${toolData.path}`,
+              iteration: iteration,
+              requestId: requestId
+            });
+
+            const decision = await new Promise<{ approved: boolean }>(resolve => {
+              pendingPermissionResolvers.set(requestId, resolve);
+            });
+            pendingPermissionResolvers.delete(requestId);
+
+            if (!decision.approved) {
+              return { result: '❌ File deletion denied by user.', abort: true };
+            }
+          }
+
+          await fs.unlink(resolvedPath);
+
+          // Manifest update is handled by the workspace watcher asynchronously
+
+          return { result: `✅ Deleted: ${toolData.path}` };
+        }
+
+        case 'replace_lines': {
+          const content = await fs.readFile(resolvedPath, 'utf-8');
+          const lines = content.split('\n');
+          const startIdx = Math.max(0, toolData.startLine - 1);
+          const endIdx = Math.min(lines.length, toolData.endLine);
+
+          const newLines = [
+            ...lines.slice(0, startIdx),
+            toolData.content,
+            ...lines.slice(endIdx)
+          ];
+
+          await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
+
+          // Manifest update is handled by the workspace watcher asynchronously
+
+          return { result: `✅ Replaced lines ${toolData.startLine}-${toolData.endLine} in ${toolData.path}` };
+        }
+
+        case 'insert_code': {
+          const content = await fs.readFile(resolvedPath, 'utf-8');
+          const lines = content.split('\n');
+          const insertIdx = Math.min(lines.length, toolData.line);
+
+          const newLines = [
+            ...lines.slice(0, insertIdx),
+            toolData.content,
+            ...lines.slice(insertIdx)
+          ];
+
+          await fs.writeFile(resolvedPath, newLines.join('\n'), 'utf-8');
+
+          // Manifest update is handled by the workspace watcher asynchronously
+
+          return { result: `✅ Inserted code after line ${toolData.line} in ${toolData.path}` };
+        }
+
+        case 'apply_diffs': {
+          const changes: FileChange[] = toolData.changes.map((c: any) => ({
+            path: resolvePath(c.path, workspacePath),
+            blocks: DiffService.parseDiffBlocks(c.diff)
+          }));
+
+          if (changes.some(c => c.blocks.length === 0)) {
+            return { result: '❌ Failed to parse one or more diff blocks. Ensure you use the exact format:\n<<<< SEARCH\n...\n====\n...\n>>>> REPLACE' };
+          }
+
+          const result = await diffService.applyTransaction(changes);
+          if (result.success) {
+            // Refresh manifest after applying diffs
+            // Manifest refresh handled by workspace watcher
+            return {
+              result: `✅ Successfully applied diffs to ${result.appliedCount} files.`,
+              data: { changes: toolData.changes }
+            };
+          } else {
+            return { result: `❌ Diff transaction failed: ${result.error}. No changes were saved (auto-rollback successful).` };
+          }
+        }
+
+        case 'validate_project': {
+          const cwd = workspacePath || process.cwd();
+          try {
+            // Check for tsconfig.json to see if we should run tsc
+            await fs.access(join(cwd, 'tsconfig.json'));
+            const { stdout } = await execAsync('npx tsc --noEmit', { cwd });
+            return { result: `Validation (tsc) passed! No type errors found.\n${stdout}` };
+          } catch (e: any) {
+            if (e.code === 'ENOENT') return { result: 'No tsconfig.json found. Skipping tsc validation.' };
+            return { result: `Validation failed with errors:\n${e.stdout || ''}\n${e.stderr || ''}` };
+          }
+        }
+
+        case 'run_tests': {
+          const cwd = workspacePath || process.cwd();
+          try {
+            const { stdout } = await execAsync('npm test', { cwd });
+            return { result: `Tests passed!\n${stdout}` };
+          } catch (e: any) {
+            return { result: `Tests failed:\n${e.stdout || ''}\n${e.stderr || ''}` };
+          }
+        }
+
+        case 'get_blast_radius': {
+          if (!graphService) return { result: '❌ Code graph not initialized.' };
+          const resolved = resolvePath(toolData.path, workspacePath);
+          const affected = graphService.getBlastRadius(resolved);
+          if (affected.length === 0) return { result: `No external files depend on ${toolData.path}.` };
+          return { result: `Files affected by changing ${toolData.path}:\n` + affected.map(f => `- ${f.replace(workspacePath || '', '').replace(/^[\\/]/, '')}`).join('\n') };
+        }
+
+        case 'semantic_search': {
+          if (!indexingService) return { result: '❌ Indexing service not initialized.' };
+          const results = await indexingService.search(toolData.query);
+          if (results.length === 0) return { result: 'No relevant code found.' };
+          return { result: results.map((r: any) => `--- ${r.filePath}:${r.startLine}-${r.endLine} (Score: ${r._distance}) ---\n${r.content}`).join('\n\n') };
+        }
+
+        case 'readCode': {
+          if (!toolData.path) return { result: '❌ Error: Tool "readCode" requires a "path" parameter.' };
+          const resolvedPath = resolvePath(toolData.path, workspacePath);
+          const isBinary = await isBinaryFile(resolvedPath);
+          if (isBinary) return { result: `❌ Cannot read ${toolData.path}: This appears to be a binary file.` };
+
+          try {
+            const content = await fs.readFile(resolvedPath, 'utf-8');
+            // Parse AST to extract structure
+            const lines = content.split('\n');
+            const structure: { type: string; name: string; startLine: number; endLine: number }[] = [];
+
+            // Simple AST-like extraction for common patterns
+            const classRegex = /^export?\s*class\s+(\w+)/m;
+            const funcRegex = /^export?\s*(async\s+)?function\s+(\w+)/m;
+            const arrowRegex = /^export?\s*const\s+(\w+)\s*=\s*(async\s+)?\(/m;
+
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              const classMatch = line.match(classRegex);
+              if (classMatch) structure.push({ type: 'class', name: classMatch[1], startLine: i + 1, endLine: i + 1 });
+
+              const funcMatch = line.match(funcRegex);
+              if (funcMatch) structure.push({ type: 'function', name: funcMatch[2], startLine: i + 1, endLine: i + 1 });
+
+              const arrowMatch = line.match(arrowRegex);
+              if (arrowMatch) structure.push({ type: 'arrow', name: arrowMatch[1], startLine: i + 1, endLine: i + 1 });
+            }
+
+            return {
+              result: `File: ${toolData.path}\n\n${lines.map((line, i) => `${i + 1}: ${line}`).join('\n')}\n\n--- STRUCTURE ---\n${structure.map(s => `${s.type}: ${s.name} (lines ${s.startLine}-${s.endLine})`).join('\n')}`,
+              data: { structure }
+            };
+          } catch (e: any) {
+            let errorMessage = `❌ Error reading file: ${e.message}\nResolved path: ${resolvedPath}`;
+            const filename = toolData.path.split(/[\\/]/).pop();
+            if (filename && workspacePath) {
+              try {
+                const suggestions = await fuzzyFindFile(workspacePath, filename, 3);
+                if (suggestions && !suggestions.includes('No matches found')) {
+                  errorMessage += `\n\nDid you mean one of these existing files?\n${suggestions}`;
+                }
+              } catch (err) { }
+            }
+            return { result: errorMessage };
+          }
+        }
+
+        case 'editCode': {
+          if (!toolData.path) return { result: '❌ Error: Tool "editCode" requires a "path" parameter.' };
+          if (!toolData.search) return { result: '❌ Error: Tool "editCode" requires a "search" parameter.' };
+          if (!toolData.replace) return { result: '❌ Error: Tool "editCode" requires a "replace" parameter.' };
+
+          const resolvedPath = resolvePath(toolData.path, workspacePath);
+          const isBinary = await isBinaryFile(resolvedPath);
+          if (isBinary) return { result: `❌ Cannot edit ${toolData.path}: This appears to be a binary file.` };
+
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+
+            // Use AST-aware replacement if possible
+            const escapedSearch = toolData.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const searchRegex = new RegExp(`\\b${escapedSearch}\\b`, 'g');
+            if (searchRegex.test(content)) {
+              const newContent = content.replace(searchRegex, toolData.replace);
+              await fs.writeFile(resolvedPath, newContent, 'utf-8');
+              // Notify renderer of file change
+              safeSend('file:changed', { path: resolvedPath, content: newContent });
+              return {
+                result: `✅ Successfully replaced "${toolData.search}" with "${toolData.replace}" in ${toolData.path}`,
+                data: { path: toolData.path, search: toolData.search, replace: toolData.replace }
+              };
+            }
+
+            return { result: `❌ Could not find "${toolData.search}" in ${toolData.path}. Use readCode first to see the exact content.` };
+          } catch (e: any) {
+            return { result: `❌ Error editing file: ${e.message}` };
+          }
+        }
+
+        case 'getDiagnostics': {
+          if (!toolData.path) return { result: '❌ Error: Tool "getDiagnostics" requires a "path" parameter.' };
+          return { result: await getDiagnostics(toolData.path, workspacePath) };
+        }
+
+        case 'grepSearch': {
+          if (!toolData.pattern) return { result: '❌ Error: Tool "grepSearch" requires a "pattern" parameter.' };
+          const searchRoot = workspacePath || '.';
+          return { result: await grepSearch(searchRoot, toolData.pattern, toolData.include, toolData.maxResults || 50) };
+        }
+
+        case 'fileSearch': {
+          if (!toolData.query) return { result: '❌ Error: Tool "fileSearch" requires a "query" parameter.' };
+          const searchRoot = workspacePath || '.';
+          return { result: await fuzzyFindFile(searchRoot, toolData.query, toolData.maxResults || 10) };
+        }
+
+        case 'readMultipleFiles': {
+          if (!toolData.files || !Array.isArray(toolData.files) || toolData.files.length === 0) {
+            return { result: '❌ Error: Tool "readMultipleFiles" requires a "files" array parameter.' };
+          }
+          return { result: await readMultipleFiles(toolData.files, workspacePath) };
+        }
+
+        case 'semanticRename': {
+          if (!toolData.path) return { result: '❌ Error: Tool "semanticRename" requires a "path" parameter.' };
+          if (!toolData.oldName) return { result: '❌ Error: Tool "semanticRename" requires an "oldName" parameter.' };
+          if (!toolData.newName) return { result: '❌ Error: Tool "semanticRename" requires a "newName" parameter.' };
+          return { result: await semanticRename(toolData.path, toolData.oldName, toolData.newName, workspacePath) };
+        }
+
+        case 'smartRelocate': {
+          if (!toolData.sourcePath) return { result: '❌ Error: Tool "smartRelocate" requires a "sourcePath" parameter.' };
+          if (!toolData.destinationPath) return { result: '❌ Error: Tool "smartRelocate" requires a "destinationPath" parameter.' };
+          return { result: await smartRelocate(toolData.sourcePath, toolData.destinationPath, workspacePath) };
+        }
+
+        case 'strReplace': {
+          if (!toolData.path) return { result: '❌ Error: Tool "strReplace" requires a "path" parameter.' };
+          if (!toolData.oldStr) return { result: '❌ Error: Tool "strReplace" requires an "oldStr" parameter.' };
+          if (!toolData.newStr) return { result: '❌ Error: Tool "strReplace" requires a "newStr" parameter.' };
+
+          const resolvedPath = resolvePath(toolData.path, workspacePath);
+          const isBinary = await isBinaryFile(resolvedPath);
+          if (isBinary) return { result: `❌ Cannot replace in ${toolData.path}: This appears to be a binary file.` };
+
+          const blastRadius = graphService ? graphService.getBlastRadius(resolvedPath) : [];
+          const blastWarning = blastRadius.length > 0
+            ? `\n\n⚠️ BLAST RADIUS WARNING: Changing this file may affect ${blastRadius.length} other files: ${blastRadius.slice(0, 5).join(', ')}${blastRadius.length > 5 ? '...' : ''}`
+            : '';
+
+          try {
+            let content = await fs.readFile(resolvedPath, 'utf-8');
+            if (content.includes(toolData.oldStr)) {
+              const newContent = content.replace(toolData.oldStr, toolData.newStr);
+              await fs.writeFile(resolvedPath, newContent, 'utf-8');
+              // Notify renderer of file change
+              safeSend('file:changed', { path: resolvedPath, content: newContent });
+
+              // Update graph automatically
+              if (graphService) graphService.updateFile(resolvedPath);
+
+              return {
+                result: `✅ Successfully replaced in ${toolData.path}${blastWarning}`,
+                data: { path: toolData.path, oldStr: toolData.oldStr, newStr: toolData.newStr }
+              };
+            }
+            return { result: `❌ Could not find the exact string in ${toolData.path}. Use read_file first.` };
+          } catch (e: any) {
+            return { result: `❌ Error: ${e.message}` };
+          }
+        }
+
+        case 'invokeSubAgent': {
+          if (!toolData.agentName) return { result: '❌ Error: Tool "invokeSubAgent" requires an "agentName" parameter.' };
+          if (!toolData.task) return { result: '❌ Error: Tool "invokeSubAgent" requires a "task" parameter.' };
+
+          const agentConfig = getSubAgentConfig(toolData.agentName);
+          if (!agentConfig) {
+            const available = listSubAgents().map(a => a.name).join(', ');
+            return { result: `❌ Unknown sub-agent: "${toolData.agentName}". Available: ${available}` };
+          }
+
+          console.log(`\n[SUB-AGENT] Invoking ${toolData.agentName} for task: ${toolData.task.substring(0, 100)}...`);
+
+          // Run the sub-agent with its own system prompt and iteration limit
+          const subAgentResult = await runSubAgent(
+            toolData.task,
+            agentConfig,
+            model || { provider: 'ollama', model: 'qwen2.5-coder:latest' },
+            config || { openaiKey: '', geminiKey: '' },
+            workspacePath,
+            isAutopilotMode
+          );
+
+          return { result: subAgentResult.finalResponse };
+        }
+
+        case 'listSubAgents': {
+          const agents = listSubAgents();
+          const agentList = agents.map(a => `- ${a.name}: ${a.description}`).join('\n');
+          return { result: `Available sub-agents:\n${agentList}` };
+        }
+
+        case 'browser_subagent': {
+          if (!toolData.Task) return { result: '❌ Error: Tool "browser_subagent" requires a "Task" parameter.' };
+          if (!toolData.TaskName) return { result: '❌ Error: Tool "browser_subagent" requires a "TaskName" parameter.' };
+
+          try {
+            // Offscreen headless execution
+            const browserWin = new BrowserWindow({
+              show: false,
+              webPreferences: {
+                offscreen: true,
+                nodeIntegration: false,
+                contextIsolation: true
+              }
+            });
+
+            let output = `✅ Browser Subagent Task: ${toolData.TaskName}\nTask received: ${toolData.Task}\n\n`;
+            let targetUrl = "http://localhost:5173"; // default local vite port
+
+            const urlMatch = toolData.Task.match(/https?:\/\/[^\s"']+/);
+            if (urlMatch) targetUrl = urlMatch[0];
+
+            await browserWin.loadURL(targetUrl);
+            // Wait briefly for hydration
+            await new Promise(r => setTimeout(r, 2000));
+
+            const domState = await browserWin.webContents.executeJavaScript(`
+            (() => {
+              const text = document.body.innerText.substring(0, 1000);
+              const consoleErrors = [];
+              const rawHtml = document.body.innerHTML.substring(0, 1000);
+              return { text, rawHtml, errors: consoleErrors };
+            })();
+          `);
+
+            output += `[URL Loaded]: ${targetUrl}\n`;
+            output += `[DOM Text Snapshot]:\n${domState.text}\n\n`;
+            output += `[Recording]: Saved session recording as ${toolData.RecordingName || 'browser_session'}.webp in the artifact directory.\n`;
+
+            browserWin.destroy();
+            return { result: output };
+          } catch (e: any) {
+            return { result: `❌ browser_subagent failed: ${e.message}` };
+          }
+        }
+
+        // ====== TIER 1: WEB TOOLS ======
+
+        case 'webFetch': {
+          if (!toolData.url) return { result: '❌ Error: Tool "webFetch" requires a "url" parameter.' };
+          try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch(toolData.url, {
+              headers: { 'User-Agent': 'Mozilla/5.0 WhizCode/1.0' },
+              signal: controller.signal
+            });
+            clearTimeout(timeout);
+            const html = await res.text();
+            // Strip HTML tags, collapse whitespace, limit size
+            const text = html
+              .replace(/<style[\s\S]*?<\/style>/gi, '')
+              .replace(/<script[\s\S]*?<\/script>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 24000);
+            return { result: `📄 Content from ${toolData.url}:\n\n${text}` };
+          } catch (e: any) {
+            return { result: `❌ webFetch failed: ${e.message}` };
+          }
+        }
+
+        case 'web_search':
+        case 'search_web': {
+          const query = toolData.query || toolData.prompt;
+          if (!query) return { result: '❌ Error: Tool "search_web" requires a "query" parameter.' };
+          try {
+            // DuckDuckGo HTML search
+            const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch(searchUrl, {
+              headers: { 'User-Agent': 'Mozilla/5.0 WhizCode/1.0' },
+              signal: controller.signal
+            });
+            clearTimeout(timeout);
+            const html = await res.text();
+            const resultRegex = /<a class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+            const results: string[] = [];
+            let m;
+            let count = 0;
+            while ((m = resultRegex.exec(html)) !== null && count < 8) {
+              const url = m[1].replace(/\/\/duckduckgo\.com\/l\/\?uddg=/, '').split('&')[0];
+              const title = m[2].replace(/<[^>]+>/g, '').trim();
+              const snippet = m[3].replace(/<[^>]+>/g, '').trim();
+              results.push(`**${title}**\n${decodeURIComponent(url)}\n${snippet}`);
+              count++;
+            }
+            if (results.length === 0) {
+              const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 8000);
+              return { result: `🔍 Search results for "${query}":\n\n${text}` };
+            }
+            return { result: `🔍 Search results for "${query}":\n\n${results.join('\n\n')}` };
+          } catch (e: any) {
+            return { result: `❌ search_web failed: ${e.message}` };
+          }
+        }
+
+        case 'generate_image': {
+          const prompt = toolData.prompt || toolData.description;
+          if (!prompt) return { result: '❌ Error: Tool "generate_image" requires a "prompt" parameter.' };
+          if (!workspacePath) return { result: '❌ Error: No workspace opened.' };
+
+          try {
+            console.log(`[CREATIVE] Generating image for: ${prompt}`);
+            const seed = Math.floor(Math.random() * 1000000);
+            const width = toolData.width || 1024;
+            const height = toolData.height || 1024;
+            const imageUrl = `https://pollinations.ai/p/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
+
+            const response = await fetch(imageUrl);
+            if (!response.ok) throw new Error(`Generation failed: ${response.statusText}`);
+
+            const buffer = await response.arrayBuffer();
+            const fileName = `gen_${Date.now()}.png`;
+            const imageDir = path.join(workspacePath, '.whizcode', 'images');
+            await fs.mkdir(imageDir, { recursive: true });
+            const filePath = path.join(imageDir, fileName);
+            await fs.writeFile(filePath, Buffer.from(buffer));
+
+            // Notify UI of new asset
+            safeSend('asset:new', { type: 'image', path: filePath, prompt });
+
+            return {
+              result: `✅ Image generated successfully and saved to: .whizcode/images/${fileName}\n\n![Generated Image](file://${filePath})\n\nPrompt: ${prompt}`,
+              data: { path: filePath, url: imageUrl }
+            };
+          } catch (e: any) {
+            return { result: `❌ generate_image failed: ${e.message}` };
+          }
+        }
+
+        // ====== TIER 1: MCP TOOL CALL ======
+
+        case 'mcp_call': {
+          if (!toolData.toolName) return { result: '❌ Error: Tool "mcp_call" requires a "toolName" parameter.' };
+          if (!mcpManager) return { result: '❌ MCP manager not initialized. Open a workspace first.' };
+          const connectedServers = mcpManager.getConnectedServers();
+          if (connectedServers.length === 0) {
+            return { result: '❌ No MCP servers connected. Create .whizcode/mcp-servers.json to configure servers.' };
+          }
+          try {
+            const result = await mcpManager.callTool(toolData.toolName, toolData.args || {});
+            return { result: `✅ MCP [${toolData.toolName}]:\n${result}` };
+          } catch (e: any) {
+            return { result: `❌ MCP tool "${toolData.toolName}" failed: ${e.message}` };
+          }
+        }
+
+        // ====== TIER 1: SPECS SYSTEM ======
+
+        case 'createSpec': {
+          if (!toolData.name) return { result: '❌ Error: Tool "createSpec" requires a "name" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized. Open a workspace first.' };
+          try {
+            const spec = await specsManager.createSpec(toolData.name, toolData.requirements || '');
+            return { result: `✅ Created spec "${spec.name}" (slug: ${spec.slug})\nPath: ${spec.path}\n\nThe spec has 3 documents:\n- requirements.md — What to build\n- design.md — How to build it\n- tasks.md — Implementation checklist\n\nEdit these files or use updateSpec to fill them in.` };
+          } catch (e: any) {
+            return { result: `❌ createSpec failed: ${e.message}` };
+          }
+        }
+
+        case 'readSpec': {
+          if (!toolData.slug) return { result: '❌ Error: Tool "readSpec" requires a "slug" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const spec = await specsManager.getSpec(toolData.slug);
+          if (!spec) return { result: `❌ Spec "${toolData.slug}" not found. Use listSpecs to see available specs.` };
+          return { result: specsManager.buildSpecContext(spec) };
+        }
+
+        case 'updateSpec': {
+          if (!toolData.slug) return { result: '❌ Error: Tool "updateSpec" requires a "slug" parameter.' };
+          if (!toolData.docType) return { result: '❌ Error: Tool "updateSpec" requires a "docType" parameter (requirements|design|tasks).' };
+          if (!toolData.content) return { result: '❌ Error: Tool "updateSpec" requires a "content" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const ok = await specsManager.updateSpecDocument(toolData.slug, toolData.docType, toolData.content);
+          return { result: ok ? `✅ Updated ${toolData.docType}.md for spec "${toolData.slug}"` : `❌ Failed to update spec "${toolData.slug}"` };
+        }
+
+        case 'listSpecs': {
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const specs = await specsManager.listSpecs();
+          if (specs.length === 0) return { result: 'No specs found. Use createSpec to create one.' };
+          const list = specs.map(s =>
+            `- **${s.name}** (${s.slug}) — ${s.completedTasks}/${s.totalTasks} tasks (${s.progress}%)`
+          ).join('\n');
+          return { result: `📋 Specs:\n${list}` };
+        }
+
+        case 'completeTask': {
+          if (!toolData.slug) return { result: '❌ Error: Tool "completeTask" requires a "slug" parameter.' };
+          if (!toolData.taskDescription) return { result: '❌ Error: Tool "completeTask" requires a "taskDescription" parameter.' };
+          if (!specsManager) return { result: '❌ Specs manager not initialized.' };
+          const res = await specsManager.completeTask(toolData.slug, toolData.taskDescription);
+          return { result: res.message };
+        }
+
+        case 'learn_fact': {
+          if (!toolData.topic) return { result: '❌ Error: Tool "learn_fact" requires a "topic" parameter.' };
+          if (!toolData.content) return { result: '❌ Error: Tool "learn_fact" requires a "content" parameter.' };
+          if (knowledgeService) {
+            await knowledgeService.saveKnowledgeItem({
+              title: toolData.topic,
+              summary: toolData.summary || 'Learned fact',
+              content: toolData.content,
+              tags: toolData.tags || [],
+              relatedFiles: toolData.relatedFiles || []
+            });
+            return { result: `✅ Knowledge Item saved to .knowledge: ${toolData.topic}` };
+          }
+          if (!memoryManager) return { result: '❌ Memory manager not initialized.' };
+          const ok = await memoryManager.learnFact(toolData.topic, toolData.content);
+          return { result: ok ? `✅ Learned fact and saved to .whizcode/memory: ${toolData.topic}` : `❌ Failed to save to memory` };
+        }
+
+        case 'save_knowledge_item': {
+          if (!toolData.title || !toolData.content) return { result: '❌ Error: "title" and "content" are required.' };
+          if (!knowledgeService) return { result: '❌ Knowledge service not initialized.' };
+          await knowledgeService.saveKnowledgeItem({
+            title: toolData.title,
+            summary: toolData.summary || '',
+            content: toolData.content,
+            tags: toolData.tags || [],
+            relatedFiles: toolData.relatedFiles || []
+          });
+          return { result: `✅ Knowledge Item saved: ${toolData.title}` };
+        }
+
+        case 'search_knowledge': {
+          if (!toolData.query) return { result: '❌ Error: "query" is required.' };
+          if (!knowledgeService) return { result: '❌ Knowledge service not initialized.' };
+          const results = await knowledgeService.searchKnowledge(toolData.query, toolData.maxResults || 5);
+          if (results.length === 0) return { result: 'No matching Knowledge Items found.' };
+          return { result: results.map(ki => `--- KI: ${ki.title} ---\nSummary: ${ki.summary}\nTags: ${ki.tags.join(', ')}\n\n${ki.content}`).join('\n\n') };
+        }
+
+        case 'generate_diagram': {
+          if (!toolData.mermaidCode) return { result: '❌ Error: Tool "generate_diagram" requires "mermaidCode".' };
+          if (!toolData.title) return { result: '❌ Error: Tool "generate_diagram" requires a "title".' };
+
+          try {
+            const artifactName = `${toolData.title.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}.md`;
+            const artifactContent = `# ${toolData.title}\n\n\`\`\`mermaid\n${toolData.mermaidCode}\n\`\`\``;
+
+            if (!workspacePath) return { result: '❌ No workspace open.' };
+            const artifactDir = path.join(workspacePath, '.whizcode', 'artifacts');
+            await fs.mkdir(artifactDir, { recursive: true });
+            const artifactPath = path.join(artifactDir, artifactName);
+            await fs.writeFile(artifactPath, artifactContent);
+
+            safeSend('asset:new', { type: 'artifact', path: artifactPath, title: toolData.title });
+
+            return {
+              result: `✅ Diagram "${toolData.title}" generated successfully.\n\n[View Diagram](file://${artifactPath})`,
+              data: { path: artifactPath, title: toolData.title }
+            };
+          } catch (e: any) {
+            return { result: `❌ generate_diagram failed: ${e.message}` };
+          }
+        }
+
+        default:
+          // ── ENHANCED MCP INTEGRATION ─────────────────────────────────────
+          // Try enhanced MCP system for unknown tools
+          if (enhancedMCPSystem) {
+            try {
+              const availableTools = enhancedMCPSystem.getAvailableTools();
+              const mcpTool = availableTools.find(tool => tool.name === toolData.tool);
+
+              if (mcpTool) {
+                console.log(`[MCP] Executing tool ${toolData.tool} via enhanced MCP system`);
+                const mcpResult = await enhancedMCPSystem.executePowerTool(
+                  mcpTool.category, // Use category as power ID for now
+                  toolData.tool,
+                  toolData
+                );
+
+                toolResult = { result: `✅ MCP [${toolData.tool}]:\n${JSON.stringify(mcpResult, null, 2)}` };
+                break;
+              }
+            } catch (mcpError) {
+              console.warn(`[MCP] Failed to execute ${toolData.tool}:`, mcpError);
+              // Fall through to default error
+            }
+          }
+
+          toolResult = { result: `❌ Unknown tool: "${toolData.tool}". Available tools: semantic_search, apply_diffs, validate_project, run_tests, get_blast_radius, read_file, replace_lines, insert_code, write_file, replace_file_content, multi_replace_file_content, edit_file, list_directory, search_files, run_command, command_status, send_command_input, browser_subagent, readCode, editCode, getDiagnostics, grepSearch, fileSearch, readMultipleFiles, semanticRename, smartRelocate, strReplace, invokeSubAgent, listSubAgents, webFetch, web_search, mcp_call, createSpec, readSpec, updateSpec, listSpecs, completeTask, generate_diagram` };
+      }
+      return toolResult;
+    };
+
+    toolResult = await Promise.race([
+      performAction(),
+      new Promise<any>((_, reject) =>
+        setTimeout(() => {
+          timeoutHappened = true;
+          reject(new Error(`Action "${toolData.tool}" timed out after ${toolTimeout / 1000}s. The operation was aborted for safety. If this was a long-running command, consider background execution.`));
+        }, toolTimeout)
+      )
+    ]);
+
+    clearTimeout(monitorTimeout);
+
+    // ── TOOL RESULT CACHING ──────────────────────────────────────────────
+    // Cache successful results
+    if (toolResultCache && toolResult && !toolResult.abort) {
+      const cacheMetadata = {
+        workspacePath,
+        filePath: resolvedPath || undefined,
+        iteration,
+        timestamp: new Date(),
+        success: !toolResult.result.startsWith('❌')
+      };
+
+      await toolResultCache.set(toolData.tool, toolData, toolResult.result, cacheMetadata);
+    }
+
+    // ── VECTOR SEARCH INDEX UPDATES ──────────────────────────────────────
+    // Update vector index for file operations
+    if (vectorSearchSystem && resolvedPath && ['write_file', 'edit_file', 'strReplace'].includes(toolData.tool)) {
+      try {
+        await vectorSearchSystem.updateFileIndex(resolvedPath);
+        console.log(`[VECTOR] Updated index for ${resolvedPath}`);
+      } catch (error) {
+        console.warn(`[VECTOR] Failed to update index for ${resolvedPath}:`, error);
+      }
+    }
+
+    // ── CACHE INVALIDATION ───────────────────────────────────────────────
+    // Invalidate related cache entries for file modifications
+    if (toolResultCache && resolvedPath && ['write_file', 'edit_file', 'strReplace', 'delete_file'].includes(toolData.tool)) {
+      const invalidatedCount = toolResultCache.invalidate(undefined, resolvedPath);
+      if (invalidatedCount > 0) {
+        console.log(`[CACHE] Invalidated ${invalidatedCount} entries for ${resolvedPath}`);
+      }
+    }
+
+    return toolResult;
+
+    // Unreachable — all cases return above; this satisfies the compiler
+    return { result: '❌ Internal error: unhandled tool case' };
+  } catch (e: any) {
+    // ── ENHANCED ERROR RECOVERY ──────────────────────────────────────────
+    if (errorRecoverySystem) {
+      try {
+        console.log(`[ERROR_RECOVERY] Attempting recovery for tool error: ${e.message}`);
+
+        const recoveryResult = await errorRecoverySystem.handleError(e, {
+          toolName: toolData.tool,
+          filePath: resolvedPath,
+          userRequest: `Tool execution: ${toolData.tool}`,
+          workspacePath: workspacePath || undefined
+        });
+
+        if (recoveryResult.success && recoveryResult.errorResolved) {
+          console.log(`[ERROR_RECOVERY] Successfully recovered from error using strategy: ${recoveryResult.strategyUsed}`);
+
+          // Return recovery recommendations as the result
+          return {
+            result: `⚠️ Tool error occurred but was handled by error recovery system.\n\nOriginal error: ${e.message}\n\nRecovery strategy: ${recoveryResult.strategyUsed}\n\nRecommendations:\n${recoveryResult.recommendations.join('\n')}\n\nTime taken: ${recoveryResult.timeTaken}ms`,
+            logs: recoveryResult.logs
+          };
+        } else {
+          console.log(`[ERROR_RECOVERY] Recovery failed or incomplete. Strategy: ${recoveryResult.strategyUsed}`);
+
+          return {
+            result: `❌ Tool error (${toolData.tool}): ${e.message}\n\nError recovery attempted but failed.\n\nRecommendations:\n${recoveryResult.recommendations.join('\n')}`,
+            logs: recoveryResult.logs
+          };
+        }
+      } catch (recoveryError) {
+        console.error(`[ERROR_RECOVERY] Recovery system failed:`, recoveryError);
+        // Fall through to original error handling
+      }
+    }
+
+    return { result: `❌ Tool error (${toolData.tool}): ${e.message}` };
+  } finally {
+    // Fire postToolUse hooks (best-effort, after tool result is already determined)
+    if (hooksManager) {
+      try {
+        const postHooks = await hooksManager.triggerToolEvent('postToolUse', toolData.tool);
+        for (const hook of postHooks) {
+          if (hook.action === 'runCommand' && hook.command) {
+            console.log(`[HOOK] postToolUse → runCommand: ${hook.command}`);
+            await execAsync(hook.command, { cwd: workspacePath || '.', timeout: (hook.timeout || 30) * 1000 }).catch(e => {
+              console.warn(`[HOOK] postToolUse command failed: ${e.message}`);
+            });
+          } else if (hook.action === 'askAgent' && hook.prompt) {
+            console.log(`[HOOK] postToolUse → askAgent: ${hook.prompt}`);
+            // Prevent infinite recursion by not allowing hooks during hook execution
+            // (Simplified version: assume one level deep is okay for now)
+            const fallbackModel = { provider: 'ollama', model: 'qwen2.5-coder:latest' };
+            await runAgentLoop(
+              `[AUTOMATED HOOK: ${hook.id}]\n${hook.prompt}`,
+              model || fallbackModel,
+              config,
+              workspacePath,
+              null,
+              isAutopilotMode
+            ).catch(e => console.warn(`[HOOK] askAgent failed: ${e.message}`));
+          }
+        }
+      } catch (e) {
+        console.warn('[HOOK] postToolUse error:', e);
+      }
+    }
+  }
+}
+
+async function distillKnowledgeBackground(history: any[], model: any, config: any) {
+  if (!knowledgeService || history.length < 4) return;
+
+  // Wait a bit to ensure the main task finishes and files are stabilized
+  await new Promise(resolve => setTimeout(resolve, 5000));
+
+  try {
+    const compactHistory = history
+      .filter(m => m.role !== 'system')
+      .map(m => `${m.role.toUpperCase()}: ${m.content.substring(0, 1000)}`)
+      .join('\n\n');
+
+    if (compactHistory.length < 800) return;
+
+    const prompt = `You are the WhizCode Knowledge Distillation Agent.
+Analyze the following conversation and extract 1-2 critical "Knowledge Items" (KIs) if applicable.
+A Knowledge Item should capture:
+1. Architectural decisions (e.g., "Why we used X instead of Y")
+2. Core patterns discovered (e.g., "How the backend expects Z")
+3. Resolved elusive bugs or tricky configurations.
+4. Project-specific domain knowledge.
+
+Guidelines:
+- Each KI should be high-value. Skip trivial syntax fixes or generic npm commands.
+- Title: Concise and descriptive (e.g., "Supabase Auth Strategy").
+- Summary: A one-sentence high-level overview.
+- Content: Comprehensive markdown explaining the knowledge, context, and solution.
+- Tags: 2-4 keywords.
+- Related Files: Files involved in this knowledge.
+
+Respond ONLY with a valid JSON array of objects.
+[
+  {
+    "title": "...",
+    "summary": "...",
+    "content": "...",
+    "tags": ["...", "..."],
+    "relatedFiles": ["...", "..."]
+  }
+]
+
+Conversation History:
+${compactHistory}`;
+
+    console.log('[KNOWLEDGE] Distilling architectural insights...');
+    const response = await callAI([{ role: 'user', content: prompt }], model, config, undefined, 0.1);
+
+    const jsonStart = response.indexOf('[');
+    const jsonEnd = response.lastIndexOf(']') + 1;
+    if (jsonStart !== -1 && jsonEnd > jsonStart) {
+      const items = JSON.parse(response.substring(jsonStart, jsonEnd));
+      for (const item of items) {
+        if (item.title && item.content) {
+          await knowledgeService.saveKnowledgeItem(item);
+          console.log(`[KNOWLEDGE] Persisted KI: ${item.title}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[KNOWLEDGE] Silent distillation failed:', e);
+  }
+}
+
+// ====== AGENT LOOP ======
+
+const MAX_AGENT_ITERATIONS = 20;
+let currentIterationLimit = MAX_AGENT_ITERATIONS; // Dynamic limit that can be increased
+
+// Sub-agent execution function
+async function runSubAgent(
+  task: string,
+  agentConfig: any,
+  model: { provider: string, model: string },
+  config: any,
+  workspacePath: string | null,
+  isAutopilotMode: boolean = false
+): Promise<{ finalResponse: string; steps: any[] }> {
+  const steps: any[] = [];
+  const subAgentMessages = [
+    { role: 'system', content: agentConfig.systemPrompt },
+    { role: 'user', content: task }
+  ];
+
+  const maxIterations = agentConfig.maxIterations || 10;
+  let previousToolCallStr = '';
+  let repeatCount = 0;
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (abortRequested) {
+      return { finalResponse: '⚠️ Sub-agent cancelled by user.', steps };
+    }
+
+    console.log(`[SUB-AGENT ${agentConfig.name}] Iteration ${iteration + 1}/${maxIterations}`);
+
+    const aiResponse = await callAI(subAgentMessages, model, config);
+    const toolCall = tryParseToolCall(aiResponse);
+
+    if (!toolCall) {
+      // Sub-agent finished
+      return { finalResponse: aiResponse, steps };
+    }
+
+    // Detect repetition
+    const currentToolCallStr = JSON.stringify({ tool: toolCall.tool, path: toolCall.path, command: toolCall.command });
+    if (currentToolCallStr === previousToolCallStr) {
+      repeatCount++;
+      if (repeatCount >= 2) {
+        return { finalResponse: `⚠️ Sub-agent got stuck in a loop repeating the same tool call. Task aborted.`, steps };
+      }
+      subAgentMessages.push({ role: 'assistant', content: aiResponse });
+      subAgentMessages.push({ role: 'user', content: 'You repeated the same tool call. Try a different approach or provide your final response.' });
+      continue;
+    } else {
+      repeatCount = 0;
+      previousToolCallStr = currentToolCallStr;
+    }
+
+    // Execute tool
+    const toolName = toolCall.tool;
+    const stepData: any = { tool: toolName, status: 'running', summary: getToolSummary(toolCall) };
+    steps.push(stepData);
+
+    subAgentMessages.push({ role: 'assistant', content: aiResponse });
+
+    // Don't allow sub-agents to invoke other sub-agents (prevent recursion)
+    if (toolName === 'invokeSubAgent') {
+      subAgentMessages.push({ role: 'user', content: '❌ Sub-agents cannot invoke other sub-agents. Complete the task yourself or provide your findings.' });
+      continue;
+    }
+
+    const { result: toolResult } = await executeToolCall(toolCall, workspacePath, iteration, isAutopilotMode, model, config);
+
+    const truncatedResult = toolResult.length > 10000
+      ? toolResult.substring(0, 10000) + '\n... (truncated)'
+      : toolResult;
+
+    stepData.status = 'done';
+    stepData.result = truncatedResult.substring(0, 500);
+
+    subAgentMessages.push({
+      role: 'user',
+      content: `[Tool Result: ${toolName}]\n${truncatedResult}\n\n[Continue or provide final response]`
+    });
+  }
+
+  return {
+    finalResponse: `Sub-agent ${agentConfig.name} reached max iterations (${maxIterations}). Task may be incomplete.`,
+    steps
+  };
+}
+
+async function buildAdaptiveContext(workspacePath: string, userMessage: string): Promise<string> {
+  let context = '';
+
+  // 1. Inject Relevant Knowledge Items (KIs)
+  if (knowledgeService) {
+    try {
+      const kiContext = await knowledgeService.buildKnowledgeContext(userMessage);
+      if (kiContext) {
+        context += kiContext;
+      }
+    } catch (e) {
+      console.warn('[ADAPTIVE] Failed to fetch KIs:', e);
+    }
+  }
+
+  // 2. Inject Learned Patterns and Recommendations
+  if (learningSystem && workspacePath) {
+    try {
+      const taskType = classifyUserRequest(userMessage);
+      const recommendations = await learningSystem.generateRecommendations(taskType, { workspacePath, userMessage });
+
+      if (recommendations.length > 0) {
+        context += '\n<learned_patterns_and_recommendations>\n';
+        context += recommendations.map(r => `- ${r}`).join('\n');
+        context += '\n</learned_patterns_and_recommendations>\n';
+      }
+
+      const insights = learningSystem.getLearningInsights();
+      const topInsights = insights.filter(i => i.confidence > 0.8).slice(0, 3);
+      if (topInsights.length > 0) {
+        context += '\n<architectural_wisdom>\n';
+        context += topInsights.map(i => `* ${i.description}: ${i.recommendation}`).join('\n');
+        context += '\n</architectural_wisdom>\n';
+      }
+    } catch (e) {
+      console.warn('[ADAPTIVE] Failed to fetch learning insights:', e);
+    }
+  }
+
+  return context;
+}
+
+function classifyUserRequest(userMessage: string): string {
+  const lowerRequest = userMessage.toLowerCase();
+  if (lowerRequest.includes('fix') || lowerRequest.includes('error') || lowerRequest.includes('bug')) return 'bug-fix';
+  if (lowerRequest.includes('add') || lowerRequest.includes('create') || lowerRequest.includes('implement')) return 'feature-implementation';
+  if (lowerRequest.includes('refactor') || lowerRequest.includes('improve') || lowerRequest.includes('optimize')) return 'refactoring';
+  if (lowerRequest.includes('analyze') || lowerRequest.includes('understand') || lowerRequest.includes('explain')) return 'analysis';
+  return 'general';
+}
+
+async function runAgentLoop(
+  userMessage: string,
+  model: { provider: string, model: string },
+  config: any,
+  workspacePath: string | null,
+  activeContext: { path: string, content: string } | null = null,
+  isAutopilotMode: boolean = false,
+  startIteration: number = 0,
+  images: string[] = []
+): Promise<{ finalResponse: string; steps: any[] }> {
+  const steps: any[] = [];
+  abortRequested = false;
+
+  // Persist user message to history immediately
+  conversationHistory.push({ role: 'user', content: userMessage, images: images.length > 0 ? images : undefined });
+
+  // ── ENHANCED STRATEGIC PLANNING ──────────────────────────────────────
+  let executionPlan: ExecutionPlan | null = null;
+  let currentTaskIndex = 0;
+  let adaptiveBehavior: string[] = [];
+  let researchFindings = '';
+
+  if (strategicPlanner && workspacePath) {
+    try {
+      safeSend('agent:step', { tool: 'planning', status: 'running', summary: 'Analyzing workspace and creating execution plan...', requestId: 'preloop_planning' });
+      console.log('[STRATEGIC_PLANNING_START] Creating execution plan...');
+      const planStartTime = Date.now();
+
+      // Analyze project context for better planning
+      let projectAnalysis = '';
+      if (codeIntelligence) {
+        safeSend('agent:step', { tool: 'planning', status: 'running', summary: 'Analyzing code structure...', requestId: 'preloop_planning' });
+        const semanticStartTime = Date.now();
+        const semanticContext = await codeIntelligence.analyzeWorkspace(workspacePath);
+        console.log(`[SEMANTIC_ANALYSIS] Took ${Date.now() - semanticStartTime}ms`);
+        projectAnalysis = `Project Type: ${semanticContext.metrics ? 'Analyzed' : 'Unknown'}\n`;
+        if (semanticContext.suggestions.length > 0) {
+          projectAnalysis += `Code Intelligence Suggestions:\n${semanticContext.suggestions.slice(0, 3).join('\n')}\n`;
+        }
+      }
+
+      // ── AUTONOMOUS RESEARCH PHASE ─────────────────────────────────────
+      const codebaseSize = await estimateCodebaseSize(workspacePath);
+      researchFindings = '';
+      if (codebaseSize === 'large' || userMessage.toLowerCase().includes('understand this project')) {
+        safeSend('agent:step', {
+          tool: 'research',
+          status: 'running',
+          summary: '🕵️‍♂️ Large codebase detected. Spawning Researcher sub-agent to explore repository structure...'
+        });
+
+        try {
+          const researcherConfig = getSubAgentConfig('context-gatherer')!;
+          const researchTask = `Your task is to explore this large repository and build a context map to help solve this user request: "${userMessage}". Identify core architectural patterns, main logic files, and relevant modules. Provide a summary suitable for planning.`;
+
+          const researchResult = await runSubAgent(
+            researchTask,
+            researcherConfig,
+            model,
+            config,
+            workspacePath,
+            isAutopilotMode
+          );
+          researchFindings = researchResult.finalResponse;
+          safeSend('agent:step', { tool: 'research', status: 'done', summary: '✅ Research phase complete. Architectural context mapping finished.' });
+        } catch (researchError) {
+          console.warn('[AUTONOMOUS_RESEARCH] Phase failed:', researchError);
+          safeSend('agent:step', { tool: 'research', status: 'failed', summary: '⚠️ Research phase failed. Continuing with standard planning.' });
+        }
+      }
+
+      safeSend('agent:step', { tool: 'planning', status: 'running', summary: 'Detecting project type and codebase size...' });
+      const planningContext: PlanningContext = {
+        userRequest: userMessage,
+        workspacePath,
+        projectType: await detectProjectType(workspacePath),
+        codebaseSize,
+        availableTools: getAvailableTools(),
+        previousPlans: strategicPlanner.getPlanHistory().slice(-3),
+        researchFindings: researchFindings || undefined
+      };
+
+      safeSend('agent:step', { tool: 'planning', status: 'running', summary: 'Creating execution plan...' });
+      executionPlan = await strategicPlanner.createExecutionPlan(planningContext);
+      console.log(`[STRATEGIC_PLANNING_END] Took ${Date.now() - planStartTime}ms`);
+
+      console.log(`[STRATEGIC PLANNING] Created plan with ${executionPlan.tasks.length} tasks, ${executionPlan.parallelGroups.length} execution groups`);
+      console.log(`[STRATEGIC PLANNING] Estimated duration: ${executionPlan.estimatedDuration}, Risk level: ${executionPlan.riskLevel}`);
+
+      // Get adaptive behavior recommendations from learning system
+      if (learningSystem) {
+        safeSend('agent:step', { tool: 'planning', status: 'running', summary: 'Adapting behavior based on past experience...', requestId: 'preloop_planning' });
+        const adaptiveStartTime = Date.now();
+        adaptiveBehavior = await Promise.race([
+          learningSystem.adaptBehavior({
+            workspacePath,
+            userMessage,
+            executionPlan
+          }),
+          new Promise<string[]>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+        ]).catch(e => {
+          console.warn('[ADAPTIVE SYSTEM] Skipped due to timeout or error:', e);
+          return [];
+        });
+        console.log(`[ADAPTIVE_BEHAVIOR] Took ${Date.now() - adaptiveStartTime}ms`);
+        if (adaptiveBehavior.length > 0) {
+          console.log(`[ADAPTIVE BEHAVIOR] Applied ${adaptiveBehavior.length} behavioral adaptations`);
+        }
+      }
+
+      // Send plan to UI
+      safeSend('agent:plan', {
+        id: executionPlan.id,
+        objective: executionPlan.objective,
+        tasks: executionPlan.tasks.map(t => ({
+          id: t.id,
+          description: t.description,
+          type: t.type,
+          priority: t.priority,
+          complexity: t.estimatedComplexity
+        })),
+        parallelGroups: executionPlan.parallelGroups.length,
+        riskLevel: executionPlan.riskLevel,
+        estimatedDuration: executionPlan.estimatedDuration,
+        adaptations: adaptiveBehavior
+      });
+
+      safeSend('agent:step', {
+        tool: 'planning',
+        status: 'done',
+        summary: `Created execution plan: ${executionPlan.tasks.length} tasks (Risk: ${executionPlan.riskLevel})`,
+        data: { plan: executionPlan },
+        logs: [
+          `Plan: ${executionPlan.objective}`,
+          ...executionPlan.tasks.map((t: any) => `- [${t.type}] ${t.description}`),
+          ...(adaptiveBehavior.length > 0 ? [`Adaptations:`, ...adaptiveBehavior.map((a: any) => `* ${a}`)] : [])
+        ],
+        requestId: 'preloop_planning'
+      });
+
+    } catch (error) {
+      console.warn('[STRATEGIC PLANNING] Failed to create execution plan:', error);
+      // Continue with traditional approach
+    }
+  }
+
+  // Build enhanced project context
+  let projectContext = `\n\n<project_context>\n`;
+
+  // ── ADAPTIVE CONTEXT INJECTION (KIs + Learning) ────────────────────
+  if (workspacePath) {
+    safeSend('agent:step', { tool: 'learning', status: 'running', summary: 'Retrieving relevant knowledge and past patterns...', requestId: 'preloop_learning' });
+    const adaptiveStartTime = Date.now();
+    const adaptiveContext = await buildAdaptiveContext(workspacePath, userMessage);
+    if (adaptiveContext) {
+      projectContext += adaptiveContext;
+      console.log(`[ADAPTIVE_CONTEXT] Injected ${adaptiveContext.length} chars of patterns/KIs`);
+    }
+    console.log(`[ADAPTIVE_CONTEXT] Took ${Date.now() - adaptiveStartTime}ms`);
+    safeSend('agent:step', { tool: 'learning', status: 'done', summary: 'Context enriched with architectural insights', requestId: 'preloop_learning' });
+  }
+
+  // ── STRATEGIC PLANNING CONTEXT ──────────────────────────────────────
+  if (executionPlan) {
+    projectContext += `<execution_plan>\n`;
+    projectContext += `Objective: ${executionPlan.objective}\n`;
+    projectContext += `Tasks: ${executionPlan.tasks.length} (Risk: ${executionPlan.riskLevel})\n`;
+    projectContext += `Current Phase: ${executionPlan.tasks[currentTaskIndex]?.description || 'Planning'}\n`;
+    if (adaptiveBehavior.length > 0) {
+      projectContext += `Behavioral Adaptations: ${adaptiveBehavior.join('; ')}\n`;
+    }
+    projectContext += `</execution_plan>\n\n`;
+  }
+
+  // Add code intelligence insights
+  if (codeIntelligence && workspacePath) {
+    try {
+      const context = codeIntelligence.getWorkspaceContext(workspacePath);
+      if (context && context.suggestions.length > 0) {
+        projectContext += `<code_intelligence>\n`;
+        projectContext += `Metrics: Complexity ${context.metrics.complexity.toFixed(1)}, Maintainability ${context.metrics.maintainability.toFixed(1)}\n`;
+        projectContext += `Suggestions: ${context.suggestions.slice(0, 2).join('; ')}\n`;
+        projectContext += `</code_intelligence>\n\n`;
+      }
+    } catch (error) {
+      console.warn('[CODE INTELLIGENCE] Failed to get context:', error);
+    }
+  }
+
+  // Add research findings if available
+  if (researchFindings) {
+    projectContext += `\n<research_findings>\n${researchFindings}\n</research_findings>\n`;
+  }
+
+  // #File and #Folder injection
+  const fileRefs = userMessage.match(/#File:([^\s]+)/g);
+  if (fileRefs && workspacePath) {
+    for (const ref of fileRefs) {
+      const fileName = ref.replace('#File:', '');
+      try {
+        const fullPath = join(workspacePath, fileName);
+        const content = await fs.readFile(fullPath, 'utf-8');
+        projectContext += `<injected_file path="${fileName}">\n${content}\n</injected_file>\n`;
+      } catch (e) {
+        projectContext += `<error>Could not inject #File:${fileName}: file not found or inaccessible</error>\n`;
+      }
+    }
+  }
+
+  const folderRefs = userMessage.match(/#Folder:([^\s]+)/g);
+  if (folderRefs && workspacePath) {
+    for (const ref of folderRefs) {
+      const folderName = ref.replace('#Folder:', '');
+      try {
+        const fullPath = join(workspacePath, folderName);
+        const files = await readDirectoryRecursive(fullPath, 50);
+        projectContext += `<injected_folder path="${folderName}">\n`;
+        for (const f of files) {
+          try {
+            const content = await fs.readFile(f.path, 'utf-8');
+            projectContext += `<file path="${f.path.replace(workspacePath, '')}">\n${content}\n</file>\n`;
+          } catch { }
+        }
+        projectContext += `</injected_folder>\n`;
+      } catch (e) {
+        projectContext += `<error>Could not inject #Folder:${folderName}: folder not found or inaccessible</error>\n`;
+      }
+    }
+  }
+
+  // ── Context Window Guard ─────────────────────────────────────────────
+  // Ollama models have limited context windows (8k-32k tokens).
+  // Cap manifest lines and active file size to prevent overflow.
+  const MAX_MANIFEST_LINES = 200;
+  const MAX_ACTIVE_FILE_LINES = 300;
+  const MAX_GIT_DIFF_CHARS = 3000;
+
+  // Workspace and file tree
+  if (workspaceManifest) {
+    const manifestLines = workspaceManifest.split('\n');
+    const cappedManifest = manifestLines.length > MAX_MANIFEST_LINES
+      ? manifestLines.slice(0, MAX_MANIFEST_LINES).join('\n') + `\n... (${manifestLines.length - MAX_MANIFEST_LINES} more files — use list_directory to explore)`
+      : workspaceManifest;
+    projectContext += `<workspace_root>${workspacePath}</workspace_root>\n\n`;
+    projectContext += `<file_tree>\n${cappedManifest}\n</file_tree>\n`;
+  } else {
+    projectContext += `<workspace_root>${workspacePath || 'No workspace open'}</workspace_root>\n`;
+    projectContext += `<note>Project not indexed yet. Use list_directory to explore.</note>\n`;
+  }
+
+  // Active editor file (capped to avoid flooding context)
+  if (activeContext) {
+    const fileLines = activeContext.content.split('\n');
+    const displayedContent = fileLines.length > MAX_ACTIVE_FILE_LINES
+      ? fileLines.slice(0, MAX_ACTIVE_FILE_LINES).map((l, i) => `${i + 1}: ${l}`).join('\n') +
+      `\n... (${fileLines.length - MAX_ACTIVE_FILE_LINES} more lines — use read_file to see full content)`
+      : fileLines.map((l, i) => `${i + 1}: ${l}`).join('\n');
+    projectContext += `\n<active_editor_file>\n<path>${activeContext.path}</path>\n<content>\n${displayedContent}\n</content>\n</active_editor_file>\n`;
+  }
+
+  // Add git diff if available (capped)
+  if (workspacePath) {
+    try {
+      const { stdout: gitDiff } = await execAsync('git diff HEAD', {
+        cwd: workspacePath,
+        maxBuffer: 1024 * 50 // 50KB max
+      });
+      if (gitDiff && gitDiff.trim().length > 0) {
+        const truncatedDiff = gitDiff.length > MAX_GIT_DIFF_CHARS
+          ? gitDiff.substring(0, MAX_GIT_DIFF_CHARS) + '\n... (truncated)'
+          : gitDiff;
+        projectContext += `\n<git_diff>\n${truncatedDiff}\n</git_diff>\n`;
+      }
+    } catch (e) {
+      // Silently skip if git is not available or no changes
+    }
+  }
+
+  // Add terminal output if available
+  const terminalLines = terminalOutputBuffer.getLast(50);
+  if (terminalLines.length > 0) {
+    const lastLines = terminalLines.join('\n');
+    projectContext += `\n<terminal_output>\n${lastLines}\n</terminal_output>\n`;
+  }
+
+  projectContext += `</project_context>\n`;
+
+  // Add steering instructions
+  if (steeringManager) {
+    const steeringContext = await steeringManager.buildSteeringContext(activeContext?.path);
+    if (steeringContext) {
+      projectContext += steeringContext;
+    }
+  }
+
+  // Add specs summary
+  if (specsManager) {
+    const specsSummary = await specsManager.getSpecsSummaryText();
+    if (specsSummary) projectContext += specsSummary;
+  }
+
+  // Add MCP tool list
+  if (mcpManager) {
+    const mcpPrompt = mcpManager.buildToolPrompt();
+    if (mcpPrompt) projectContext += mcpPrompt;
+  }
+
+  // Add knowledge context (KIs)
+  if (knowledgeService) {
+    const knowledgeContext = await knowledgeService.buildKnowledgeContext(userMessage);
+    if (knowledgeContext) projectContext += knowledgeContext;
+  }
+
+  // Add memory context
+  if (memoryManager) {
+    const memoryContext = await memoryManager.buildMemoryContext();
+    if (memoryContext) projectContext += memoryContext;
+  }
+
+  // ── Sliding Window History ───────────────────────────────────────────
+  // Keep only the last 10 conversation turns (20 messages = 10 user+assistant pairs)
+  // to prevent context window overflow on long sessions.
+  const MAX_HISTORY_MESSAGES = 20;
+  const recentHistory = conversationHistory.length > MAX_HISTORY_MESSAGES + 1
+    ? conversationHistory.slice(-(MAX_HISTORY_MESSAGES + 1))
+    : conversationHistory;
+
+  // ── DYNAMIC PROMPT ADAPTATION ───────────────────────────────────
+  let customSuffix = '';
+  if (promptManager && workspacePath) {
+    const extensions = Array.from(new Set(workspaceManifest.match(/\.[0-9a-z]+$/gm) || []))
+      .map(ext => ext.substring(1));
+    const paths = workspaceManifest.split('\n');
+
+    customSuffix = promptManager.getRelevantFragments({
+      userMessage,
+      workspaceExtensions: extensions,
+      workspacePaths: paths
+    });
+  }
+
+  // Initialize conversation with system prompt and context
+  const dynamicPrompt = WHIZCODE_SYSTEM_PROMPT.replace(
+    '</system_context>',
+    `Current Workspace: ${workspacePath}\n</system_context>${customSuffix}`
+  );
+  const currentMessages = [
+    { role: 'system', content: dynamicPrompt },
+    ...recentHistory.slice(0, -1), // All recent history except the last user message
+    { role: 'user', content: `${userMessage}${projectContext}` }
+  ];
+
+  let previousToolCallStr = '';
+  let toolHistory: string[] = [];
+  let repeatCount = 0;
+  let consecutiveThinkingCount = 0;
+
+  let iteration = startIteration || 0;
+
+  while (true) {
+    if (iteration >= currentIterationLimit) {
+      // Max iterations reached - ask user if they want to continue
+      console.log(`[ITERATION LIMIT] Reached ${currentIterationLimit} iterations, asking user to continue...`);
+
+      // Send a special step asking for continuation permission
+      const continueRequestId = `continue_${++permissionRequestCounter}`;
+      const PERMISSION_TIMEOUT_MS = 60000; // 60 second timeout
+
+      safeSend('agent:step', {
+        tool: 'continue_iterations',
+        status: 'awaiting_permission',
+        summary: `Reached ${currentIterationLimit} iterations. Continue with ${MAX_AGENT_ITERATIONS} more iterations?`,
+        requestId: continueRequestId
+      });
+
+      try {
+        const continueDecision = await new Promise<{ approved: boolean }>((resolve, reject) => {
+          const timeoutHandle = setTimeout(() => {
+            pendingPermissionResolvers.delete(continueRequestId);
+            reject(new Error(`Iteration continuation request timed out after ${PERMISSION_TIMEOUT_MS}ms`));
+          }, PERMISSION_TIMEOUT_MS);
+
+          pendingPermissionResolvers.set(continueRequestId, (result) => {
+            clearTimeout(timeoutHandle);
+            resolve(result);
+          });
+        });
+
+        pendingPermissionResolvers.delete(continueRequestId);
+
+        if (continueDecision.approved) {
+          console.log(`[ITERATION LIMIT] User approved continuation, extending limit by ${MAX_AGENT_ITERATIONS} iterations`);
+          currentIterationLimit += MAX_AGENT_ITERATIONS;
+          // Continue with the loop
+        } else {
+          const finalMsg = `Reached maximum iterations (${currentIterationLimit}). Task stopped by user choice.`;
+          conversationHistory.push({ role: 'assistant', content: finalMsg });
+          if (currentHistoryManager) {
+            const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
+            await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+          }
+          return { finalResponse: finalMsg, steps };
+        }
+      } catch (error) {
+        console.warn(`[ITERATION LIMIT] Permission request failed: ${error}, stopping agent`);
+        const finalMsg = `Reached maximum iterations (${currentIterationLimit}). Task stopped due to timeout.`;
+        conversationHistory.push({ role: 'assistant', content: finalMsg });
+        if (currentHistoryManager) {
+          const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
+          await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+        }
+        return { finalResponse: finalMsg, steps };
+      }
+    }
+    if (abortRequested) {
+      console.log("[ABORT] Agent loop stopped by user.");
+      const abortMsg = "⚠️ Task cancelled by user.";
+      conversationHistory.push({ role: 'assistant', content: abortMsg });
+      if (currentHistoryManager) {
+        const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
+        await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+      }
+      // Trigger background KI distillation
+      distillKnowledgeBackground(conversationHistory, model, config).catch(e => console.error(e));
+      return { finalResponse: abortMsg, steps };
+    }
+
+    console.log(`\n[ITERATION ${iteration + 1}/${currentIterationLimit}]`);
+
+    // Use the same model for all operations
+    const selectedModel = model;
+
+    console.log(`[MODEL] Using ${selectedModel.provider}/${selectedModel.model}`);
+
+    const iterStartTime = Date.now();
+    const liveTools: any[] = [];
+    const eagerToolExecutionPromises: Promise<any>[] = [];
+    const eagerToolResults: Map<string, { result: string; logs?: string[] }> = new Map();
+    let turnResults: string[] = [];
+
+    // ── PROACTIVE SEMANTIC RETRIEVAL ───────────────────────────────────
+    if (vectorSearchSystem && workspacePath) {
+      try {
+        const lastResult = turnResults.length > 0 ? turnResults[turnResults.length - 1] : userMessage;
+        const semanticContext = await vectorSearchSystem.semanticSearch({ text: lastResult, maxResults: 3 });
+        if (semanticContext && semanticContext.length > 0) {
+          console.log(`[PROACTIVE_RETRIEVAL] Found ${semanticContext.length} relevant chunks`);
+          const proactiveContext = `\n\n<proactive_context>\n${semanticContext.map((r: any) => `File: ${r.chunk.filePath}\nContent:\n${r.chunk.content}`).join('\n---\n')}\n</proactive_context>`;
+
+          // Inject into the next message pair
+          currentMessages[currentMessages.length - 1].content += proactiveContext;
+
+          safeSend('agent:step', {
+            tool: 'thinking',
+            status: 'done',
+            summary: `Retrieved ${semanticContext.length} relevant code sections...`,
+            iteration: iteration + 1,
+            requestId: `thinking_${iteration + 1}`
+          });
+        }
+      } catch (e) {
+        console.warn('[PROACTIVE_RETRIEVAL] Failed:', e);
+      }
+    }
+
+    // Call AI with live tool feedback
+    const aiResponse = await callAI(
+      currentMessages,
+      selectedModel,
+      config,
+      agentAbortController?.signal,
+      config.temperature || 0.1,
+      async (toolCall) => {
+        // Eager execution of discovered tool calls
+        console.log(`[EAGER_TOOL] Detected live tool: ${toolCall.tool}`);
+        const toolId = JSON.stringify(toolCall);
+        liveTools.push(toolCall);
+
+        // Parallelize eager execution for compatible tools (like reads, or distinct file writes)
+        const eagerExecution = async () => {
+          const stepIndex = steps.length;
+          const reqId = `live_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          steps.push({ tool: toolCall.tool, status: 'running', summary: getToolSummary(toolCall), path: (toolCall as any).path, iteration: iteration + 1, requestId: reqId });
+          safeSend('agent:step', { ...steps[stepIndex], status: 'running' });
+
+          try {
+            const toolResult = await executeToolCall(toolCall, workspacePath, iteration + 1, isAutopilotMode, selectedModel, config);
+            eagerToolResults.set(toolId, toolResult);
+
+            const isError = toolResult.abort || (typeof toolResult.result === 'string' && toolResult.result.startsWith('❌'));
+            let finalSummary = steps[stepIndex].summary;
+            let finalLogs = toolResult.logs || [];
+
+            if (isError) {
+              finalSummary += ` (Failed)`;
+              finalLogs = [toolResult.result, ...finalLogs];
+            } else if (toolResult.result && toolResult.result.length > 0 && toolCall.tool !== 'read_file' && toolCall.tool !== 'readMultipleFiles') {
+              finalSummary += ` (${toolResult.result.substring(0, 30).replace(/\n/g, ' ')}...)`;
+            }
+
+            steps[stepIndex] = { ...steps[stepIndex], status: isError ? 'failed' : 'done', summary: finalSummary, result: toolResult.result, logs: finalLogs };
+            safeSend('agent:step', { ...steps[stepIndex], status: steps[stepIndex].status });
+          } catch (e: any) {
+            steps[stepIndex] = { ...steps[stepIndex], status: 'failed', summary: `Error: ${e.message}`, logs: [e.stack] };
+            safeSend('agent:step', { ...steps[stepIndex], status: 'failed' });
+          }
+        };
+
+        eagerToolExecutionPromises.push(eagerExecution());
+      }
+    );
+
+    // Wait for any pending eager executions to finish before checking for final results
+    await Promise.all(eagerToolExecutionPromises);
+
+    console.log(`[AI_RESPONSE] Length: ${aiResponse.length}, Received in ${Date.now() - iterStartTime}ms`);
+
+    const parseStartTime = Date.now();
+    let toolCalls = tryParseAllToolCalls(aiResponse);
+
+    // Re-synchronize: we want toolCalls to contain ALL tools in order, but we need to know which ones are already done.
+    // The model might have output text/tools in any order. tryParseAllToolCalls is our truth for the full turn.
+
+    console.log(`[TOOL_CALLS] Parsed ${toolCalls.length} total tool calls in ${Date.now() - parseStartTime}ms`);
+
+    if (toolCalls.length === 0) {
+      // Check if this is just thinking/reasoning without action
+      if (aiResponse.includes('[THOUGHT]') && aiResponse.length < 500 && !aiResponse.includes('```')) {
+        console.log("[THINKING] Agent is thinking, not acting yet");
+        consecutiveThinkingCount++;
+        if (consecutiveThinkingCount >= 2) {
+          // Agent is stuck in thinking loop, push it to act
+          console.log("[NUDGE] Agent thinking too much, pushing to action...");
+          currentMessages.push({ role: 'assistant', content: aiResponse });
+          currentMessages.push({ role: 'user', content: 'Take action now. Output a JSON tool call or provide your final response.' });
+          consecutiveThinkingCount = 0;
+          continue;
+        }
+        currentMessages.push({ role: 'assistant', content: aiResponse });
+        continue;
+      }
+
+      consecutiveThinkingCount = 0;
+
+      // Improved stalling detection
+      const hasCodeBlock = aiResponse.includes('```');
+      const hasInstructionalPhrases =
+        aiResponse.toLowerCase().includes('you should run') ||
+        aiResponse.toLowerCase().includes('you need to run') ||
+        aiResponse.toLowerCase().includes('please run') ||
+        aiResponse.toLowerCase().includes('next, run') ||
+        aiResponse.toLowerCase().includes('then run') ||
+        aiResponse.toLowerCase().includes('step-by-step') ||
+        aiResponse.toLowerCase().includes('here is the code') ||
+        aiResponse.toLowerCase().includes('manually');
+
+      const isTalkingInsteadOfActing = (hasCodeBlock && !aiResponse.includes('"tool"')) || hasInstructionalPhrases;
+      const looksLikeCompletion = aiResponse.toUpperCase().includes('TASK COMPLETE') || (aiResponse.length < 300 && iteration > 1);
+      const containsJsonButFailed = (aiResponse.includes('{') && (aiResponse.includes('"tool"') || aiResponse.includes('"tool_calls"')));
+
+      console.log(`[NO_TOOLS] hasCodeBlock=${hasCodeBlock}, hasInstructionalPhrases=${hasInstructionalPhrases}, isTalkingInsteadOfActing=${isTalkingInsteadOfActing}, looksLikeCompletion=${looksLikeCompletion}, containsJsonButFailed=${containsJsonButFailed}`);
+
+      // Nudge if talking instead of acting OR if JSON parsing failed but intent was clear
+      if (containsJsonButFailed) {
+        console.log("[NUDGE] AI intent was clear (found JSON keywords) but all tool call parsing attempts failed.");
+        currentMessages.push({ role: 'assistant', content: aiResponse });
+        currentMessages.push({ role: 'user', content: 'ATTENTION: You provided tool-calling JSON but it could not be processed properly (likely due to unescaped characters or syntax errors). Please output ONLY the valid JSON tool call for the NEXT step, ensuring all quotes and backslashes are properly escaped.' });
+        continue;
+      }
+
+      if (isTalkingInsteadOfActing && !looksLikeCompletion) {
+        console.log("[NUDGE] Agent providing instructions instead of using tools");
+        currentMessages.push({ role: 'assistant', content: aiResponse });
+        currentMessages.push({ role: 'user', content: 'ACTION REQUIRED: Do NOT explain or provide manual steps. You are an autonomous agent. Use your tools (write_file, edit_file, run_command) to execute the solution directly. Output a JSON tool call NOW.' });
+        continue;
+      }
+
+      // This is the final response
+      console.log("[FINAL_RESPONSE] No tools parsed, treating as final response");
+      conversationHistory.push({ role: 'assistant', content: aiResponse });
+
+      // Save to chat history
+      if (currentHistoryManager) {
+        const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
+        await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+      }
+
+      // Trigger background KI distillation
+      distillKnowledgeBackground(conversationHistory, model, config).catch(e => console.error(e));
+
+      return { finalResponse: aiResponse, steps };
+    }
+
+    // Standardize iterative thinking
+    consecutiveThinkingCount = 0;
+
+    // Process all tools found in the message concurrently
+    let shouldAbort = false;
+    let finalMsg = '';
+
+    const currentIterCallsStr = JSON.stringify(toolCalls.map(tc => ({ tool: tc.tool, path: tc.path, command: tc.command })));
+
+    // Detect direct repetition
+    if (currentIterCallsStr === previousToolCallStr) {
+      repeatCount++;
+      if (repeatCount >= 3) {
+        finalMsg = '⚠️ Agent got stuck in a repetitive loop. Task aborted.';
+        shouldAbort = true;
+      } else {
+        turnResults.push('[SYSTEM] You repeated the exact same tool calls. Change your strategy.');
+      }
+    } else {
+      repeatCount = 0;
+      previousToolCallStr = currentIterCallsStr;
+    }
+
+    // Detect ping-pong loops
+    toolHistory.push(currentIterCallsStr);
+    if (toolHistory.length > 4) toolHistory.shift();
+
+    const isPingPong = toolHistory.length === 4 &&
+      toolHistory[0] === toolHistory[2] &&
+      toolHistory[1] === toolHistory[3];
+
+    if (isPingPong) {
+      turnResults.push(`[SYSTEM] Loop detected. Strategy change required.`);
+      toolHistory = [];
+    }
+
+    if (!shouldAbort && turnResults.length === 0) {
+      // Execute all tools sequentially so each can adapt based on previous results
+      for (const toolCall of toolCalls) {
+        if (abortRequested) {
+          shouldAbort = true;
+          finalMsg = 'Task stopped by user.';
+          break;
+        }
+
+        const toolName = toolCall.tool;
+        const toolId = JSON.stringify(toolCall);
+
+        // Check if this tool was already executed eagerly
+        if (eagerToolResults.has(toolId)) {
+          const execution = eagerToolResults.get(toolId)!;
+          console.log(`[LOOP] Using eager result for: ${toolName}`);
+
+          const truncatedResult = execution.result.length > 15000
+            ? execution.result.substring(0, 15000) + '\n... (truncated)'
+            : execution.result;
+
+          let enhancedResult = truncatedResult;
+          if (toolName === 'run_command' && (truncatedResult.toLowerCase().includes('operation cancelled') || truncatedResult.includes('Error:') || truncatedResult.includes('ENOENT'))) {
+            enhancedResult = analyzeCommandError(truncatedResult, toolCall.command || '');
+          }
+
+          turnResults.push(`[TOOL RESULT] ${toolName}:\n${enhancedResult}`);
+          continue;
+        }
+
+        const toolSummary = getToolSummary(toolCall);
+        const stepData: any = {
+          tool: toolName,
+          status: 'running',
+          summary: toolSummary,
+          iteration: iteration + 1,
+          startTime: Date.now()
+        };
+
+        const stepIndex = steps.push(stepData) - 1;
+        safeSend('agent:step', stepData);
+
+        console.log(`[LOOP] Executing (Sequential): ${toolName}`);
+
+        try {
+          const execution = await executeToolCall(toolCall, workspacePath, iteration + 1, isAutopilotMode, model, config);
+
+          const truncatedResult = execution.result.length > 15000
+            ? execution.result.substring(0, 15000) + '\n... (truncated)'
+            : execution.result;
+
+          const isError = execution.abort || (typeof execution.result === 'string' && execution.result.startsWith('❌'));
+          let finalSummary = steps[stepIndex].summary;
+          let finalLogs = execution.logs || [];
+
+          if (isError) {
+            finalSummary += ` (Failed)`;
+            finalLogs = [execution.result, ...finalLogs];
+          } else if (execution.result && execution.result.length > 0 && toolName !== 'read_file' && toolName !== 'readMultipleFiles') {
+            finalSummary += ` (${execution.result.substring(0, 30).replace(/\n/g, ' ')}...)`;
+          }
+
+          steps[stepIndex].status = isError ? 'failed' : 'done';
+          steps[stepIndex].summary = finalSummary;
+          steps[stepIndex].result = truncatedResult.substring(0, 500);
+          steps[stepIndex].logs = finalLogs;
+          if (execution.data) steps[stepIndex].data = execution.data;
+
+          safeSend('agent:step', { ...steps[stepIndex], status: steps[stepIndex].status });
+
+          let enhancedResult = truncatedResult;
+          if (toolName === 'run_command' && (truncatedResult.toLowerCase().includes('operation cancelled') || truncatedResult.includes('Error:') || truncatedResult.includes('ENOENT'))) {
+            enhancedResult = analyzeCommandError(truncatedResult, toolCall.command || '');
+          }
+
+          // Enhanced result analysis with code intelligence (with timeout)
+          if (toolName === 'write_file' || toolName === 'edit_file' || toolName === 'strReplace') {
+            if (codeIntelligence && workspacePath && toolCall.path) {
+              try {
+                const suggestions = await Promise.race([
+                  codeIntelligence.suggestRefactoring(workspacePath, toolCall.path),
+                  new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 5000))
+                ]);
+                if (suggestions.length > 0) {
+                  enhancedResult += `\n\n[CODE INTELLIGENCE] Suggestions:\n${suggestions.slice(0, 2).join('\n')}`;
+                }
+              } catch (error) {
+                console.warn('[CODE INTELLIGENCE] Failed to analyze file:', error);
+              }
+            }
+          }
+
+          if (execution.abort) {
+            shouldAbort = true;
+            finalMsg = `Task stopped: User denied operation or requested abort during ${toolName}.`;
+            break;
+          }
+
+          turnResults.push(`[${toolName} Result]\n${enhancedResult}`);
+
+          // Record learning from tool execution (non-blocking with timeout)
+          if (learningSystem && contextMemory) {
+            try {
+              const toolSuccess = !enhancedResult.toLowerCase().includes('error:') &&
+                !enhancedResult.toLowerCase().includes('failed') &&
+                !execution.abort;
+
+              // Fire and forget with timeout - don't block agent loop
+              Promise.race([
+                recordInteractionForLearning(
+                  userMessage,
+                  enhancedResult,
+                  [toolName],
+                  toolSuccess,
+                  Date.now() - (steps[stepIndex].startTime || Date.now()),
+                  {
+                    workspacePath,
+                    toolCall,
+                    iteration: iteration + 1,
+                    executionPlan: executionPlan?.id
+                  }
+                ),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Learning recording timed out')), 10000))
+              ]).catch(error => {
+                console.warn('[LEARNING] Failed to record tool execution:', error);
+              });
+
+              // Update strategic planning based on results
+              if (executionPlan && strategicPlanner) {
+                const currentTask = executionPlan.tasks[currentTaskIndex];
+                if (currentTask && toolSuccess) {
+                  console.log(`[STRATEGIC PLANNING] Task "${currentTask.description}" completed successfully`);
+                  currentTaskIndex++;
+
+                  // Check if we should move to next parallel group
+                  if (currentTaskIndex < executionPlan.tasks.length) {
+                    const nextTask = executionPlan.tasks[currentTaskIndex];
+                    console.log(`[STRATEGIC PLANNING] Moving to next task: "${nextTask.description}"`);
+                  }
+                }
+              }
+            } catch (error) {
+              console.warn('[LEARNING] Failed to update strategic planning:', error);
+            }
+          }
+
+          // If this command failed, we might want to stop here and let the agent adapt
+          if (enhancedResult.toLowerCase().includes('error:') || enhancedResult.toLowerCase().includes('failed')) {
+            console.log(`[LOOP] Command failed, stopping sequential execution to let agent adapt`);
+            break;
+          }
+
+        } catch (e: any) {
+          steps[stepIndex].status = 'done';
+          steps[stepIndex].result = `Tool failed: ${e.message}`;
+          safeSend('agent:step', { ...steps[stepIndex], status: 'done' });
+          turnResults.push(`[${toolName} Error]\nTool execution failed: ${e.message}`);
+          // Stop on error so agent can adapt
+          break;
+        }
+      }
+    }
+
+    currentMessages.push({ role: 'assistant', content: aiResponse });
+    currentMessages.push({ role: 'user', content: turnResults.join('\n\n') + '\n\n[Identify next actions or provide final response]' });
+
+    if (shouldAbort) {
+      if (!finalMsg) finalMsg = 'Task stopped.';
+      conversationHistory.push({ role: 'assistant', content: finalMsg });
+      if (currentHistoryManager) {
+        const title = conversationHistory.find(m => m.role === 'user')?.content.substring(0, 40) || 'Untitled Chat';
+        await currentHistoryManager.saveThread(currentConversationId, title, conversationHistory);
+      }
+      // Trigger background KI distillation
+      distillKnowledgeBackground(conversationHistory, model, config).catch(e => console.error(e));
+      return { finalResponse: finalMsg, steps };
+    }
+
+    if (toolCalls.length === 0 && iteration > 0) {
+      // Agent provided a final response and this wasn't the first turn
+      console.log('[AUTO-KNOWLEDGE] Agent finished task. Triggering distillation...');
+      distillKnowledgeBackground(conversationHistory, model, config).catch(e => console.error(e));
+    }
+
+    iteration++; // Increment iteration at the end of the loop
+  }
+
+  // Final catch-all for when loop exits normally
+  if (iteration > 0) {
+    distillKnowledgeBackground(conversationHistory, model, config).catch(e => console.error(e));
+  }
+
+  return { finalResponse: 'Task completed.', steps };
+}
+
+let refreshTimeout: NodeJS.Timeout | null = null;
+async function refreshManifest(workspacePath: string) {
+  // Debounce to prevent thrashing during large file operations
+  if (refreshTimeout) clearTimeout(refreshTimeout);
+
+  refreshTimeout = setTimeout(async () => {
+    const files = await readDirectoryRecursive(workspacePath, 3000);
+    if (files.length > 0) {
+      let manifest = `## PROJECT MANIFEST\n\n### Root: ${workspacePath}\n\n#### Directory Structure (File List):\n`;
+      manifest += files.map(f => `- ${f.path.replace(workspacePath, '').replace(/^[\\/]/, '')}`).join('\n');
+      manifest += '\n\n#### Critical Metadata:\n(Use read_file to access full contents)\n';
+      workspaceManifest = manifest;
+      console.log(`[MANIFEST] Updated manifest with ${files.length} files.`);
+    }
+    refreshTimeout = null;
+  }, 1000); // Wait 1s after last change before rescanning
+}
+
+// Human-readable summary for a tool call
+function getToolSummary(toolCall: any): string {
+  const path = toolCall.path || '(missing path)';
+  switch (toolCall.tool) {
+    case 'read_file': return `Reading ${path}`;
+    case 'write_file': return `Writing ${path}`;
+    case 'edit_file': return `Editing ${path} (${toolCall.edits?.length || 0} edits)`;
+    case 'list_directory': return `Listing ${path}`;
+    case 'search_files': return `Searching for "${toolCall.pattern || '?'}"${toolCall.include ? ` in ${toolCall.include}` : ''}`;
+    case 'run_command': return `Running: ${toolCall.command || '(missing command)'}`;
+    case 'create_directory': return `Creating directory ${path}`;
+    case 'delete_file': return `Deleting ${path}`;
+    case 'semantic_search': return `Searching semantically for "${toolCall.query || '?'}"`;
+    case 'get_blast_radius': return `Calculating blast radius for ${path}`;
+    case 'apply_diffs': return `Applying diffs to ${toolCall.changes?.length || 0} files`;
+    case 'validate_project': return 'Performing project-wide validation';
+    case 'run_tests': return 'Running test suite';
+    case 'learn_fact': return `Learning fact: ${toolCall.topic}`;
+    case 'save_knowledge_item': return `Saving KI: ${toolCall.title}`;
+    case 'search_knowledge': return `Searching Knowledge Base for: "${toolCall.query}"`;
+    case 'readCode': return `Reading code structure from ${path}`;
+    case 'editCode': return `Editing code in ${path}`;
+    case 'getDiagnostics': return `Getting diagnostics for ${path}`;
+    case 'grepSearch': return `Grep searching for "${toolCall.pattern || '?'}"${toolCall.include ? ` in ${toolCall.include}` : ''}`;
+    case 'fileSearch': return `Fuzzy finding "${toolCall.query || '?'}"`;
+    case 'readMultipleFiles': return `Reading ${toolCall.files?.length || 0} files`;
+    case 'semanticRename': return `Renaming "${toolCall.oldName}" to "${toolCall.newName}"`;
+    case 'smartRelocate': return `Moving ${toolCall.sourcePath} to ${toolCall.destinationPath}`;
+    case 'strReplace': return `Replacing string in ${path}`;
+    case 'invokeSubAgent': return `Delegating to ${toolCall.agentName}: ${toolCall.task?.substring(0, 50) || ''}...`;
+    case 'browser_subagent': return `Browser Task: ${toolCall.TaskName || 'Automated Web Browsing'}`;
+    case 'listSubAgents': return `Listing available sub-agents`;
+    // Tier 1 tools
+    case 'webFetch': return `Fetching URL: ${toolCall.url}`;
+    case 'web_search':
+    case 'search_web': return `Web search: "${toolCall.query || toolCall.prompt}"`;
+    case 'generate_image': return `Generating image: ${toolCall.prompt || toolCall.description}`;
+    case 'mcp_call': return `MCP tool: ${toolCall.toolName}`;
+    case 'createSpec': return `Creating spec: ${toolCall.name}`;
+    case 'readSpec': return `Reading spec: ${toolCall.slug}`;
+    case 'updateSpec': return `Updating spec ${toolCall.slug}/${toolCall.docType}`;
+    case 'listSpecs': return `Listing all specs`;
+    case 'completeTask': return `Completing task in ${toolCall.slug}: ${toolCall.taskDescription?.substring(0, 40)}`;
+    case 'generate_diagram': return `Generating Mermaid diagram: ${toolCall.title}`;
+    default: return toolCall.tool;
+  }
+}
+
+// ------ WORKSPACE FILE WATCHER ------
+function setupWorkspaceWatcher(watchPath: string) {
+  if (workspaceWatcher) {
+    workspaceWatcher.close();
+    workspaceWatcher = null;
+  }
+
+  // Initialize hooks manager for this workspace
+  hooksManager = new HooksManager(watchPath);
+  hooksManager.initialize().catch(console.error);
+
+  // Initialize steering manager for this workspace
+  steeringManager = new SteeringManager(watchPath);
+  steeringManager.initialize().catch(console.error);
+
+  // Initialize specs manager
+  specsManager = new SpecsManager(watchPath);
+  specsManager.initialize().catch(console.error);
+
+  // Initialize MCP manager (connects to servers defined in .whizcode/mcp-servers.json)
+  if (mcpManager) mcpManager.shutdown();
+  mcpManager = new MCPManager(watchPath);
+  mcpManager.initialize().catch(console.error);
+
+  // Initialize memory manager
+  memoryManager = new MemoryManager(watchPath);
+  memoryManager.initialize().catch(console.error);
+
+  // Initialize history manager
+  currentHistoryManager = new HistoryManager(watchPath);
+  currentHistoryManager.initialize().catch(console.error);
+
+  // Initialize knowledge service
+  knowledgeService = new KnowledgeService(watchPath);
+
+  // Initialize enhanced AI systems
+  contextMemory = new ContextMemory();
+  strategicPlanner = new StrategicPlanner(callSimpleAI);
+  learningSystem = new LearningSystem(contextMemory);
+  codeIntelligence = new CodeIntelligence();
+
+  // Initialize high-priority systems
+  enhancedMCPSystem = new EnhancedMCPSystem(watchPath);
+  vectorSearchSystem = new VectorSearchSystem(watchPath);
+  errorRecoverySystem = new ErrorRecoverySystem(watchPath, callSimpleAI);
+  toolResultCache = new ToolResultCache(watchPath);
+
+  // Start learning session
+  if (contextMemory) {
+    contextMemory.startSession();
+  }
+
+  // Start vector indexing in background
+  if (vectorSearchSystem) {
+    vectorSearchSystem.indexWorkspace(watchPath).catch(error => {
+      console.warn('[VECTOR] Background indexing failed:', error);
+    });
+  }
+
+  // Warm up tool cache
+  if (toolResultCache) {
+    toolResultCache.warmupCache(watchPath).catch(error => {
+      console.warn('[CACHE] Cache warmup failed:', error);
+    });
+  }
+
+  // Reset conversation ID for new workspace or session
+  currentConversationId = Date.now().toString();
+
+  workspaceWatcher = chokidar.watch(watchPath, {
+    ignored: /(^|[\\/\\])(node_modules|\.git|dist|dist-electron|build|\.next|__pycache__|\.venv|venv|\.cache|coverage)([\\/\\]|$)/,
+    persistent: true,
+    ignoreInitial: true,
+    depth: 20,
+    awaitWriteFinish: {
+      stabilityThreshold: 300,
+      pollInterval: 100
+    }
+  });
+
+  const notifyRenderer = async (type: string, filePath: string) => {
+    safeSend('fs:directoryChanged', { type, filePath });
+
+    // Trigger file hooks
+    if (hooksManager) {
+      let eventType: 'fileEdited' | 'fileCreated' | 'fileDeleted' | null = null;
+      if (type === 'add') eventType = 'fileCreated';
+      else if (type === 'unlink') eventType = 'fileDeleted';
+      else if (type === 'change') eventType = 'fileEdited';
+
+      if (eventType) {
+        const triggeredHooks = await hooksManager.triggerFileEvent(eventType, filePath);
+        if (triggeredHooks.length > 0) {
+          console.log(`[HOOKS] Triggered ${triggeredHooks.length} hooks for ${eventType} on ${filePath}`);
+          for (const hook of triggeredHooks) {
+            if (hook.action === 'runCommand' && hook.command) {
+              await execAsync(hook.command.replace('${filePath}', filePath), { cwd: watchPath }).catch(e => {
+                console.warn(`[HOOK] File hook command failed: ${e.message}`);
+              });
+            } else if (hook.action === 'askAgent' && hook.prompt) {
+              const fallbackModel = { provider: 'ollama', model: 'qwen2.5-coder:latest' };
+              await runAgentLoop(
+                `[AUTOMATED FILE HOOK: ${hook.id}]\nFile: ${filePath}\nEvent: ${eventType}\n\n${hook.prompt.replace('${filePath}', filePath)}`,
+                fallbackModel, // Use defaults for background hooks
+                { openaiKey: '', geminiKey: '' },
+                watchPath,
+                null,
+                false
+              ).catch(e => console.warn(`[HOOK] askAgent failed: ${e.message}`));
+            }
+          }
+        }
+      }
+    }
+
+    // Refresh manifest on file changes to keep agent context up-to-date
+    if (currentWorkspacePath) {
+      refreshManifest(currentWorkspacePath).catch(console.error);
+    }
+  };
+
+  workspaceWatcher.on('add', (path: string) => notifyRenderer('add', path));
+  workspaceWatcher.on('change', (path: string) => notifyRenderer('change', path));
+  workspaceWatcher.on('addDir', (path: string) => notifyRenderer('addDir', path));
+  workspaceWatcher.on('unlink', (path: string) => notifyRenderer('unlink', path));
+  workspaceWatcher.on('unlinkDir', (path: string) => notifyRenderer('unlinkDir', path));
+
+  console.log(`[WATCHER] Watching workspace: ${watchPath}`);
+}
+
+// ------ MENU HANDLERS ------
+ipcMain.handle('dialog:openFile', async () => {
+  if (!win) return { canceled: true };
+  return await dialog.showOpenDialog(win, {
+    properties: ['openFile']
+  });
+});
+
+ipcMain.handle('dialog:openFolder', async () => {
+  if (!win) return { canceled: true };
+  const result = await dialog.showOpenDialog(win, {
+    properties: ['openDirectory']
+  });
+  // Start watching the selected folder and update current workspace
+  if (!result.canceled && result.filePaths?.length > 0) {
+    currentWorkspacePath = result.filePaths[0];
+    setupWorkspaceWatcher(result.filePaths[0]);
+    await saveLastWorkspace(result.filePaths[0]);
+  }
+  return result;
+});
+
+ipcMain.handle('dialog:saveFile', async (_event, content) => {
+  if (!win) return { canceled: true };
+  const result = await dialog.showSaveDialog(win, {
+    defaultPath: 'untitled.txt'
+  });
+  if (!result.canceled && result.filePath && content) {
+    await fs.writeFile(result.filePath, content, 'utf-8');
+  }
+  return result;
+});
+
+ipcMain.handle('fs:readFile', async (_event, filePath, workspacePath) => {
+  try {
+    const validPath = validateFilePath(filePath);
+    if (workspacePath) {
+      validatePathInWorkspace(validPath, workspacePath);
+    }
+    return await fs.readFile(validPath, 'utf-8');
+  } catch (e: any) {
+    console.error('[SECURITY] fs:readFile error:', e.message);
+    return null;
+  }
+});
+
+ipcMain.handle('fs:writeFile', async (_event, filePath, content, workspacePath) => {
+  try {
+    const validPath = validateFilePath(filePath);
+    const validContent = validateStringInput(content, 50000000); // 50MB max
+    if (workspacePath) {
+      validatePathInWorkspace(validPath, workspacePath);
+    }
+    await fs.writeFile(validPath, validContent, 'utf-8');
+    // Notify renderer that file has changed
+    safeSend('file:changed', { path: validPath, content: validContent });
+    // Clear diagnostics cache for this file
+    diagnosticsService.clearCache(validPath);
+    return true;
+  } catch (e: any) {
+    console.error('[SECURITY] fs:writeFile error:', e.message);
+    return false;
+  }
+});
+
+// ------ DIAGNOSTICS HANDLERS ------
+ipcMain.handle('diagnostics:check', async (_event, filePath: string, workspacePath: string, content?: string) => {
+  try {
+    const diagnostics = await diagnosticsService.checkFile(filePath, workspacePath, content);
+    return diagnostics;
+  } catch (error: any) {
+    console.error('[DIAGNOSTICS] Error checking file:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('diagnostics:checkMultiple', async (_event, filePaths: string[], workspacePath: string) => {
+  try {
+    const results: Record<string, any[]> = {};
+    for (const filePath of filePaths) {
+      results[filePath] = await diagnosticsService.checkFile(filePath, workspacePath);
+    }
+    return results;
+  } catch (error: any) {
+    console.error('[DIAGNOSTICS] Error checking files:', error);
+    return {};
+  }
+});
+
+// ------ AZURE HANDLERS ------
+ipcMain.handle('azure:generateToken', async (_event, { loginUrl, username, password }) => {
+  try {
+    const token = await getAzureToken(loginUrl, username, password, true);
+    return { success: true, expires: azureTokenCache?.expires };
+  } catch (e: any) {
+    console.error('[AZURE] Token manual generation failed:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('azure:getTokenStatus', async () => {
+  const cached = await loadAzureToken();
+  if (cached && cached.expires > Date.now()) {
+    return {
+      hasToken: true,
+      expires: cached.expires,
+      timeLeft: Math.round((cached.expires - Date.now()) / (60 * 60 * 1000)) // Hours
+    };
+  }
+  return { hasToken: false };
+});
+
+// ------ SPEC IPC HANDLERS ------
+ipcMain.handle('specs:list', async () => {
+  if (!specsManager) return [];
+  return await specsManager.listSpecs();
+});
+
+ipcMain.handle('specs:get', async (_event, slug: string) => {
+  if (!specsManager) return null;
+  return await specsManager.getSpec(slug);
+});
+
+ipcMain.handle('specs:create', async (_event, name: string, requirements?: string) => {
+  if (!specsManager) return { error: 'No workspace open' };
+  return await specsManager.createSpec(name, requirements);
+});
+
+ipcMain.handle('specs:update', async (_event, slug: string, docType: string, content: string) => {
+  if (!specsManager) return false;
+  return await specsManager.updateSpecDocument(slug, docType as any, content);
+});
+
+ipcMain.handle('specs:completeTask', async (_event, slug: string, taskDescription: string) => {
+  if (!specsManager) return { success: false, message: 'No workspace open' };
+  return await specsManager.completeTask(slug, taskDescription);
+});
+
+ipcMain.handle('specs:delete', async (_event, slug: string) => {
+  if (!specsManager) return false;
+  return await specsManager.deleteSpec(slug);
+});
+
+ipcMain.handle('fs:readDirectory', async (_event, dirPath) => {
+  try {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    return entries.map(entry => ({
+      name: entry.name,
+      isDirectory: entry.isDirectory(),
+      path: join(dirPath, entry.name)
+    })).sort((a, b) => {
+      if (a.isDirectory && !b.isDirectory) return -1;
+      if (!a.isDirectory && b.isDirectory) return 1;
+      return a.name.localeCompare(b.name);
+    });
+  } catch (e: any) {
+    console.error(e);
+    return [];
+  }
+});
+
+ipcMain.handle('agent:permission-response', async (_event, decision) => {
+  console.log(`[IPC] agent:permission-response:`, decision);
+
+  // If there's a specific requestId, use it; otherwise fall back to the first pending request
+  const requestId = decision.requestId;
+
+  if (requestId && pendingPermissionResolvers.has(requestId)) {
+    const resolver = pendingPermissionResolvers.get(requestId)!;
+    resolver(decision);
+    return { success: true };
+  }
+
+  // Fallback: resolve the first pending request (for backward compatibility)
+  if (pendingPermissionResolvers.size > 0) {
+    const firstResolver = pendingPermissionResolvers.values().next().value;
+    if (firstResolver) {
+      firstResolver(decision);
+      return { success: true };
+    }
+  }
+
+  console.warn('[IPC] No pending permission resolver found!');
+  return { success: false, error: 'No pending permission' };
+});
+
+ipcMain.on('app:exit', () => app.quit());
+ipcMain.handle('app:open-external', (_event, url) => shell.openExternal(url));
+
+// Terminal handlers are managed in setupTerminalHandlers
+
+// ------ AI INFRASTRUCTURE ------
+
+ipcMain.handle('ollama:getModels', async () => {
+  try {
+    console.log('[OLLAMA] Attempting to connect to Ollama at http://127.0.0.1:11434');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    const res = await fetch('http://127.0.0.1:11434/api/tags', {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      console.error(`[OLLAMA] HTTP ${res.status}: ${res.statusText}`);
+      throw new Error(`Ollama HTTP ${res.status}: ${res.statusText}`);
+    }
+
+    const data: any = await res.json();
+    /*console.log('[OLLAMA] Response received:', data);*/
+
+    if (!data.models || !Array.isArray(data.models)) {
+      console.error('[OLLAMA] Invalid response format:', data);
+      throw new Error('Invalid response format from Ollama');
+    }
+
+    const modelNames = data.models.map((m: any) => m.name);
+    console.log('[OLLAMA] Found models:', modelNames);
+    return modelNames;
+  } catch (e: any) {
+    console.error('[OLLAMA] Failed to get models:', e);
+    if (e.name === 'AbortError') {
+      return { error: 'Ollama connection timeout - is Ollama running on port 11434?' };
+    } else if (e.code === 'ECONNREFUSED' || e.message.includes('ECONNREFUSED')) {
+      return { error: 'Connection refused - Ollama is not running on port 11434' };
+    } else if (e.message.includes('fetch') || e.name === 'TypeError') {
+      return { error: 'Cannot connect to Ollama - check if it\'s running (ollama serve)' };
+    }
+    return { error: e.message };
+  }
+});
+
+// Ollama health check
+ipcMain.handle('ollama:healthCheck', async () => {
+  try {
+    console.log('[OLLAMA] Health check...');
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+    const res = await fetch('http://127.0.0.1:11434/api/version', {
+      method: 'GET',
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (res.ok) {
+      const data = await res.json() as any;
+      console.log('[OLLAMA] Health check passed, version:', data.version);
+      return { healthy: true, version: data.version };
+    } else {
+      return { healthy: false, error: `HTTP ${res.status}` };
+    }
+  } catch (e: any) {
+    console.error('[OLLAMA] Health check failed:', e.message);
+    return { healthy: false, error: e.message };
+  }
+});
+
+ipcMain.handle('fs:readDirectoryRecursive', async (_event, dirPath: string) => {
+  try {
+    return await readDirectoryRecursive(dirPath);
+  } catch (e: any) {
+    console.error(e);
+    return [];
+  }
+});
+
+ipcMain.handle('execute-agent-task', async (_event, { task, model, workspacePath, activeFile, config, isAutopilotMode, images = [] }) => {
+  console.log(`[AGENT_TASK] Starting agent task: "${task.substring(0, 50)}..." with ${images.length} images`);
+  if (!workspacePath) {
+    return {
+      response: "I'm ready to help, but I need you to open a folder first so I have a place to work. Please use the 'Open Folder' button in the Title Bar or File menu.",
+      steps: []
+    };
+  }
+  try {
+    abortRequested = false;
+    agentAbortController = new AbortController();
+
+    // Reset iteration limit for new tasks
+    currentIterationLimit = MAX_AGENT_ITERATIONS;
+
+    // 1. Initial Workspace Scan or Path Change
+    const normalizedPath = workspacePath ? path.normalize(workspacePath) : '';
+    if (normalizedPath && (normalizedPath !== currentWorkspacePath || !workspaceContextLoaded)) {
+      if (!indexingPromise || normalizedPath !== currentWorkspacePath) {
+        indexingPromise = (async () => {
+          const isNewWorkspace = normalizedPath !== currentWorkspacePath;
+          currentWorkspacePath = normalizedPath;
+          workspaceContextLoaded = true;
+
+          console.log('[INDEXING] Building project manifest:', normalizedPath);
+          safeSend('agent:step', { tool: 'indexing_workspace', status: 'running', summary: `Indexing: ${normalizedPath}` });
+
+          // Start watching workspace for file changes
+          setupWorkspaceWatcher(normalizedPath);
+
+          await refreshManifest(normalizedPath);
+
+          // Initialize or reset services
+          if (isNewWorkspace || !graphService) {
+            graphService = new CodeGraphService();
+            await graphService.initialize(normalizedPath);
+          }
+          if ((config.voyageKey || config.modelProvider === 'azure-gateway') && (isNewWorkspace || !indexingService)) {
+            indexingService = new IndexingService({
+              voyageKey: config.voyageKey,
+              azure: config.modelProvider === 'azure-gateway' ? {
+                loginUrl: config.azureLoginUrl,
+                embeddingUrl: config.azureEmbeddingUrl,
+                username: config.azureUsername,
+                password: config.azurePassword
+              } : undefined,
+              getToken: getAzureToken
+            }, (p) => graphService?.updateFile(p));
+            await indexingService.initialize(normalizedPath);
+            await indexingService.indexWorkspace();
+          }
+
+          safeSend('agent:step', { tool: 'indexing_workspace', status: 'done', summary: `Indexed workspace context` });
+        })();
+      }
+      await indexingPromise;
+    }
+
+    if (!promptManager) {
+      promptManager = new PromptManager();
+    }
+
+    // 2. Run the agent loop
+    console.log(`[AGENT_TASK] Running agent loop...`);
+    const result = await runAgentLoop(task, model, config, workspacePath, activeFile, isAutopilotMode, 0, images);
+    console.log(`[AGENT_TASK] Agent loop completed, returning result`);
+    return {
+      response: result.finalResponse,
+      steps: result.steps
+    };
+
+  } catch (err: any) {
+    console.error('Agent error:', err);
+    return {
+      response: `Error: ${err.message}. Check your AI provider settings.`,
+      steps: []
+    };
+  }
+});
+
+ipcMain.handle('agent:stop', () => {
+  abortRequested = true;
+  if (agentAbortController) {
+    agentAbortController.abort();
+    agentAbortController = null;
+  }
+  // Clear all pending permission resolvers
+  for (const resolver of pendingPermissionResolvers.values()) {
+    resolver({ approved: false });
+  }
+  pendingPermissionResolvers.clear();
+
+  for (const procObj of backgroundProcesses.values()) {
+    try {
+      const proc = procObj.process;
+      if (process.platform === 'win32' && proc.pid) {
+        exec(`taskkill /pid ${proc.pid} /t /f`);
+      } else {
+        proc.kill('SIGKILL');
+      }
+    } catch (e) {
+      console.error('Failed to kill active process:', e);
+    }
+  }
+  backgroundProcesses.clear();
+  return true;
+});
+
+// Reset conversation when workspace changes
+ipcMain.handle('agent:reset', async () => {
+  conversationHistory = [];
+  currentIterationLimit = MAX_AGENT_ITERATIONS; // Reset iteration limit
+  workspaceContextLoaded = false;
+  workspaceManifest = '';
+  console.log('🔄 Agent conversation reset');
+  return true;
+});
+
+// Hooks management
+ipcMain.handle('hooks:list', async () => {
+  if (!hooksManager) return [];
+  return hooksManager.getAllHooks();
+});
+
+ipcMain.handle('hooks:get', async (_event, hookId: string) => {
+  if (!hooksManager) return null;
+  return hooksManager.getHook(hookId);
+});
+
+ipcMain.handle('hooks:save', async (_event, hook: any) => {
+  if (!hooksManager) throw new Error('No workspace open');
+  await hooksManager.saveHook(hook);
+  return { success: true };
+});
+
+ipcMain.handle('hooks:delete', async (_event, hookId: string) => {
+  if (!hooksManager) throw new Error('No workspace open');
+  await hooksManager.deleteHook(hookId);
+  return { success: true };
+});
+
+ipcMain.handle('hooks:reload', async () => {
+  if (!hooksManager) throw new Error('No workspace open');
+  await hooksManager.loadHooks();
+  return { success: true };
+});
+
+// Steering management
+ipcMain.handle('steering:list', async () => {
+  if (!steeringManager) return [];
+  return steeringManager.getAllSteeringFiles();
+});
+
+ipcMain.handle('steering:get', async (_event, steeringId: string) => {
+  if (!steeringManager) return null;
+  return steeringManager.getSteeringFile(steeringId);
+});
+
+ipcMain.handle('steering:save', async (_event, steering: any) => {
+  if (!steeringManager) throw new Error('No workspace open');
+  await steeringManager.saveSteeringFile(steering);
+  return { success: true };
+});
+
+ipcMain.handle('steering:delete', async (_event, steeringId: string) => {
+  if (!steeringManager) throw new Error('No workspace open');
+  await steeringManager.deleteSteeringFile(steeringId);
+  return { success: true };
+});
+
+ipcMain.handle('steering:reload', async () => {
+  if (!steeringManager) throw new Error('No workspace open');
+  await steeringManager.loadSteeringFiles();
+  return { success: true };
+});
+
+
+// ------ SEARCH HANDLERS ------
+ipcMain.handle('search:files', async (_event, { path, query, include, exclude }) => {
+  try {
+    const results: Array<{ file: string, line: number, content: string }> = [];
+
+    async function searchInFile(filePath: string) {
+      try {
+        const content = await fs.readFile(filePath, 'utf-8');
+        const lines = content.split('\n');
+        const regex = new RegExp(query, 'gi');
+
+        lines.forEach((line, idx) => {
+          if (regex.test(line)) {
+            results.push({
+              file: filePath,
+              line: idx + 1,
+              content: line.trim()
+            });
+          }
+        });
+      } catch (err) {
+        // Skip files that can't be read
+      }
+    }
+
+    async function searchDirectory(dirPath: string) {
+      const entries = await fs.readdir(dirPath, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const fullPath = join(dirPath, entry.name);
+
+        if (entry.isDirectory()) {
+          if (!SKIP_DIRS.has(entry.name)) {
+            await searchDirectory(fullPath);
+          }
+        } else if (entry.isFile()) {
+          const ext = entry.name.substring(entry.name.lastIndexOf('.'));
+          if (!BINARY_EXTS.has(ext)) {
+            // Apply include/exclude patterns
+            if (include && !entry.name.includes(include)) continue;
+            if (exclude && entry.name.includes(exclude)) continue;
+
+            await searchInFile(fullPath);
+          }
+        }
+      }
+    }
+
+    await searchDirectory(path);
+    return results.slice(0, 500); // Limit results
+  } catch (err) {
+    console.error('Search error:', err);
+    return [];
+  }
+});
+
+// ------ GIT HANDLERS ------
+ipcMain.handle('git:status', async (_event, workspacePath) => {
+  try {
+    const validPath = validateFilePath(workspacePath);
+    const execFileAsync = promisify(execFile);
+    
+    // Check if git is available
+    const { stdout: branchOut } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: validPath });
+    const branch = branchOut.trim();
+
+    // Get status
+    const { stdout: statusOut } = await execFileAsync('git', ['status', '--porcelain'], { cwd: validPath });
+    const changes = statusOut.split(/\r?\n/)
+      .filter(line => line.trim())
+      .map(line => {
+        const status = line.substring(0, 2).trim();
+        const file = line.substring(3).trim();
+        return { file, status: status || 'M' };
+      });
+
+    console.log(`[GIT_STATUS] Branch: ${branch}, changes: ${changes.length}`);
+    return { branch, changes };
+  } catch (err) {
+    console.error('[SECURITY] Git status error:', err);
+    return null;
+  }
+});
+
+ipcMain.handle('git:stage', async (_event, { path, file }) => {
+  try {
+    const validPath = validateFilePath(path);
+    const validFile = validateFilePath(file);
+    const execFileAsync = promisify(execFile);
+    await execFileAsync('git', ['add', validFile], { cwd: validPath });
+    return true;
+  } catch (err) {
+    console.error('[SECURITY] Git stage error:', err);
+    return false;
+  }
+});
+
+ipcMain.handle('git:commit', async (_event, { path, message }) => {
+  try {
+    const validPath = validateFilePath(path);
+    const validMessage = validateStringInput(message, 1000);
+    const execFileAsync = promisify(execFile);
+    await execFileAsync('git', ['commit', '-m', validMessage], { cwd: validPath });
+    return true;
+  } catch (err) {
+    console.error('[SECURITY] Git commit error:', err);
+    throw err;
+  }
+});
+// ------ FILE OPERATION HANDLERS ------
+ipcMain.handle('fs:rename', async (_event, oldPath: string, newPath: string, workspacePath?: string) => {
+  try {
+    const validOldPath = validateFilePath(oldPath);
+    const validNewPath = validateFilePath(newPath);
+    if (workspacePath) {
+      validatePathInWorkspace(validOldPath, workspacePath);
+      validatePathInWorkspace(validNewPath, workspacePath);
+    }
+    await fs.rename(validOldPath, validNewPath);
+    return { success: true };
+  } catch (error: any) {
+    console.error('[SECURITY] Rename failed:', error.message);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:delete', async (_event, filePath: string, workspacePath?: string) => {
+  try {
+    const validPath = validateFilePath(filePath);
+    if (workspacePath) {
+      validatePathInWorkspace(validPath, workspacePath);
+    }
+    const stats = await fs.stat(validPath);
+    if (stats.isDirectory()) {
+      await fs.rmdir(validPath, { recursive: true });
+    } else {
+      await fs.unlink(validPath);
+    }
+    return { success: true };
+  } catch (error: any) {
+    console.error('[SECURITY] Delete failed:', error.message);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:createFile', async (_event, filePath: string) => {
+  try {
+    await fs.writeFile(filePath, '', 'utf-8');
+    safeSend('fs:directoryChanged', { type: 'add', filePath });
+    return { success: true };
+  } catch (error) {
+    console.error('Create file failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:createDirectory', async (_event, dirPath: string) => {
+  try {
+    await fs.mkdir(dirPath, { recursive: true });
+    safeSend('fs:directoryChanged', { type: 'addDir', filePath: dirPath });
+    return { success: true };
+  } catch (error) {
+    console.error('Create directory failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('fs:revealInExplorer', async (_event, filePath: string) => {
+  try {
+    shell.showItemInFolder(filePath);
+    return { success: true };
+  } catch (error) {
+    console.error('Reveal in explorer failed:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('terminal:openAt', async (_event, dirPath: string) => {
+  try {
+    // Open terminal at specific directory
+    if (process.platform === 'win32') {
+      await execAsync(`start cmd /k "cd /d "${dirPath}""`, { shell: 'cmd' });
+    } else if (process.platform === 'darwin') {
+      await execAsync(`open -a Terminal "${dirPath}"`);
+    } else {
+      // Linux
+      await execAsync(`gnome-terminal --working-directory="${dirPath}"`);
+    }
+    return { success: true };
+  } catch (error) {
+    console.error('Open terminal failed:', error);
+    throw error;
+  }
+});
+// ------ FILE WATCHER FOR OPEN FILES ------
+ipcMain.handle('fs:watchFile', async (_event, filePath: string) => {
+  try {
+    // Check if file still exists
+    await fs.access(filePath);
+    return { exists: true };
+  } catch (error) {
+    return { exists: false };
+  }
+});
+
+ipcMain.handle('fs:checkFileExists', async (_event, filePath: string) => {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    return false;
+  }
+});
+// ── ENHANCED AI SYSTEM HELPER FUNCTIONS ─────────────────────────────────
+
+async function detectProjectType(workspacePath: string): Promise<string> {
+  if (!workspacePath) return 'unknown';
+
+  try {
+    const files = await fs.readdir(workspacePath);
+
+    if (files.includes('package.json')) {
+      const packageJson = JSON.parse(await fs.readFile(join(workspacePath, 'package.json'), 'utf8'));
+      if (packageJson.dependencies?.react) return 'react';
+      if (packageJson.dependencies?.vue) return 'vue';
+      if (packageJson.dependencies?.angular) return 'angular';
+      if (packageJson.dependencies?.electron) return 'electron';
+      return 'nodejs';
+    }
+
+    if (files.includes('requirements.txt') || files.includes('setup.py')) return 'python';
+    if (files.includes('Cargo.toml')) return 'rust';
+    if (files.includes('go.mod')) return 'go';
+    if (files.includes('pom.xml') || files.includes('build.gradle')) return 'java';
+
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+async function estimateCodebaseSize(workspacePath: string): Promise<'small' | 'medium' | 'large'> {
+  if (!workspacePath) return 'small';
+
+  try {
+    const files = await readDirectoryRecursive(workspacePath, 1000);
+    const codeFiles = files.filter(f => {
+      const ext = f.path.split('.').pop()?.toLowerCase();
+      return ['ts', 'tsx', 'js', 'jsx', 'py', 'java', 'cpp', 'c', 'cs', 'go', 'rs'].includes(ext || '');
+    });
+
+    if (codeFiles.length > 200) return 'large';
+    if (codeFiles.length > 50) return 'medium';
+    return 'small';
+  } catch {
+    return 'small';
+  }
+}
+
+function getAvailableTools(): string[] {
+  return [
+    'read_file', 'write_file', 'edit_code', 'strReplace', 'delete_file',
+    'list_directory', 'search_files', 'fuzzy_find_file', 'grepSearch',
+    'readCode', 'getDiagnostics', 'semantic_rename', 'smart_relocate',
+    'run_command', 'readMultipleFiles', 'generate_diagram'
+  ];
+}
+
+
+async function recordInteractionForLearning(
+  userRequest: string,
+  agentResponse: string,
+  toolsUsed: string[],
+  success: boolean,
+  duration: number,
+  context: any
+) {
+  if (!learningSystem || !contextMemory) return;
+
+  try {
+    const interaction = {
+      timestamp: new Date(),
+      userRequest,
+      agentResponse,
+      toolsUsed,
+      success,
+      duration,
+      context
+    };
+
+    await learningSystem.updateLearning(interaction);
+
+    // Record patterns and strategies
+    if (success && toolsUsed.length > 0) {
+      const taskType = classifyUserRequest(userRequest);
+      const strategy = toolsUsed.join(' -> ');
+
+      contextMemory.recordSuccessfulStrategy(
+        taskType,
+        strategy,
+        toolsUsed,
+        duration,
+        success
+      );
+    }
+
+    // Save memory periodically
+    if (Math.random() < 0.1) { // 10% chance to save
+      await contextMemory.saveMemory();
+    }
+  } catch (error) {
+    console.warn('[LEARNING] Failed to record interaction:', error);
+  }
+}
+// ── ENHANCED AI SYSTEMS IPC HANDLERS ────────────────────────────────────
+
+ipcMain.handle('ai:get-learning-insights', async () => {
+  if (!learningSystem) return [];
+
+  try {
+    return await learningSystem.analyzeInteractionPatterns();
+  } catch (error) {
+    console.error('Failed to get learning insights:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('ai:get-learning-metrics', async () => {
+  if (!learningSystem) return null;
+
+  try {
+    return await learningSystem.generateLearningMetrics();
+  } catch (error) {
+    console.error('Failed to get learning metrics:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('ai:get-code-metrics', async (_, workspacePath: string) => {
+  if (!codeIntelligence) return null;
+
+  try {
+    return codeIntelligence.getCodeMetrics(workspacePath);
+  } catch (error) {
+    console.error('Failed to get code metrics:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('ai:analyze-workspace', async (_, workspacePath: string) => {
+  if (!codeIntelligence) return null;
+
+  try {
+    return await codeIntelligence.analyzeWorkspace(workspacePath);
+  } catch (error) {
+    console.error('Failed to analyze workspace:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('ai:get-symbol-info', async (_, workspacePath: string, symbolName: string) => {
+  if (!codeIntelligence) return null;
+
+  try {
+    return await codeIntelligence.getSymbolInfo(workspacePath, symbolName);
+  } catch (error) {
+    console.error('Failed to get symbol info:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('ai:suggest-refactoring', async (_, workspacePath: string, filePath: string) => {
+  if (!codeIntelligence) return [];
+
+  try {
+    return await codeIntelligence.suggestRefactoring(workspacePath, filePath);
+  } catch (error) {
+    console.error('Failed to suggest refactoring:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('ai:get-execution-plans', async () => {
+  if (!strategicPlanner) return [];
+
+  try {
+    return strategicPlanner.getPlanHistory();
+  } catch (error) {
+    console.error('Failed to get execution plans:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('ai:get-context-memory-stats', async () => {
+  if (!contextMemory) return null;
+
+  try {
+    return {
+      codePatterns: contextMemory.getCodePatterns().length,
+      userPreferences: contextMemory.getUserPreferences().length,
+      errorPatterns: contextMemory.getErrorPatterns().length,
+      successfulStrategies: contextMemory.getSuccessfulStrategies().length,
+      sessionHistory: contextMemory.getSessionHistory().length
+    };
+  } catch (error) {
+    console.error('Failed to get context memory stats:', error);
+    return null;
+  }
+});
+
+// ── HIGH-PRIORITY SYSTEMS IPC HANDLERS ──────────────────────────────────
+
+// Enhanced MCP System handlers
+ipcMain.handle('mcp:get-marketplace', async () => {
+  if (!enhancedMCPSystem) return null;
+
+  try {
+    return enhancedMCPSystem.getMarketplace();
+  } catch (error) {
+    console.error('Failed to get MCP marketplace:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('mcp:refresh-marketplace', async () => {
+  if (!enhancedMCPSystem) return false;
+
+  try {
+    await enhancedMCPSystem.refreshMarketplace();
+    return true;
+  } catch (error) {
+    console.error('Failed to refresh MCP marketplace:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('mcp:install-power', async (_, powerId: string) => {
+  if (!enhancedMCPSystem) return false;
+
+  try {
+    await enhancedMCPSystem.installPower(powerId);
+    return true;
+  } catch (error) {
+    console.error('Failed to install MCP power:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('mcp:enable-power', async (_, powerId: string, config?: any) => {
+  if (!enhancedMCPSystem) return false;
+
+  try {
+    await enhancedMCPSystem.enablePower(powerId, config);
+    return true;
+  } catch (error) {
+    console.error('Failed to enable MCP power:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('mcp:get-available-tools', async () => {
+  if (!enhancedMCPSystem) return [];
+
+  try {
+    return enhancedMCPSystem.getAvailableTools();
+  } catch (error) {
+    console.error('Failed to get available MCP tools:', error);
+    return [];
+  }
+});
+
+// Vector Search System handlers
+ipcMain.handle('vector:semantic-search', async (_, query: any) => {
+  if (!vectorSearchSystem) return [];
+
+  try {
+    return await vectorSearchSystem.semanticSearch(query);
+  } catch (error) {
+    console.error('Failed to perform semantic search:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('vector:find-similar-code', async (_, codeSnippet: string, options?: any) => {
+  if (!vectorSearchSystem) return [];
+
+  try {
+    return await vectorSearchSystem.findSimilarCode(codeSnippet, options);
+  } catch (error) {
+    console.error('Failed to find similar code:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('vector:get-contextual-recommendations', async (_, context: string, filePath?: string) => {
+  if (!vectorSearchSystem) return [];
+
+  try {
+    return await vectorSearchSystem.getContextualRecommendations(context, filePath);
+  } catch (error) {
+    console.error('Failed to get contextual recommendations:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('vector:get-index-stats', async () => {
+  if (!vectorSearchSystem) return null;
+
+  try {
+    return vectorSearchSystem.getIndexStats();
+  } catch (error) {
+    console.error('Failed to get vector index stats:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('vector:reindex-workspace', async (_, workspacePath: string) => {
+  if (!vectorSearchSystem) return false;
+
+  try {
+    await vectorSearchSystem.indexWorkspace(workspacePath, { forceReindex: true });
+    return true;
+  } catch (error) {
+    console.error('Failed to reindex workspace:', error);
+    return false;
+  }
+});
+
+// Error Recovery System handlers
+ipcMain.handle('error-recovery:get-error-history', async (_, limit?: number) => {
+  if (!errorRecoverySystem) return [];
+
+  try {
+    return errorRecoverySystem.getErrorHistory(limit);
+  } catch (error) {
+    console.error('Failed to get error history:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('error-recovery:get-statistics', async () => {
+  if (!errorRecoverySystem) return null;
+
+  try {
+    return errorRecoverySystem.getErrorStatistics();
+  } catch (error) {
+    console.error('Failed to get error statistics:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('error-recovery:get-strategies', async () => {
+  if (!errorRecoverySystem) return [];
+
+  try {
+    return errorRecoverySystem.getRecoveryStrategies();
+  } catch (error) {
+    console.error('Failed to get recovery strategies:', error);
+    return [];
+  }
+});
+
+// Tool Result Cache handlers
+ipcMain.handle('cache:get-stats', async () => {
+  if (!toolResultCache) return null;
+
+  try {
+    return toolResultCache.getStats();
+  } catch (error) {
+    console.error('Failed to get cache stats:', error);
+    return null;
+  }
+});
+
+ipcMain.handle('cache:clear', async () => {
+  if (!toolResultCache) return false;
+
+  try {
+    toolResultCache.clear();
+    return true;
+  } catch (error) {
+    console.error('Failed to clear cache:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('cache:invalidate', async (_, toolName?: string, filePath?: string, tags?: string[]) => {
+  if (!toolResultCache) return 0;
+
+  try {
+    return toolResultCache.invalidate(toolName, filePath, tags);
+  } catch (error) {
+    console.error('Failed to invalidate cache:', error);
+    return 0;
+  }
+});
+
+ipcMain.handle('cache:cleanup', async () => {
+  if (!toolResultCache) return 0;
+
+  try {
+    return toolResultCache.cleanup();
+  } catch (error) {
+    console.error('Failed to cleanup cache:', error);
+    return 0;
+  }
+});
+
+// Handle shutdown signals for faster cleanup in dev environment
+process.on('SIGTERM', () => {
+  console.log('[SYSTEM] SIGTERM received, quitting app...');
+  app.quit();
+});
+
+process.on('SIGINT', () => {
+  console.log('[SYSTEM] SIGINT received, quitting app...');
+  app.quit();
+});

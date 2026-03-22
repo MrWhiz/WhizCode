@@ -346,7 +346,7 @@ impl AgentOrchestrator {
     }
 
     fn get_system_prompt(&self, workspace_path: &Option<String>, active_file: &Option<serde_json::Value>) -> String {
-        let mut p = crate::commands::prompts::KIRO_SYSTEM_PROMPT.to_string();
+        let mut p = crate::commands::prompts::WHIZCODE_SYSTEM_PROMPT.to_string();
         if let Some(ws) = workspace_path { p = p.replace("{{workspace_path}}", ws); }
         if let Some(f) = active_file { if let Some(path) = f.get("path").and_then(|p| p.as_str()) { p = p.replace("{{active_file}}", path); } }
         p

@@ -2,7 +2,7 @@ use crate::error::Result;
 
 #[tauri::command]
 pub async fn specs_list() -> Result<Vec<serde_json::Value>> {
-    // Return empty list - specs are loaded from .kiro/specs/ directory by frontend
+    // Return empty list - specs are loaded from .whizcode/specs/ directory by frontend
     Ok(vec![])
 }
 

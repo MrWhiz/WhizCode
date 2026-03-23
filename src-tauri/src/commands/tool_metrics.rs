@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use crate::error::Result;
+use crate::error::{Result, ApiError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMetrics {
@@ -282,8 +282,9 @@ pub async fn tool_metrics_record_execution(
     error_message: Option<String>,
     input_tokens: u32,
     output_tokens: u32,
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
 ) -> Result<()> {
-    let system = ToolMetricsSystem::new();
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     system.record_execution(ToolExecution {
         tool_name,
         timestamp: chrono::Local::now().timestamp() as u64,
@@ -292,54 +293,73 @@ pub async fn tool_metrics_record_execution(
         error_message,
         input_tokens,
         output_tokens,
-    })?;
-    Ok(())
+    })
 }
 
 #[tauri::command]
-pub async fn tool_metrics_get_metrics(tool_name: String) -> Result<Option<ToolMetrics>> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_get_metrics(
+    tool_name: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<Option<ToolMetrics>> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     Ok(system.get_tool_metrics(&tool_name))
 }
 
 #[tauri::command]
-pub async fn tool_metrics_get_all() -> Result<Vec<ToolMetrics>> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_get_all(
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<Vec<ToolMetrics>> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     Ok(system.get_all_metrics())
 }
 
 #[tauri::command]
-pub async fn tool_metrics_rank_tools() -> Result<Vec<ToolRanking>> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_rank_tools(
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<Vec<ToolRanking>> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     Ok(system.rank_tools())
 }
 
 #[tauri::command]
-pub async fn tool_metrics_get_recommendations(task_type: String) -> Result<Vec<ToolRanking>> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_get_recommendations(
+    task_type: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<Vec<ToolRanking>> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     Ok(system.get_tool_recommendations(&task_type))
 }
 
 #[tauri::command]
-pub async fn tool_metrics_get_history(limit: Option<usize>) -> Result<Vec<ToolExecution>> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_get_history(
+    limit: Option<usize>,
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<Vec<ToolExecution>> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     Ok(system.get_execution_history(limit))
 }
 
 #[tauri::command]
-pub async fn tool_metrics_get_failure_analysis(tool_name: String) -> Result<Option<serde_json::Value>> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_get_failure_analysis(
+    tool_name: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<Option<serde_json::Value>> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     Ok(system.get_failure_analysis(&tool_name))
 }
 
 #[tauri::command]
-pub async fn tool_metrics_get_statistics() -> Result<serde_json::Value> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_get_statistics(
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<serde_json::Value> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     Ok(system.get_statistics())
 }
 
 #[tauri::command]
-pub async fn tool_metrics_clear() -> Result<()> {
-    let system = ToolMetricsSystem::new();
+pub async fn tool_metrics_clear(
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolMetricsSystem>>>,
+) -> Result<()> {
+    let system = state.lock().map_err(|e| ApiError::from(e.to_string()))?;
     system.clear_metrics()
 }

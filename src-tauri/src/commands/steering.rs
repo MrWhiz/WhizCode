@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::Result;
+use tauri::State;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteeringFile {
@@ -53,10 +54,37 @@ pub struct SteeringSystem {
 #[allow(dead_code)]
 impl SteeringSystem {
     pub fn new() -> Self {
-        Self {
+        let system = Self {
             steering_files: Arc::new(Mutex::new(HashMap::new())),
             active_contexts: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+
+        // Add default steering rules
+        let _ = system.add_steering_file(SteeringFile {
+            id: "react_best_practices".to_string(),
+            path: "".to_string(),
+            name: "React Best Practices".to_string(),
+            content: "Always use functional components with hooks. Prefer Tailwind for styling. Use specific prop types.".to_string(),
+            inclusion_type: "fileMatch".to_string(),
+            file_match_pattern: Some("*.tsx|*.jsx".to_string()),
+            enabled: true,
+            created_at: Self::current_timestamp(),
+            last_modified: Self::current_timestamp(),
+        });
+
+        let _ = system.add_steering_file(SteeringFile {
+            id: "typescript_strict".to_string(),
+            path: "".to_string(),
+            name: "TypeScript Strict Mode".to_string(),
+            content: "Avoid using 'any'. Always define interfaces for complex objects. Prefer 'type' over 'interface' for simple unions.".to_string(),
+            inclusion_type: "fileMatch".to_string(),
+            file_match_pattern: Some("*.ts|*.tsx".to_string()),
+            enabled: true,
+            created_at: Self::current_timestamp(),
+            last_modified: Self::current_timestamp(),
+        });
+
+        system
     }
 
     fn current_timestamp() -> u64 {
@@ -262,27 +290,38 @@ impl SteeringSystem {
 }
 
 #[tauri::command]
-pub async fn steering_add_file(file: SteeringFile) -> Result<()> {
-    eprintln!("Adding steering file: {} ({})", file.name, file.inclusion_type);
-    Ok(())
+pub async fn steering_add_file(
+    file: SteeringFile,
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<()> {
+    let system = state.lock().unwrap();
+    system.add_steering_file(file)
 }
 
 #[tauri::command]
-pub async fn steering_remove_file(file_id: String) -> Result<()> {
-    eprintln!("Removing steering file: {}", file_id);
-    Ok(())
+pub async fn steering_remove_file(
+    file_id: String,
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<()> {
+    let system = state.lock().unwrap();
+    system.remove_steering_file(&file_id)
 }
 
 #[tauri::command]
-pub async fn steering_get_file(file_id: String) -> Result<Option<SteeringFile>> {
-    eprintln!("Getting steering file: {}", file_id);
-    Ok(None)
+pub async fn steering_get_file(
+    file_id: String,
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<Option<SteeringFile>> {
+    let system = state.lock().unwrap();
+    Ok(system.get_steering_file(&file_id))
 }
 
 #[tauri::command]
-pub async fn steering_list_all() -> Result<Vec<SteeringFile>> {
-    eprintln!("Listing all steering files");
-    Ok(vec![])
+pub async fn steering_list_all(
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<Vec<SteeringFile>> {
+    let system = state.lock().unwrap();
+    Ok(system.get_all_steering_files())
 }
 
 #[tauri::command]
@@ -292,15 +331,21 @@ pub async fn steering_get_enabled() -> Result<Vec<SteeringFile>> {
 }
 
 #[tauri::command]
-pub async fn steering_enable_file(file_id: String) -> Result<()> {
-    eprintln!("Enabling steering file: {}", file_id);
-    Ok(())
+pub async fn steering_enable_file(
+    file_id: String,
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<()> {
+    let system = state.lock().unwrap();
+    system.enable_steering_file(&file_id)
 }
 
 #[tauri::command]
-pub async fn steering_disable_file(file_id: String) -> Result<()> {
-    eprintln!("Disabling steering file: {}", file_id);
-    Ok(())
+pub async fn steering_disable_file(
+    file_id: String,
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<()> {
+    let system = state.lock().unwrap();
+    system.disable_steering_file(&file_id)
 }
 
 #[tauri::command]
@@ -310,20 +355,22 @@ pub async fn steering_update_file(file: SteeringFile) -> Result<()> {
 }
 
 #[tauri::command]
-pub async fn steering_load_context(workspace_path: String, _current_file: Option<String>) -> Result<SteeringContext> {
-    eprintln!("Loading steering context for: {}", workspace_path);
-    Ok(SteeringContext {
-        workspace_path,
-        active_steering_files: vec![],
-        injected_context: String::new(),
-        total_context_size: 0,
-    })
+pub async fn steering_load_context(
+    workspace_path: String, 
+    current_file: Option<String>,
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<SteeringContext> {
+    let system = state.lock().unwrap();
+    system.load_steering_files_for_context(&workspace_path, current_file.as_deref())
 }
 
 #[tauri::command]
-pub async fn steering_get_injected_context(workspace_path: String) -> Result<Option<String>> {
-    eprintln!("Getting injected context for: {}", workspace_path);
-    Ok(None)
+pub async fn steering_get_injected_context(
+    workspace_path: String,
+    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+) -> Result<Option<String>> {
+    let system = state.lock().unwrap();
+    Ok(system.get_injected_context(&workspace_path))
 }
 
 #[tauri::command]

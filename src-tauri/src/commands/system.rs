@@ -11,16 +11,12 @@ pub struct SystemInfo {
 
 #[tauri::command]
 pub async fn get_system_info() -> Result<SystemInfo> {
-    // Get memory info - try sys_info, fallback to 0 if not available
-    let memory_gb = 0.0; // Fallback for now - sys_info API may vary
-    
     let info = SystemInfo {
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         cpu_count: num_cpus::get(),
-        memory_gb,
+        memory_gb: 0.0,
     };
-    
     Ok(info)
 }
 
@@ -35,7 +31,6 @@ pub async fn reveal_in_folder(path: String) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let path = path.replace("/", "\\");
-        
         std::process::Command::new("explorer")
             .arg("/select,")
             .arg(path)
@@ -66,13 +61,18 @@ pub async fn reveal_in_folder(path: String) -> Result<()> {
 pub async fn open_terminal_at(path: String) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
+        let mut clean_path = path.replace("/", "\\");
+        if clean_path.starts_with(r"\\?\") {
+            clean_path = clean_path.trim_start_matches(r"\\?\").to_string();
+        }
+
         std::process::Command::new("cmd")
             .arg("/c")
             .arg("start")
             .arg("powershell")
             .arg("-NoExit")
             .arg("-Command")
-            .arg(format!("Set-Location -Path '{}'", path))
+            .arg(format!("Set-Location -LiteralPath '{}'", clean_path))
             .spawn()
             .map_err(|e| ApiError::from(format!("Failed to open terminal: {}", e)))?;
     }
@@ -89,12 +89,12 @@ pub async fn open_terminal_at(path: String) -> Result<()> {
     {
         std::process::Command::new("x-terminal-emulator")
             .arg("--working-directory")
-            .arg(path)
+            .arg(&path)
             .spawn()
             .or_else(|_| {
                 std::process::Command::new("gnome-terminal")
                     .arg("--working-directory")
-                    .arg(path)
+                    .arg(&path)
                     .spawn()
             })
             .map_err(|e| ApiError::from(format!("Failed to open terminal: {}", e)))?;

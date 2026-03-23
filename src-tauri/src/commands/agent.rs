@@ -7,7 +7,7 @@ use std::sync::Mutex as StdMutex;
 
 // Global permission channel to wait for user input
 lazy_static::lazy_static! {
-    static ref AGENT_CANCEL_TOKEN: Arc<PlMutex<bool>> = Arc::new(PlMutex::new(false));
+    pub static ref AGENT_CANCEL_TOKEN: Arc<PlMutex<bool>> = Arc::new(PlMutex::new(false));
     pub static ref PERMISSION_TX: StdMutex<Option<oneshot::Sender<bool>>> = StdMutex::new(None);
 }
 

@@ -87,8 +87,9 @@ impl VectorSearchSystem {
     pub fn index_workspace(&self, workspace_path: &str) -> crate::error::Result<()> {
         let conn = self.db.lock().unwrap();
         
-        // Clear existing index for this workspace (or just keep it and sync - for simplicity we clear now)
-        conn.execute("DELETE FROM code_chunks", []).map_err(|e| format!("Failed to clear index: {}", e))?;
+        // Ensure index table has mtime column for incremental indexing
+        // This will fail if the column already exists, which is fine.
+        let _ = conn.execute("ALTER TABLE code_chunks ADD COLUMN mtime INTEGER", []);
 
         let mut file_count = 0;
         let mut chunk_count = 0;
@@ -99,14 +100,32 @@ impl VectorSearchSystem {
             .filter(|e| e.path().is_file())
         {
             let path = entry.path();
-            if crate::utils::should_skip_file(path) {
+            let file_path = path.to_string_lossy().to_string();
+            
+            // Skip hidden or ignored files
+            if crate::utils::should_skip_file(path) || file_path.contains(".git") || file_path.contains("node_modules") {
                 continue;
+            }
+
+            let mtime = fs::metadata(path)
+                .and_then(|m| m.modified().map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))
+                .unwrap_or(0);
+
+            // Check if file has changed since last index
+            let mut stmt = conn.prepare("SELECT mtime FROM code_chunks WHERE file_path = ? LIMIT 1").unwrap();
+            let last_mtime: Option<u64> = stmt.query_row(params![file_path], |row| row.get(0)).ok();
+            
+            if let Some(last) = last_mtime {
+                if last >= mtime {
+                    continue; // Skip unchanged file
+                }
+                // File changed, remove old chunks before re-indexing
+                let _ = conn.execute("DELETE FROM code_chunks WHERE file_path = ?", params![file_path]);
             }
 
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
             if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go") {
                 if let Ok(content) = fs::read_to_string(path) {
-                    let file_path = path.to_string_lossy().to_string();
                     let file_chunks = self.chunk_file(&content, &file_path);
                     
                     for chunk in file_chunks {
@@ -114,8 +133,8 @@ impl VectorSearchSystem {
                         let deps_json = serde_json::to_string(&chunk.dependencies).unwrap_or_default();
                         
                         conn.execute(
-                            "INSERT INTO code_chunks (id, file_path, chunk_type, symbol_name, content, start_line, end_line, embedding, complexity, dependencies)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            "INSERT INTO code_chunks (id, file_path, chunk_type, symbol_name, content, start_line, end_line, embedding, complexity, dependencies, mtime)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                             params![
                                 chunk.id,
                                 chunk.file_path,
@@ -125,8 +144,9 @@ impl VectorSearchSystem {
                                 chunk.start_line,
                                 chunk.end_line,
                                 embedding_json,
-                                chunk.complexity,
-                                deps_json
+                                chunk.complexity as i32,
+                                deps_json,
+                                mtime as i64,
                             ],
                         ).map_err(|e| format!("Failed to insert chunk: {}", e))?;
                         chunk_count += 1;

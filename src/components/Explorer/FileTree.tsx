@@ -360,21 +360,6 @@ export const FileTree: React.FC<FileTreeProps> = ({
         }
     }, [collapseAll, path])
 
-    useEffect(() => {
-        let unlistenFileChanged: (() => void) | null = null
-        const setupListener = async () => {
-            try {
-                unlistenFileChanged = await events.onFileChanged(() => {
-                    fetchFiles()
-                    setRefreshKey(prev => prev + 1)
-                })
-            } catch (error) {
-                console.error('Failed to setup file change listener:', error)
-            }
-        }
-        setupListener()
-        return () => { if (unlistenFileChanged) unlistenFileChanged() }
-    }, [fetchFiles])
 
     const handleContextMenu = (e: React.MouseEvent, entry: FileEntry) => {
         setContextMenu({ x: e.clientX, y: e.clientY, entry })

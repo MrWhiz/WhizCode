@@ -6,6 +6,7 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Message, AgentStep } from '../../types'
 import { ChatSettings } from './ChatSettings'
 import { MermaidDiagram } from './MermaidDiagram'
+import { TerminalBlock } from './TerminalBlock'
 
 interface ChatPanelProps {
     chatWidth: number;
@@ -101,7 +102,7 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
 
     // Auto-open logs if the step is a running command or if it fails
     React.useEffect(() => {
-        if ((isLive && step.status === 'running' && step.tool === 'run_command') || step.status === 'failed') {
+        if ((isLive && (step.status === 'running' || step.status === 'started') && step.tool === 'run_command') || step.status === 'failed') {
             setLogsOpen(true);
         }
     }, [isLive, step.status, step.tool]);
@@ -152,13 +153,35 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
                         {personaIcon} {step.persona.toUpperCase()}
                     </span>
                 )}
-                {isLive && step.status === 'running' ? (
+                {isLive && (step.status === 'running' || step.status === 'started') ? (
                     <div className="spinner" style={{ width: 10, height: 10 }}></div>
                 ) : (
                     <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
                 )}
                 <span className="agent-step-summary">{displaySummary}</span>
-                {step.status === 'done' && <span className="agent-step-check">✓</span>}
+                {/* Status badge */}
+                <span style={{
+                    marginLeft: '8px',
+                    fontSize: '9px',
+                    padding: '2px 6px',
+                    borderRadius: '3px',
+                    fontWeight: 'bold',
+                    backgroundColor: 
+                        step.status === 'identified' ? '#6c7086' :
+                        step.status === 'started' ? '#89b4fa' :
+                        step.status === 'completed' || step.status === 'done' ? '#a6e3a1' :
+                        step.status === 'failed' ? '#f38ba8' :
+                        '#9399b2',
+                    color: '#1e1e2e'
+                }}>
+                    {step.status === 'identified' ? 'IDENTIFIED' :
+                     step.status === 'started' ? 'RUNNING' :
+                     step.status === 'completed' ? 'DONE' :
+                     step.status === 'done' ? 'DONE' :
+                     step.status === 'failed' ? 'FAILED' :
+                     step.status.toUpperCase()}
+                </span>
+                {(step.status === 'done' || step.status === 'completed') && <span className="agent-step-check">✓</span>}
                 {step.status === 'failed' && <span style={{ color: 'var(--error-color)', fontSize: 12 }}>✗</span>}
                 {canOpenLogs && (
                     <span style={{ marginLeft: 'auto', fontSize: '10px', opacity: 0.5, paddingLeft: 6 }}>
@@ -177,7 +200,13 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
                     />
                 </div>
             )}
-            {canOpenLogs && logsOpen && <LogContainer logs={step.logs && step.logs.length > 0 ? step.logs : ['(No logs yet)']} />}
+            {canOpenLogs && logsOpen && (
+                step.tool === 'run_command' ? (
+                    <TerminalBlock logs={step.logs && step.logs.length > 0 ? step.logs : []} isLive={isLive} requestId={step.requestId} />
+                ) : (
+                    <LogContainer logs={step.logs && step.logs.length > 0 ? step.logs : ['(No logs yet)']} />
+                )
+            )}
         </div>
     );
 };
@@ -702,7 +731,7 @@ export const ChatPanel = ({
                                 {agentSteps.length > 0 && (
                                     <div className="agent-steps live">
                                         {agentSteps.map((step, si) => (
-                                            <StepBlock key={si} step={step} getToolIcon={getToolIcon} isLive={true} />
+                                            <StepBlock key={step.requestId || `step_${si}`} step={step} getToolIcon={getToolIcon} isLive={true} />
                                         ))}
                                     </div>
                                 )}
@@ -891,14 +920,14 @@ export const ChatPanel = ({
                             disabled={isLoading}
                         />
                         {!isLoading ? (
-                            <button className="send-btn" onClick={handleSend} disabled={!input.trim() || isLoading}>
+                            <button className="send-btn" onClick={() => handleSend()} disabled={!input.trim() && selectedImages.length === 0}>
                                 <svg className="send-icon" viewBox="0 0 24 24">
                                     <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                     <path d="M22 2L15 22L11 13L2 9L22 2Z" fill="currentColor" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                                 </svg>
                             </button>
                         ) : (
-                            <button className="stop-btn" onClick={handleStop} title="Stop Agent">
+                            <button className="stop-btn" onClick={() => handleStop()} title="Stop Agent">
                                 <svg className="stop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                     <rect x="3" y="3" width="18" height="18" rx="2" ry="2" fill="currentColor"></rect>
                                 </svg>

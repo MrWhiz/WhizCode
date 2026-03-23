@@ -26,7 +26,18 @@ struct FileChangedPayload {
 pub async fn read_file(
     path: String,
     state: State<'_, Arc<RwLock<AppState>>>,
+    cache: State<'_, Arc<std::sync::Mutex<crate::commands::tool_result_cache::ToolResultCache>>>,
 ) -> Result<String> {
+    // ── 1. CACHE LOOKUP ───────────────────────────────────────────────────
+    let cache_key = format!("fs:read:{}", path);
+    if let Ok(c) = cache.lock() {
+        if let Some(cached) = c.get(&cache_key) {
+            if let Some(content) = cached.as_str() {
+                return Ok(content.to_string());
+            }
+        }
+    }
+
     let workspace = {
         let app_state = state.read();
         app_state.get_workspace()
@@ -43,9 +54,16 @@ pub async fn read_file(
         return Err("Cannot read binary file".into());
     }
     
-    tokio::fs::read_to_string(&resolved)
+    let content = tokio::fs::read_to_string(&resolved)
         .await
-        .map_err(ApiError::from)
+        .map_err(ApiError::from)?;
+
+    // ── 2. CACHE STORE ────────────────────────────────────────────────────
+    if let Ok(c) = cache.lock() {
+        let _ = c.set(cache_key, serde_json::Value::String(content.clone()), Some(30)); // 30s TTL
+    }
+
+    Ok(content)
 }
 
 #[tauri::command]
@@ -54,6 +72,7 @@ pub async fn write_file(
     content: String,
     handle: AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
+    cache: State<'_, Arc<std::sync::Mutex<crate::commands::tool_result_cache::ToolResultCache>>>,
 ) -> Result<()> {
     let workspace = {
         let app_state = state.read();
@@ -71,7 +90,14 @@ pub async fn write_file(
         .await
         .map_err(ApiError::from)?;
 
-    // Emit event to trigger UI refresh
+    // ── 1. CACHE INVALIDATION ─────────────────────────────────────────────
+    if let Ok(c) = cache.lock() {
+        let _ = c.invalidate(&format!("fs:read:{}", path));
+        let _ = c.invalidate(&format!("fs:dir:{}", PathBuf::from(&path).parent().unwrap_or(std::path::Path::new("")).to_string_lossy()));
+    }
+
+    // Add small delay to prevent queue overflow
+    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     handle.emit("file:changed", FileChangedPayload { path: path.clone() }).map_err(|e| e.to_string())?;
     
     Ok(())
@@ -178,6 +204,7 @@ pub async fn create_file(
         .await
         .map_err(ApiError::from)?;
 
+    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -204,6 +231,7 @@ pub async fn create_directory(
         .await
         .map_err(ApiError::from)?;
 
+    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -252,6 +280,7 @@ pub async fn delete_file(
             .map_err(ApiError::from)?;
     }
     
+    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -300,6 +329,7 @@ pub async fn delete_directory(
             .map_err(ApiError::from)?;
     }
     
+    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -352,7 +382,9 @@ pub async fn rename_file(
             .map_err(ApiError::from)?;
     }
     
+    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     handle.emit("file:changed", FileChangedPayload { path: old_path }).map_err(|e| e.to_string())?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
     handle.emit("file:changed", FileChangedPayload { path: new_path }).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -391,29 +423,34 @@ pub async fn watch_directory(
     let mut watcher = recommended_watcher(tx).map_err(|e| e.to_string())?;
     watcher.watch(&watch_path, RecursiveMode::Recursive).map_err(|e| e.to_string())?;
 
-    // Spawn a background thread to forward events to the frontend
+    // Spawn a background thread to forward events to the frontend with debouncing
     std::thread::spawn(move || {
-        // Keep watcher alive in this thread
         let _watcher = watcher;
+        let mut pending_paths = std::collections::HashSet::new();
+        let mut last_emit = std::time::Instant::now();
+        let debounce_window = Duration::from_millis(1000);  // Honors "once per second" request
+
         loop {
-            match rx.recv_timeout(Duration::from_secs(30)) {
+            match rx.recv_timeout(Duration::from_millis(100)) {  // Increased from 50ms to 100ms
                 Ok(Ok(event)) => {
-                    // Debounce: only emit for create/remove/modify events
                     use notify::EventKind;
-                    let should_emit = matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)
-                    );
-                    if should_emit {
-                        for p in &event.paths {
-                            let path_str = p.to_string_lossy().to_string();
-                            let _ = handle.emit("file:changed", FileChangedPayload { path: path_str });
+                    if matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)) {
+                        for p in event.paths {
+                            if !utils::should_skip_file(&p) {
+                                pending_paths.insert(p.to_string_lossy().to_string());
+                            }
                         }
                     }
                 }
-                Ok(Err(_)) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+
+            // Emit batched events if window passed or set is large
+            if !pending_paths.is_empty() && (last_emit.elapsed() >= debounce_window || pending_paths.len() > 20) {  // Reduced from 50 to 20
+                for path in pending_paths.drain() {
+                    let _ = handle.emit("file:changed", FileChangedPayload { path });
+                }
+                last_emit = std::time::Instant::now();
             }
         }
     });

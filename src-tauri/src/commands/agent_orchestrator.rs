@@ -264,10 +264,112 @@ impl AgentOrchestrator {
 
     async fn execute_tool(&mut self, call: &ToolCall, workspace_path: &Option<String>) -> Result<String> {
         let key = format!("{}_{}", call.tool, serde_json::to_string(&call.args).unwrap_or_default());
-        if let Ok(c) = self.tool_result_cache.lock() { if let Some(r) = c.get(&key).ok().flatten() { if let Some(s) = r.as_str() { return Ok(s.to_string()); } } }
+        if let Ok(c) = self.tool_result_cache.lock() { 
+            if let Some(r) = c.get(&key) { 
+                if let Some(s) = r.as_str() { 
+                    return Ok(s.to_string()); 
+                } 
+            } 
+        }
         if let Ok(h) = self.hooks_manager.lock() { let _ = h.trigger_tool_event("preToolUse", &call.tool); }
         
         let res = match call.tool.as_str() {
+            // Reasoning tools (no-op, just return the reasoning)
+            "Think" | "Reason" | "Verify" | "Check" | "Validate" => {
+                let reasoning = call.args.get("reasoning").and_then(|r| r.as_str())
+                    .or_else(|| call.args.get("content").and_then(|c| c.as_str()))
+                    .unwrap_or("Reasoning completed");
+                Ok(format!("✓ {}: {}", call.tool, reasoning))
+            }
+            // Planner-generated tools (map to standard tools)
+            "List" => {
+                let p = call.args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                let mut full = std::path::PathBuf::from(p);
+                if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                let mut entries = Vec::new();
+                let mut dir = tokio::fs::read_dir(&full).await.map_err(|e| format!("LS failed: {}", e))?;
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                    entries.push(format!("{}{}", name, if is_dir { "/" } else { "" }));
+                }
+                Ok(entries.join("\n"))
+            }
+            "Search" => {
+                let pattern = call.args.get("pattern").and_then(|p| p.as_str()).unwrap_or("*");
+                let p = call.args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                let mut full = std::path::PathBuf::from(p);
+                if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                let mut results = Vec::new();
+                let mut dir = tokio::fs::read_dir(&full).await.map_err(|e| format!("Search failed: {}", e))?;
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.contains(pattern) {
+                        results.push(name);
+                    }
+                }
+                Ok(results.join("\n"))
+            }
+            "Read" => {
+                let p = call.args.get("path").and_then(|p| p.as_str()).ok_or("No path")?;
+                let mut full = std::path::PathBuf::from(p);
+                if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                tokio::fs::read_to_string(&full).await.map_err(|e| format!("Read failed {}: {}", p, e).into())
+            }
+            "Write" => {
+                let p = call.args.get("path").and_then(|p| p.as_str()).ok_or("No path")?;
+                let c = call.args.get("content").and_then(|c| c.as_str()).ok_or("No content")?;
+                let mut full = std::path::PathBuf::from(p);
+                if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                if let Some(par) = full.parent() { let _ = tokio::fs::create_dir_all(par).await; }
+                tokio::fs::write(&full, c).await.map(|_| format!("Wrote {}", p)).map_err(|e| format!("Write failed: {}", e).into())
+            }
+            "Edit" => {
+                let p = call.args.get("path").and_then(|p| p.as_str()).ok_or("No path")?;
+                let c = call.args.get("content").and_then(|c| c.as_str()).ok_or("No content")?;
+                let mut full = std::path::PathBuf::from(p);
+                if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                let args = super::advanced_tools::EditFileArgs {
+                    path: full.to_string_lossy().to_string(), 
+                    start_line: call.args.get("start_line").and_then(|l| l.as_u64()).map(|l| l as u32),
+                    end_line: call.args.get("end_line").and_then(|l| l.as_u64()).map(|l| l as u32), 
+                    content: c.to_string(),
+                };
+                super::advanced_tools::AdvancedToolExecutor::edit_file(&args).await.map(|r| r.output)
+            }
+            "Execute" => {
+                let cmd_str = call.args.get("command").and_then(|c| c.as_str()).ok_or("No command")?;
+                let (shell, sargs) = if cfg!(windows) { ("cmd", vec!["/C", cmd_str]) } else { ("sh", vec!["-c", cmd_str]) };
+                let mut cmd = tokio::process::Command::new(shell);
+                cmd.args(&sargs);
+                if let Some(ws) = workspace_path { cmd.current_dir(ws); }
+                let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await
+                    .map_err(|e| ApiError::from(e))??;
+                Ok(format!("Stdout:\n{}\nStderr:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+            }
+            "Analyze" => {
+                let p = call.args.get("path").and_then(|p| p.as_str()).ok_or("No path")?;
+                let mut full = std::path::PathBuf::from(p);
+                if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                
+                match tokio::fs::read_to_string(&full).await {
+                    Ok(content) => {
+                        let lines = content.lines().count();
+                        let chars = content.len();
+                        let words = content.split_whitespace().count();
+                        Ok(format!(
+                            "✓ Analysis of {}:\n- Lines: {}\n- Characters: {}\n- Words: {}\n- Size: {} bytes",
+                            full.display(),
+                            lines,
+                            chars,
+                            words,
+                            chars
+                        ))
+                    }
+                    Err(e) => Err(ApiError::from(format!("Analysis failed: {}", e)))
+                }
+            }
+            // Standard tools
             "read_file" => {
                 let p = call.args.get("path").and_then(|p| p.as_str()).ok_or("No path")?;
                 let mut full = std::path::PathBuf::from(p);
@@ -295,6 +397,28 @@ impl AgentOrchestrator {
                 }
                 Ok(entries.join("\n"))
             }
+            "grep_search" => {
+                let pattern = call.args.get("pattern").and_then(|p| p.as_str()).ok_or("No pattern")?;
+                let p = call.args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                let mut full = std::path::PathBuf::from(p);
+                if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                let mut results = Vec::new();
+                let mut dir = tokio::fs::read_dir(&full).await.map_err(|e| format!("Grep failed: {}", e))?;
+                while let Ok(Some(entry)) = dir.next_entry().await {
+                    if let Ok(metadata) = entry.metadata().await {
+                        if metadata.is_file() {
+                            if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+                                for (line_num, line) in content.lines().enumerate() {
+                                    if line.contains(pattern) {
+                                        results.push(format!("{}:{}: {}", entry.path().display(), line_num + 1, line));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(results.join("\n"))
+            }
             "edit_file" => {
                 let p = call.args.get("path").and_then(|p| p.as_str()).ok_or("No path")?;
                 let c = call.args.get("content").and_then(|c| c.as_str()).ok_or("No content")?;
@@ -310,15 +434,46 @@ impl AgentOrchestrator {
                 };
                 super::advanced_tools::AdvancedToolExecutor::edit_file(&args).await.map(|r| r.output)
             }
+            "multi_edit_file" => {
+                let edits = call.args.get("edits").ok_or("No edits")?;
+                if let Some(edits_array) = edits.as_array() {
+                    let mut results = Vec::new();
+                    for edit in edits_array {
+                        let p = edit.get("path").and_then(|p| p.as_str()).ok_or("No path in edit")?;
+                        let c = edit.get("content").and_then(|c| c.as_str()).ok_or("No content in edit")?;
+                        let mut full = std::path::PathBuf::from(p);
+                        if !full.is_absolute() { if let Some(ws) = workspace_path { full = std::path::Path::new(ws).join(full); } }
+                        
+                        let args = super::advanced_tools::EditFileArgs {
+                            path: full.to_string_lossy().to_string(),
+                            start_line: edit.get("start_line").and_then(|l| l.as_u64()).map(|l| l as u32),
+                            end_line: edit.get("end_line").and_then(|l| l.as_u64()).map(|l| l as u32),
+                            content: c.to_string(),
+                        };
+                        match super::advanced_tools::AdvancedToolExecutor::edit_file(&args).await {
+                            Ok(r) => results.push(r.output),
+                            Err(e) => results.push(format!("Error: {}", e)),
+                        }
+                    }
+                    Ok(results.join("\n"))
+                } else {
+                    Err("Edits must be an array".into())
+                }
+            }
             "run_command" => {
                 let cmd_str = call.args.get("command").and_then(|c| c.as_str()).ok_or("No command")?;
-                let (shell, sargs) = if cfg!(windows) { ("cmd", vec!["/C", cmd_str]) } else { ("sh", vec!["-c", cmd_str]) };
+                let (shell, sargs) = if cfg!(windows) { 
+                    ("powershell", vec!["-NoProfile", "-Command", cmd_str]) 
+                } else { 
+                    ("sh", vec!["-c", cmd_str]) 
+                };
                 let mut cmd = tokio::process::Command::new(shell);
                 cmd.args(&sargs);
                 if let Some(ws) = workspace_path { cmd.current_dir(ws); }
                 let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await
                     .map_err(|e| ApiError::from(e))??;
-                Ok(format!("Stdout:\n{}\nStderr:\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+                let status = if out.status.success() { "success" } else { "failed" };
+                Ok(format!("Status: {}\nStdout:\n{}\nStderr:\n{}", status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
             }
             _ => Err(format!("Unknown tool: {}", call.tool).into()),
         };

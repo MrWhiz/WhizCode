@@ -334,6 +334,8 @@ fn main() {
             
             // Agent streaming operations
             commands::agent_streaming::execute_agent_loop_streaming,
+            commands::agent_streaming::agent_send_terminal_input,
+            commands::agent_streaming::agent_stop_terminal_command,
             
             // Advanced tools operations
             commands::advanced_tools::execute_edit_file,

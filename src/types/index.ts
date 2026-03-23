@@ -1,6 +1,6 @@
 export interface AgentStep {
     tool: string;
-    status: 'running' | 'done' | 'error' | 'failed' | 'awaiting_permission';
+    status: 'running' | 'done' | 'error' | 'failed' | 'awaiting_permission' | 'identified' | 'started' | 'completed' | 'skipped' | 'alternative';
     summary: string;
     result?: string;
     iteration?: number;

@@ -1,99 +1,113 @@
 use serde::{Deserialize, Serialize};
-use crate::error::Result;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct CachedToolResult {
-    pub tool: String,
-    pub args: serde_json::Value,
-    pub result: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStats {
+    pub total_entries: usize,
+    pub total_size_bytes: usize,
+    pub hit_rate: f32,
+    pub miss_rate: f32,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CacheEntry {
+    pub key: String,
+    pub value: String,
     pub timestamp: u64,
-    pub ttl_seconds: u64,
+    pub hits: u32,
 }
 
-pub struct ToolResultCache {
-    cache: HashMap<String, CachedToolResult>,
+pub struct ToolCache {
+    cache: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    stats: Arc<Mutex<CacheStats>>,
 }
 
-impl ToolResultCache {
+impl ToolCache {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
+        ToolCache {
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            stats: Arc::new(Mutex::new(CacheStats {
+                total_entries: 0,
+                total_size_bytes: 0,
+                hit_rate: 0.0,
+                miss_rate: 0.0,
+            })),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<String> {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(entry) = cache.get_mut(key) {
+            entry.hits += 1;
+            Some(entry.value.clone())
+        } else {
+            None
         }
     }
 
     #[allow(dead_code)]
-    pub fn get_cache_key(tool: &str, args: &serde_json::Value) -> String {
-        format!("{}:{}", tool, serde_json::to_string(args).unwrap_or_default())
+    pub fn set(&self, key: String, value: String) {
+        let mut cache = self.cache.lock().unwrap();
+        let size = value.len();
+        let key_clone = key.clone();
+        cache.insert(
+            key,
+            CacheEntry {
+                key: key_clone,
+                value,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                hits: 0,
+            },
+        );
+
+        let mut stats = self.stats.lock().unwrap();
+        stats.total_entries = cache.len();
+        stats.total_size_bytes += size;
     }
 
-    #[allow(dead_code)]
-    pub fn get(&self, tool: &str, args: &serde_json::Value) -> Option<String> {
-        let key = Self::get_cache_key(tool, args);
-        
-        if let Some(cached) = self.cache.get(&key) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            
-            if now - cached.timestamp < cached.ttl_seconds {
-                return Some(cached.result.clone());
-            }
-        }
-        
-        None
+    pub fn clear(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.clear();
+        let mut stats = self.stats.lock().unwrap();
+        stats.total_entries = 0;
+        stats.total_size_bytes = 0;
     }
 
-    #[allow(dead_code)]
-    pub fn set(&mut self, tool: &str, args: serde_json::Value, result: String, ttl_seconds: u64) {
-        let key = Self::get_cache_key(tool, &args);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        self.cache.insert(key, CachedToolResult {
-            tool: tool.to_string(),
-            args,
-            result,
-            timestamp,
-            ttl_seconds,
-        });
-    }
-
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.cache.clear();
-    }
-
-    #[allow(dead_code)]
-    pub fn get_stats(&self) -> serde_json::Value {
-        serde_json::json!({
-            "total_entries": self.cache.len(),
-            "entries": self.cache.values().map(|c| serde_json::json!({
-                "tool": c.tool,
-                "timestamp": c.timestamp,
-                "ttl": c.ttl_seconds,
-            })).collect::<Vec<_>>(),
-        })
+    pub fn get_stats(&self) -> CacheStats {
+        self.stats.lock().unwrap().clone()
     }
 }
 
 #[tauri::command]
-pub async fn tool_cache_get(_tool: String, _args: serde_json::Value) -> Result<Option<String>> {
-    // This would need to be called with shared state
-    Ok(None)
+pub fn tool_cache_get(
+    key: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolCache>>>,
+) -> Option<String> {
+    state.lock().ok().and_then(|cache| cache.get(&key))
 }
 
 #[tauri::command]
-pub async fn tool_cache_clear() -> Result<()> {
-    Ok(())
+pub fn tool_cache_clear(
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolCache>>>,
+) -> Result<(), String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())
+        .map(|cache| cache.clear())
 }
 
 #[tauri::command]
-pub async fn tool_cache_get_stats() -> Result<serde_json::Value> {
-    Ok(serde_json::json!({"status": "cache_stats"}))
+pub fn tool_cache_get_stats(
+    state: tauri::State<'_, Arc<std::sync::Mutex<ToolCache>>>,
+) -> Result<CacheStats, String> {
+    state
+        .lock()
+        .map_err(|e| e.to_string())
+        .map(|cache| cache.get_stats())
 }

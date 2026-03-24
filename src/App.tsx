@@ -83,6 +83,7 @@ function App() {
     azurePassword, setAzurePassword,
     azureTokenStatus, setAzureTokenStatus,
     isAutopilotMode, setIsAutopilotMode,
+    contextLength, setContextLength,
     messagesEndRef,
     streamingContentRef,
     STREAMING_MSG_ID,
@@ -125,10 +126,26 @@ function App() {
           .then(result => {
             if (!result.canceled && result.filePaths.length > 0) {
               const selectedPath = result.filePaths[0]
-              setWorkspacePath(selectedPath)
-              workspace.setWorkspace(selectedPath).catch(err => console.error('Error setting workspace:', err))
-              setRefreshKey(prev => prev + 1)
-              setActiveView('explorer')
+              
+              // 1. Reset everything first for a clean state
+              setWorkspacePath(null) // Temporarily clear to force sub-components to unmount/reset
+              setOpenFiles([])
+              setActiveFileId(null)
+              setMessages([{
+                role: 'assistant',
+                content: "Hello! I'm your WhizCode agent. Open a folder to get started."
+              }])
+              setAgentSteps([])
+              setLiveStreamingContent('')
+              setFileErrors({})
+              
+              // 2. Set new workspace
+              setTimeout(() => {
+                  setWorkspacePath(selectedPath)
+                  workspace.setWorkspace(selectedPath).catch(err => console.error('Error setting workspace:', err))
+                  setRefreshKey(prev => prev + 1)
+                  setActiveView('explorer')
+              }, 50)
             }
           })
           .catch(err => console.error('Error opening folder:', err))
@@ -187,7 +204,7 @@ function App() {
   useSettingsPersistence(
     modelProvider, model, openaiKey, geminiKey, bedrockRegion, bedrockAccessKey, bedrockSecretKey,
     azureLoginUrl, azureEmbeddingUrl, azureCompletionUrl, azureUsername, azurePassword,
-    isAutopilotMode, sidebarWidth, isChatOpen, chatWidth
+    isAutopilotMode, contextLength, sidebarWidth, isChatOpen, chatWidth
   )
 
   // Initialize workspace
@@ -303,6 +320,7 @@ function App() {
         workspacePath: workspacePath,
         activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
         conversationHistory,
+        context_length: contextLength,
       })
       const response = result?.response || 'No response'
       const steps = result?.steps || []
@@ -567,7 +585,8 @@ function App() {
               azureLoginUrl, setAzureLoginUrl, azureEmbeddingUrl, setAzureEmbeddingUrl, azureCompletionUrl, setAzureCompletionUrl,
               azureUsername, setAzureUsername, azurePassword, setAzurePassword,
               azureTokenStatus, onGenerateAzureToken: handleGenerateAzureToken,
-              isAutopilotMode, setIsAutopilotMode
+              isAutopilotMode, setIsAutopilotMode,
+              contextLength, setContextLength
             }}
             liveStreamingContent={liveStreamingContent}
             selectedImages={selectedImages}

@@ -202,7 +202,12 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
             )}
             {canOpenLogs && logsOpen && (
                 step.tool === 'run_command' ? (
-                    <TerminalBlock logs={step.logs && step.logs.length > 0 ? step.logs : []} isLive={isLive} requestId={step.requestId} />
+                    <TerminalBlock 
+                      logs={step.logs && step.logs.length > 0 ? step.logs : []} 
+                      isLive={isLive} 
+                      isRunning={step.status === 'running' || step.status === 'started'}
+                      requestId={step.requestId} 
+                    />
                 ) : (
                     <LogContainer logs={step.logs && step.logs.length > 0 ? step.logs : ['(No logs yet)']} />
                 )

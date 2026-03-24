@@ -41,6 +41,8 @@ interface ChatSettingsProps {
     setAzurePassword: (pass: string) => void;
     azureTokenStatus: { hasToken: boolean; timeLeft?: number; expires?: number };
     onGenerateAzureToken: () => void;
+    contextLength: number;
+    setContextLength: (length: number) => void;
 }
 
 export const ChatSettings = ({
@@ -77,7 +79,9 @@ export const ChatSettings = ({
     azurePassword,
     setAzurePassword,
     azureTokenStatus,
-    onGenerateAzureToken
+    onGenerateAzureToken,
+    contextLength,
+    setContextLength
 }: ChatSettingsProps) => {
 
     const [pullingModels, setPullingModels] = useState<Record<string, { status: string; progress?: number }>>({})
@@ -241,6 +245,75 @@ export const ChatSettings = ({
                     </div>
 
                     <div className="settings-separator" />
+
+                    {/* Context Length - Only for Ollama */}
+                    {modelProvider === 'ollama' && (
+                        <>
+                            <div className="settings-model-group">
+                                <div className="settings-group-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ opacity: 0.8 }}>
+                                        <circle cx="12" cy="12" r="3"></circle>
+                                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                    </svg>
+                                    Context length
+                                </div>
+                                <div className="settings-group-description">
+                                    Context length determines how much of your conversation local LLMs can remember and use to generate responses.
+                                </div>
+                                
+                                <div className="settings-field" style={{ padding: '0 8px' }}>
+                                    <div className="context-slider-container">
+                                        <input 
+                                            type="range"
+                                            min="0"
+                                            max="6"
+                                            step="1"
+                                            className="settings-range"
+                                            value={[4096, 8192, 16384, 32768, 65536, 131072, 262144].indexOf(contextLength)}
+                                            onChange={(e) => setContextLength([4096, 8192, 16384, 32768, 65536, 131072, 262144][Number(e.target.value)])}
+                                            style={{ position: 'relative', zIndex: 10 }}
+                                        />
+                                        <div style={{ position: 'absolute', top: 32, width: '100%', left: 0 }}>
+                                            {[4096, 8192, 16384, 32768, 65536, 131072, 262144].map((val, idx, arr) => {
+                                                const labels = ['4k', '8k', '16k', '32k', '64k', '128k', '256k'];
+                                                const isActive = contextLength === val;
+                                                return (
+                                                    <div 
+                                                        key={val} 
+                                                        className={`context-tick ${isActive ? 'active' : ''}`}
+                                                        onClick={() => setContextLength(val)}
+                                                        style={{ 
+                                                            position: 'absolute', 
+                                                            left: `${(idx / (arr.length - 1)) * 100}%`,
+                                                            transform: 'translateX(-50%)',
+                                                            display: 'flex',
+                                                            flexDirection: 'column',
+                                                            alignItems: 'center',
+                                                            cursor: 'pointer'
+                                                        }}
+                                                    >
+                                                        <div className="tick-mark" style={{ 
+                                                            width: 1, 
+                                                            height: 4, 
+                                                            background: 'var(--border-color)', 
+                                                            marginBottom: 8 
+                                                        }}></div>
+                                                        <span style={{ 
+                                                            fontSize: '10px', 
+                                                            opacity: isActive ? 1 : 0.5,
+                                                            fontWeight: isActive ? 600 : 400,
+                                                            color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)'
+                                                        }}>{labels[idx]}</span>
+                                                    </div>
+                                                )
+                                            })}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="settings-separator" />
+                        </>
+                    )}
 
                     {/* Model Selection */}
                     <div className="settings-model-group">

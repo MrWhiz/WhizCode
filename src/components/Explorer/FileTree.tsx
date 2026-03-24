@@ -333,6 +333,10 @@ export const FileTree: React.FC<FileTreeProps> = ({
     }
 
     const fetchFiles = useCallback(async () => {
+        if (!path) {
+            setFiles([])
+            return
+        }
         try {
             const res = await fs.readDirectory(path)
             const sorted = res.sort((a, b) => {

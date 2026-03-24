@@ -74,6 +74,9 @@ export function useAppState() {
   const [isAutopilotMode, setIsAutopilotMode] = useState(() =>
     localStorage.getItem('isAutopilotMode') === 'true'
   )
+  const [contextLength, setContextLength] = useState(() => 
+    Number(localStorage.getItem('contextLength')) || 16384
+  )
 
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -121,6 +124,7 @@ export function useAppState() {
     ollamaChecking, setOllamaChecking,
     isSettingsOpen, setIsSettingsOpen,
     isAboutOpen, setIsAboutOpen,
+    contextLength, setContextLength,
     // Azure
     azureLoginUrl, setAzureLoginUrl,
     azureEmbeddingUrl, setAzureEmbeddingUrl,

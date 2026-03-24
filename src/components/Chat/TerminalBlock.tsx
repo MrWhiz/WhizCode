@@ -6,10 +6,11 @@ import '@xterm/xterm/css/xterm.css';
 interface TerminalBlockProps {
     logs: string[];
     isLive: boolean;
+    isRunning?: boolean;
     requestId?: string;
 }
 
-export const TerminalBlock: React.FC<TerminalBlockProps> = ({ logs, isLive, requestId }) => {
+export const TerminalBlock: React.FC<TerminalBlockProps> = ({ logs, isLive, isRunning, requestId }) => {
     const terminalRef = useRef<HTMLDivElement>(null);
     const xtermRef = useRef<Terminal | null>(null);
     const fitAddonRef = useRef<FitAddon | null>(null);
@@ -114,7 +115,7 @@ export const TerminalBlock: React.FC<TerminalBlockProps> = ({ logs, isLive, requ
             position: 'relative'
         }}>
             <div ref={terminalRef} style={{ width: '100%', height: '100%' }} />
-            {isLive && requestId && (
+            {isLive && isRunning && requestId && (
                 <button
                     onClick={handleStop}
                     style={{

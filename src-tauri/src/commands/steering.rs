@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::Result;
 use tauri::State;
@@ -47,16 +48,16 @@ pub struct SteeringMetrics {
 
 #[allow(dead_code)]
 pub struct SteeringSystem {
-    steering_files: Arc<Mutex<HashMap<String, SteeringFile>>>,
-    active_contexts: Arc<Mutex<HashMap<String, SteeringContext>>>,
+    steering_files: Arc<RwLock<HashMap<String, SteeringFile>>>,
+    active_contexts: Arc<RwLock<HashMap<String, SteeringContext>>>,
 }
 
 #[allow(dead_code)]
 impl SteeringSystem {
     pub fn new() -> Self {
         let system = Self {
-            steering_files: Arc::new(Mutex::new(HashMap::new())),
-            active_contexts: Arc::new(Mutex::new(HashMap::new())),
+            steering_files: Arc::new(RwLock::new(HashMap::new())),
+            active_contexts: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Add default steering rules
@@ -93,33 +94,32 @@ impl SteeringSystem {
             .unwrap_or_default()
             .as_secs()
     }
-
     pub fn add_steering_file(&self, mut file: SteeringFile) -> Result<()> {
+        let mut files = self.steering_files.write();
         file.created_at = Self::current_timestamp();
         file.last_modified = Self::current_timestamp();
-        let mut files = self.steering_files.lock().unwrap();
         files.insert(file.id.clone(), file);
         Ok(())
     }
 
     pub fn remove_steering_file(&self, file_id: &str) -> Result<()> {
-        let mut files = self.steering_files.lock().unwrap();
+        let mut files = self.steering_files.write();
         files.remove(file_id);
         Ok(())
     }
 
     pub fn get_steering_file(&self, file_id: &str) -> Option<SteeringFile> {
-        let files = self.steering_files.lock().unwrap();
+        let files = self.steering_files.read();
         files.get(file_id).cloned()
     }
 
     pub fn get_all_steering_files(&self) -> Vec<SteeringFile> {
-        let files = self.steering_files.lock().unwrap();
+        let files = self.steering_files.read();
         files.values().cloned().collect()
     }
 
     pub fn get_enabled_steering_files(&self) -> Vec<SteeringFile> {
-        let files = self.steering_files.lock().unwrap();
+        let files = self.steering_files.read();
         files
             .values()
             .filter(|f| f.enabled)
@@ -128,7 +128,7 @@ impl SteeringSystem {
     }
 
     pub fn enable_steering_file(&self, file_id: &str) -> Result<()> {
-        let mut files = self.steering_files.lock().unwrap();
+        let mut files = self.steering_files.write();
         if let Some(file) = files.get_mut(file_id) {
             file.enabled = true;
             file.last_modified = Self::current_timestamp();
@@ -139,7 +139,7 @@ impl SteeringSystem {
     }
 
     pub fn disable_steering_file(&self, file_id: &str) -> Result<()> {
-        let mut files = self.steering_files.lock().unwrap();
+        let mut files = self.steering_files.write();
         if let Some(file) = files.get_mut(file_id) {
             file.enabled = false;
             file.last_modified = Self::current_timestamp();
@@ -150,7 +150,7 @@ impl SteeringSystem {
     }
 
     pub fn update_steering_file(&self, file: SteeringFile) -> Result<()> {
-        let mut files = self.steering_files.lock().unwrap();
+        let mut files = self.steering_files.write();
         if files.contains_key(&file.id) {
             let mut updated_file = file;
             updated_file.last_modified = Self::current_timestamp();
@@ -240,7 +240,7 @@ impl SteeringSystem {
             total_context_size: total_size,
         };
 
-        let mut contexts = self.active_contexts.lock().unwrap();
+        let mut contexts = self.active_contexts.write();
         contexts.insert(workspace_path.to_string(), context.clone());
 
         Ok(context)
@@ -259,12 +259,12 @@ impl SteeringSystem {
     }
 
     pub fn get_injected_context(&self, workspace_path: &str) -> Option<String> {
-        let contexts = self.active_contexts.lock().unwrap();
+        let contexts = self.active_contexts.read();
         contexts.get(workspace_path).map(|c| c.injected_context.clone())
     }
 
     pub fn get_metrics(&self) -> SteeringMetrics {
-        let files = self.steering_files.lock().unwrap();
+        let files = self.steering_files.read();
         let total = files.len();
         let enabled = files.values().filter(|f| f.enabled).count();
         let auto = files.values().filter(|f| f.inclusion_type == "auto").count();
@@ -284,7 +284,7 @@ impl SteeringSystem {
     }
 
     pub fn clear_context(&self, workspace_path: &str) {
-        let mut contexts = self.active_contexts.lock().unwrap();
+        let mut contexts = self.active_contexts.write();
         contexts.remove(workspace_path);
     }
 }
@@ -292,35 +292,35 @@ impl SteeringSystem {
 #[tauri::command]
 pub async fn steering_add_file(
     file: SteeringFile,
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<()> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     system.add_steering_file(file)
 }
 
 #[tauri::command]
 pub async fn steering_remove_file(
     file_id: String,
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<()> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     system.remove_steering_file(&file_id)
 }
 
 #[tauri::command]
 pub async fn steering_get_file(
     file_id: String,
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<Option<SteeringFile>> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     Ok(system.get_steering_file(&file_id))
 }
 
 #[tauri::command]
 pub async fn steering_list_all(
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<Vec<SteeringFile>> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     Ok(system.get_all_steering_files())
 }
 
@@ -333,18 +333,18 @@ pub async fn steering_get_enabled() -> Result<Vec<SteeringFile>> {
 #[tauri::command]
 pub async fn steering_enable_file(
     file_id: String,
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<()> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     system.enable_steering_file(&file_id)
 }
 
 #[tauri::command]
 pub async fn steering_disable_file(
     file_id: String,
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<()> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     system.disable_steering_file(&file_id)
 }
 
@@ -358,18 +358,18 @@ pub async fn steering_update_file(file: SteeringFile) -> Result<()> {
 pub async fn steering_load_context(
     workspace_path: String, 
     current_file: Option<String>,
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<SteeringContext> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     system.load_steering_files_for_context(&workspace_path, current_file.as_deref())
 }
 
 #[tauri::command]
 pub async fn steering_get_injected_context(
     workspace_path: String,
-    state: State<'_, Arc<Mutex<SteeringSystem>>>,
+    state: State<'_, Arc<RwLock<SteeringSystem>>>,
 ) -> Result<Option<String>> {
-    let system = state.lock().unwrap();
+    let system = state.read();
     Ok(system.get_injected_context(&workspace_path))
 }
 

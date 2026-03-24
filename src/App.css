@@ -2206,3 +2206,61 @@ body {
   color: var(--text-tertiary);
   font-size: 10px;
 }
+
+/* Context Length Slider Sync with Ollama */
+.context-slider-container {
+  position: relative;
+  width: 100%;
+  padding: 10px 0 30px 0;
+  margin-top: 10px;
+}
+
+.context-tick {
+  transition: all 0.2s ease;
+}
+
+.context-tick:hover .tick-mark {
+  background: var(--accent-primary) !important;
+  height: 6px !important;
+}
+
+.context-tick.active .tick-mark {
+  background: var(--accent-primary) !important;
+  height: 8px !important;
+  width: 2px !important;
+}
+
+.context-tick.active span {
+  color: var(--accent-primary) !important;
+  font-weight: 600;
+  transform: translateY(2px);
+}
+
+.settings-range {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 2px;
+  background: var(--border-color);
+  border-radius: 1px;
+  outline: none;
+  margin: 15px 0;
+}
+
+.settings-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: white;
+  border: 2px solid var(--accent-primary);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.3);
+}
+
+.settings-range::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+  background: var(--accent-primary);
+}

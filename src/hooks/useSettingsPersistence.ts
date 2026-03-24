@@ -15,6 +15,7 @@ export function useSettingsPersistence(
   azureUsername: string,
   azurePassword: string,
   isAutopilotMode: boolean,
+  contextLength: number,
   sidebarWidth: number,
   isChatOpen: boolean,
   chatWidth: number
@@ -33,12 +34,13 @@ export function useSettingsPersistence(
     localStorage.setItem('azureUsername', azureUsername)
     localStorage.setItem('azurePassword', azurePassword)
     localStorage.setItem('isAutopilotMode', String(isAutopilotMode))
+    localStorage.setItem('contextLength', String(contextLength))
     localStorage.setItem('sidebarWidth', String(sidebarWidth))
     localStorage.setItem('isChatOpen', String(isChatOpen))
     localStorage.setItem('chatWidth', String(chatWidth))
   }, [
     modelProvider, model, openaiKey, geminiKey, bedrockRegion, bedrockAccessKey, bedrockSecretKey,
-    isAutopilotMode, azureLoginUrl, azureEmbeddingUrl, azureCompletionUrl, azureUsername, azurePassword,
+    isAutopilotMode, contextLength, azureLoginUrl, azureEmbeddingUrl, azureCompletionUrl, azureUsername, azurePassword,
     sidebarWidth, isChatOpen, chatWidth
   ])
 }

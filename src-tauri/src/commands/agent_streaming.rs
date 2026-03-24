@@ -9,6 +9,7 @@ use crate::state::AppState;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::commands::retry_manager::{RetryManager, RetryConfig, AutoRecoveryEngine};
+use crate::commands::steering::SteeringSystem;
 use crate::commands::failure_learning::FailureLearningEngine;
 
 // ─────────────────────────────────────────────
@@ -157,6 +158,8 @@ pub struct StreamingAgentOrchestrator {
     learning_engine: FailureLearningEngine,
     event_batch: Vec<AgentStep>,
     last_emit_time: std::time::Instant,
+    client: reqwest::Client,
+    context_length: u32,
 }
 
 // ─────────────────────────────────────────────
@@ -175,7 +178,13 @@ impl StreamingAgentOrchestrator {
             learning_engine: FailureLearningEngine::new(),
             event_batch: Vec::new(),
             last_emit_time: std::time::Instant::now(),
+            client: reqwest::Client::new(),
+            context_length: 16384, // Default
         }
+    }
+
+    pub fn set_context_length(&mut self, length: u32) {
+        self.context_length = length;
     }
 
     // Batch events to prevent IPC queue overflow
@@ -256,7 +265,7 @@ impl StreamingAgentOrchestrator {
         _vector_system: Arc<std::sync::Mutex<crate::commands::vector_search::VectorSearchSystem>>,
         code_intel: Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
         learning: Arc<std::sync::Mutex<crate::commands::learning::LearningSystem>>,
-        steering: Arc<std::sync::Mutex<crate::commands::steering::SteeringSystem>>,
+        steering: Arc<RwLock<SteeringSystem>>,
         recovery: Arc<std::sync::Mutex<crate::commands::error_recovery::ErrorRecoverySystem>>,
         app_state_ref: Arc<RwLock<AppState>>,
     ) -> Result<StreamingAgentResponse> {
@@ -321,12 +330,11 @@ impl StreamingAgentOrchestrator {
 
         // ── 2. STEERING CONTEXT LOADING ─────────────────────────────────────
         if let Some(ws) = &workspace_path {
-            if let Ok(s) = steering.lock() {
-                let current_file_path = active_file.as_ref()
-                    .and_then(|f| f.get("path"))
-                    .and_then(|p| p.as_str());
-                let _ = s.load_steering_files_for_context(ws, current_file_path);
-            }
+            let s = steering.read();
+            let current_file_path = active_file.as_ref()
+                .and_then(|f| f.get("path"))
+                .and_then(|p| p.as_str());
+            let _ = s.load_steering_files_for_context(ws, current_file_path);
         }
 
         // ── 3. CONTEXT BUILDING ─────────────────────────────────────────────
@@ -600,6 +608,7 @@ impl StreamingAgentOrchestrator {
     }
 
     async fn call_llm_streaming(&self, messages: &[(String, String)], model: &str) -> Result<(String, u32)> {
+        let context_length = self.context_length;
         let mut messages_json = Vec::new();
         // Context sliding window optimization: keeping the system prompt and latest tasks intact,
         // but trimming incredibly obese historical tool logs to keep prompt length < 10k chars natively
@@ -614,7 +623,8 @@ impl StreamingAgentOrchestrator {
 
         for (i, (_role, content)) in iter_messages {
             if i <= 1 || included_indices.contains(&i) { continue; }
-            if char_count + content.len() < 15_000 {
+            let limit = (context_length as usize * 4).saturating_sub(5000).max(10000);
+            if char_count + content.len() < limit {
                 included_indices.insert(i);
                 char_count += content.len();
             }
@@ -631,7 +641,6 @@ impl StreamingAgentOrchestrator {
 
         eprintln!("[LLM] Calling chat endpoint {} with {}/{} messages (optimized context)", model, included_indices.len(), messages.len());
 
-        let client = reqwest::Client::new();
         let payload = serde_json::json!({
             "model": model,
             "messages": messages_json,
@@ -639,8 +648,9 @@ impl StreamingAgentOrchestrator {
             "temperature": 0.1,
             "top_p": 0.9,
             "top_k": 40,
+            "keep_alive": "5m",
             "options": {
-                "num_ctx": 16000,
+                "num_ctx": self.context_length,
             }
         });
 
@@ -650,7 +660,7 @@ impl StreamingAgentOrchestrator {
         // FIX: 100-token batches prevent Windows message-queue overflow
         const BATCH_SIZE: usize = 100;
 
-        match client
+        match self.client
             .post("http://localhost:11434/api/chat")
             .json(&payload)
             .timeout(std::time::Duration::from_secs(300))
@@ -1092,6 +1102,7 @@ impl StreamingAgentOrchestrator {
         let mut executed_results = Vec::new();
         let mut json_parser = crate::commands::streaming_agent_flow::IncrementalJsonParser::new();
         let mut tool_counter = 0u32;
+        let context_length = self.context_length;
 
         // Build LLM request
         let mut messages_json = Vec::new();
@@ -1105,7 +1116,8 @@ impl StreamingAgentOrchestrator {
 
         for (i, (_role, content)) in iter_messages {
             if i <= 1 || included_indices.contains(&i) { continue; }
-            if char_count + content.len() < 15_000 {
+            let limit = (context_length as usize * 4).saturating_sub(5000).max(10000);
+            if char_count + content.len() < limit {
                 included_indices.insert(i);
                 char_count += content.len();
             }
@@ -1134,7 +1146,6 @@ impl StreamingAgentOrchestrator {
             }
         }
 
-        let client = reqwest::Client::new();
         let payload = serde_json::json!({
             "model": model_name,
             "messages": messages_json,
@@ -1142,15 +1153,16 @@ impl StreamingAgentOrchestrator {
             "temperature": 0.1,
             "top_p": 0.9,
             "top_k": 40,
+            "keep_alive": "5m",
             "options": {
-                "num_ctx": 16000,
+                "num_ctx": self.context_length,
             }
         });
 
         // ─────────────────────────────────────────────────────────
         // PHASE 1: IDENTIFY ALL TOOLS
         // ─────────────────────────────────────────────────────────
-        match client
+        match self.client
             .post("http://localhost:11434/api/chat")
             .json(&payload)
             .timeout(std::time::Duration::from_secs(300))
@@ -1748,6 +1760,7 @@ impl StreamingAgentOrchestrator {
         messages: &[(String, String)],
         model: &str,
         iteration: u32,
+        context_length: u32,
     ) -> Result<(Vec<ToolCall>, String)> {
         let mut messages_json = Vec::new();
         let mut char_count = 0;
@@ -1760,7 +1773,8 @@ impl StreamingAgentOrchestrator {
 
         for (i, (_role, content)) in iter_messages {
             if i <= 1 || included_indices.contains(&i) { continue; }
-            if char_count + content.len() < 15_000 {
+            let limit = (context_length as usize * 4).saturating_sub(5000).max(10000);
+            if char_count + content.len() < limit {
                 included_indices.insert(i);
                 char_count += content.len();
             }
@@ -1777,7 +1791,6 @@ impl StreamingAgentOrchestrator {
 
         eprintln!("[LLM] Streaming with incremental parsing: {} messages", included_indices.len());
 
-        let client = reqwest::Client::new();
         let payload = serde_json::json!({
             "model": model,
             "messages": messages_json,
@@ -1785,8 +1798,9 @@ impl StreamingAgentOrchestrator {
             "temperature": 0.1,
             "top_p": 0.9,
             "top_k": 40,
+            "keep_alive": "5m",
             "options": {
-                "num_ctx": 16000,
+                "num_ctx": self.context_length,
             }
         });
 
@@ -1795,7 +1809,7 @@ impl StreamingAgentOrchestrator {
         let mut identified_tools = Vec::new();
         let mut tool_counter = 0u32;
 
-        match client
+        match self.client
             .post("http://localhost:11434/api/chat")
             .json(&payload)
             .timeout(std::time::Duration::from_secs(300))
@@ -1883,7 +1897,7 @@ impl StreamingAgentOrchestrator {
         detected_shell: &str,
         code_intel: Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
         learning: Arc<std::sync::Mutex<crate::commands::learning::LearningSystem>>,
-        steering: Arc<std::sync::Mutex<crate::commands::steering::SteeringSystem>>,
+        steering: Arc<RwLock<SteeringSystem>>,
     ) -> String {
         let mut prompt = prompts::WHIZCODE_SYSTEM_PROMPT.to_string();
 
@@ -1928,13 +1942,12 @@ impl StreamingAgentOrchestrator {
 
         // ── 2. STEERED CONTEXT ─────────────────────────────────────────────
         if let Some(ws) = workspace_path {
-            if let Ok(s) = steering.lock() {
-                if let Some(steered_context) = s.get_injected_context(ws) {
-                    if !steered_context.is_empty() {
-                        prompt.push_str("\n\n<steering_rules>\n");
-                        prompt.push_str(&steered_context);
-                        prompt.push_str("\n</steering_rules>");
-                    }
+            let s = steering.read();
+            if let Some(steered_context) = s.get_injected_context(ws) {
+                if !steered_context.is_empty() {
+                    prompt.push_str("\n\n<steering_rules>\n");
+                    prompt.push_str(&steered_context);
+                    prompt.push_str("\n</steering_rules>");
                 }
             }
         }
@@ -2692,8 +2705,9 @@ pub async fn execute_agent_loop_streaming(
     vector_state: State<'_, Arc<std::sync::Mutex<crate::commands::vector_search::VectorSearchSystem>>>,
     intel_state: State<'_, Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>>,
     learning_state: State<'_, Arc<std::sync::Mutex<crate::commands::learning::LearningSystem>>>,
-    steering_state: State<'_, Arc<std::sync::Mutex<crate::commands::steering::SteeringSystem>>>,
+    steering_state: State<'_, Arc<RwLock<SteeringSystem>>>,
     recovery_state: State<'_, Arc<std::sync::Mutex<crate::commands::error_recovery::ErrorRecoverySystem>>>,
+    context_length: Option<u32>,
 ) -> Result<StreamingAgentResponse> {
     // Reset cancel token at the start of a new task
     {
@@ -2714,6 +2728,7 @@ pub async fn execute_agent_loop_streaming(
     let prior_history = conversation_history.unwrap_or_default();
 
     let mut orchestrator = StreamingAgentOrchestrator::new(Some(app_handle));
+    orchestrator.set_context_length(context_length.unwrap_or(16384));
     orchestrator.execute_task_streaming(
         task, model, resolved_workspace, active_file,
         prior_history,

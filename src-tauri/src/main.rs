@@ -26,7 +26,7 @@ fn main() {
         .manage(Arc::new(std::sync::Mutex::new(commands::learning::LearningSystem::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::context_memory::ContextMemory::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::graph::GraphService::new())))
-        .manage(Arc::new(std::sync::Mutex::new(commands::steering::SteeringSystem::new())))
+        .manage(Arc::new(RwLock::new(commands::steering::SteeringSystem::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::index::IndexService::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::diagnostics_service::DiagnosticsService::new())))
         .manage(Arc::new(std::sync::Mutex::new(commands::diff::DiffService::new())))

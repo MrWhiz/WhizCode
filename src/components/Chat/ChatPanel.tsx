@@ -6,6 +6,7 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Message, AgentStep } from '../../types'
 import { ChatSettings } from './ChatSettings'
 import { MermaidDiagram } from './MermaidDiagram'
+import { StreamingDisplay } from './StreamingDisplay'
 import { TerminalBlock } from './TerminalBlock'
 
 interface ChatPanelProps {
@@ -361,37 +362,25 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
     let thoughts: string[] = [];
     let cleanContent = content;
 
-    const extractThoughts = (match: string, p1: string) => {
-        const t = p1.trim();
-        if (t && !thoughts.includes(t)) {
-            thoughts.push(t);
+    // Extract thoughts from JSON format: {"thought": "...", "tool": "...", "args": {...}}
+    // Look for JSON objects with "thought" key
+    const jsonThoughtRegex = /"thought"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+    let match;
+    while ((match = jsonThoughtRegex.exec(content)) !== null) {
+        const thought = match[1]
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\')
+            .trim();
+        if (thought && !thoughts.includes(thought)) {
+            thoughts.push(thought);
         }
-        return ''; // Remove the matched thought from the clean content
-    };
-
-    // 1. Extract and perfectly strip CLOSED thought blocks first
-    const closedPatterns = [
-        /<thought>([\s\S]*?)<\/thought>/gi,
-        /<think>([\s\S]*?)<\/think>/gi,
-        /\[thought\]([\s\S]*?)\[\/thought\]/gi,
-        /\[think\]([\s\S]*?)\[\/think\]/gi,
-    ];
-
-    for (const pattern of closedPatterns) {
-        cleanContent = cleanContent.replace(pattern, extractThoughts);
     }
 
-    // 2. Handle UNCLOSED thought blocks (crucial for streaming)
-    const unclosedPatterns = [
-        /<thought>([\s\S]*?)(?=\n```|\n\{|$)/gi,
-        /<think>([\s\S]*?)(?=\n```|\n\{|$)/gi,
-        /\[thought\]([\s\S]*?)(?=\n```|\n\{|$)/gi,
-        /\[think\]([\s\S]*?)(?=\n```|\n\{|$)/gi,
-    ];
-
-    for (const pattern of unclosedPatterns) {
-        cleanContent = cleanContent.replace(pattern, extractThoughts);
-    }
+    // Remove JSON tool call blocks from display
+    cleanContent = content
+        .replace(/```json\s*\{[\s\S]*?\}\s*```/g, '')
+        .replace(/(?:\n|^)\s*\{[\s\S]*?"tool"\s*:[\s\S]*?\}\s*(?:\n|$)/g, '')
+        .trim();
 
     // Normalize and strip all possible internal control tags
     cleanContent = cleanContent
@@ -402,11 +391,9 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
         .replace(/<OUTPUT_FORMAT>[\s\S]*?<\/OUTPUT_FORMAT>/gi, '')
         .trim();
 
-    // 2. Extract and hide tool call JSONs - only hide the JSON blocks, not the whole message
+    // Define regex patterns for JSON blocks
     const jsonBlockRegex = /```json\s*\{[\s\S]*?\}\s*```/g;
     const rawJsonRegex = /(?:\n|^)\s*\{[\s\S]*?\}\s*(?:\n|$)/g;
-    
-    // Support hiding partial/streaming JSON blocks
     const streamingJsonBlockRegex = /```json\s*\{[\s\S]*$/g;
     const streamingRawJsonRegex = /(?:\n|^)\s*\{[\s\S]*$/g;
     
@@ -687,20 +674,17 @@ export const ChatPanel = ({
     const getCurrentThought = (content: string) => {
         if (!content) return null;
         
-        // Only show thought blocks - don't show raw LLM output which may contain
-        // model thinking tokens with repeated words
-        const patterns = [
-            /\[THOUGHT\]([\s\S]*?)(?:\[\/THOUGHT\]|```|\{)/i,
-            /<think>([\s\S]*?)(?:<\/think>|```|\{)/i,
-            /\[REASONING\]([\s\S]*?)(?:\[\/REASONING\]|```|\{)/i,
-        ];
-
-        for (const pattern of patterns) {
-            const match = content.match(pattern);
-            if (match && match[1].trim()) {
-                const thought = match[1].trim();
-                return thought.length > 150 ? '...' + thought.slice(-150) : thought;
-            }
+        // Extract thought from JSON format: {"thought": "...", ...}
+        // Look for the "thought" key in JSON
+        const jsonThoughtRegex = /"thought"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/;
+        const match = content.match(jsonThoughtRegex);
+        
+        if (match && match[1]) {
+            const thought = match[1]
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\')
+                .trim();
+            return thought.length > 150 ? '...' + thought.slice(-150) : thought;
         }
         
         return null;
@@ -774,6 +758,10 @@ export const ChatPanel = ({
                         <div className="chat-msg assistant">
                             <div className="chat-msg-sender">WHIZCODE</div>
                             <div className="chat-msg-content">
+                                {liveStreamingContent && (
+                                    <StreamingDisplay content={liveStreamingContent} isStreaming={true} />
+                                )}
+                                
                                 {agentSteps.length > 0 && (
                                     <div className="agent-steps live">
                                         {agentSteps.map((step, si) => (

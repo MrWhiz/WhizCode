@@ -28,9 +28,15 @@ export function useWorkspaceInit(
     return cleanup
   }, [savedState])
 
-  // Restore saved workspace on app startup
+  // Restore saved workspace on app startup (only once)
   useEffect(() => {
     const restoreSavedWorkspace = async () => {
+      // Only restore if no workspace is currently set
+      if (workspacePath) {
+        console.log('[APP] Workspace already set, skipping restoration')
+        return
+      }
+      
       if (savedState.workspacePath) {
         try {
           console.log('[APP] Attempting to restore workspace:', savedState.workspacePath)
@@ -55,7 +61,7 @@ export function useWorkspaceInit(
     }
 
     restoreSavedWorkspace()
-  }, [savedState, setWorkspacePath, setRefreshKey])
+  }, [savedState, setWorkspacePath, setRefreshKey, workspacePath])
 
   // Persist UI layout state whenever it changes
   useEffect(() => {

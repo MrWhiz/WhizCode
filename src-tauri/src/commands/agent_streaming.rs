@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::commands::prompts;
+use crate::commands::problem_identifier::ProblemIdentifier;
 use tauri::Emitter;
 use tauri::State;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::commands::retry_manager::{RetryManager, RetryConfig, AutoRecoveryEngine};
 use crate::commands::steering::SteeringSystem;
 use crate::commands::failure_learning::FailureLearningEngine;
+use regex::Regex;
 
 // ─────────────────────────────────────────────
 // Command Sanitization for PowerShell
@@ -428,7 +430,7 @@ impl StreamingAgentOrchestrator {
         // This is the key optimisation: file tree, git diff, KIs, active file,
         // steering and code-intel are sent as a single user/assistant primer pair
         // instead of being re-embedded in the system prompt on every LLM call.
-        let workspace_context = self.build_workspace_context(
+        let mut workspace_context = self.build_workspace_context(
             &workspace_path, &active_file, &task,
             code_intel.clone(), steering.clone(),
         );
@@ -444,6 +446,13 @@ impl StreamingAgentOrchestrator {
             
             eprintln!("[Agent] Context optimization: {} tokens (max: 8000)", pruned.estimated_tokens);
             eprintln!("[Agent] Pruned context summary: {}", pruned.summary);
+            
+            // Apply pruned context to workspace_context
+            if pruned.estimated_tokens < workspace_context.len() as u32 / 4 {
+                eprintln!("[Agent] Applying pruned context ({} files, {} tokens)", pruned.files.len(), pruned.estimated_tokens);
+                // Use the summary as the workspace context since files were pruned
+                workspace_context = pruned.summary;
+            }
             
             streaming_feedback.complete_phase("context_optimization");
         }
@@ -462,6 +471,11 @@ impl StreamingAgentOrchestrator {
         } else {
             format!("Task: {}\nPlease analyze the task, explore the codebase if needed, execute the necessary changes, and verify the results.", task.clone())
         };
+
+        // ── INTELLIGENT PROBLEM ANALYSIS ────────────────────────────────────
+        // Analyze the problem to provide targeted investigation guidance
+        let problem_analysis = Self::analyze_problem_intelligently(&task);
+        let final_task_msg = format!("{}{}", final_task_msg, problem_analysis);
 
         // ── CONTEXT MEMORY: Inject prior patterns into task message ──────────
         // Query for relevant strategies and error patterns from past executions
@@ -532,6 +546,7 @@ impl StreamingAgentOrchestrator {
         let mut previous_tool_sig = String::new();
         let mut repeat_count = 0u32;
         let mut tool_sig_history: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(4);
+        let mut validation_error_count = 0u32; // Track consecutive validation errors
 
         while iteration < self.max_iterations * 3 {
             if crate::commands::agent::is_agent_cancelled() { break; }
@@ -568,6 +583,9 @@ impl StreamingAgentOrchestrator {
                 }
             }
 
+            // ── VALIDATION ERROR TRACKING ───────────────────────────────────
+            // Track consecutive validation errors to detect stuck loops
+
             // ── PHASE 4: Unified streaming + sequential execution ──────────────
             // This replaces the old two-phase approach (stream_llm_with_incremental_parsing + execute_tools_sequentially)
             // Now: LLM streams → tools identified immediately → first tool executes while LLM continues → remaining tools queue
@@ -588,6 +606,7 @@ impl StreamingAgentOrchestrator {
             let mut tool_results = Vec::new();
             let mut response = String::new();
             let mut done = false;
+            let mut rejected_tools = Vec::new(); // Track rejected tool calls
 
             // Collect tool calls, results, and the raw LLM text (no extra Ollama call needed)
             let mut raw_llm_text = String::new();
@@ -597,6 +616,17 @@ impl StreamingAgentOrchestrator {
                     raw_llm_text = result.unwrap_or_default();
                     continue;
                 }
+                
+                // Extract rejected tools from the special marker entry
+                if tool_call_or_text.tool == "__rejected_tools__" {
+                    if let Ok(Ok(data)) = serde_json::to_value(&tool_call_or_text.args).map(|v| v.get("tools").cloned().ok_or(())) {
+                        if let Ok(tools_array) = serde_json::from_value::<Vec<String>>(data) {
+                            rejected_tools.extend(tools_array);
+                        }
+                    }
+                    continue;
+                }
+                
                 tool_calls.push(tool_call_or_text.clone());
                 match &result {
                     Ok(r) => {
@@ -701,8 +731,95 @@ impl StreamingAgentOrchestrator {
             // when the model clearly tried to output tool JSON but mangled the syntax.
             if tool_calls.is_empty() && !done {
                 eprintln!("[Agent] No tools in stream — analysing response text...");
-
-                let looks_complete = raw_llm_text.to_uppercase().contains("TASK COMPLETE")
+                eprintln!("[Agent] Response length: {} chars", raw_llm_text.len());
+                eprintln!("[Agent] Contains \"thought\": {}", raw_llm_text.contains("\"thought\""));
+                eprintln!("[Agent] Contains \"tool\": {}", raw_llm_text.contains("\"tool\""));
+                
+                // Check if tools were rejected due to validation
+                if !rejected_tools.is_empty() {
+                    eprintln!("[Agent] ⚠️ {} tool calls were rejected due to missing arguments", rejected_tools.len());
+                    eprintln!("[Agent] === RAW LLM RESPONSE (first 2000 chars) ===");
+                    eprintln!("{}", &raw_llm_text[..raw_llm_text.len().min(2000)]);
+                    eprintln!("[Agent] === END RAW LLM RESPONSE ===");
+                    validation_error_count += 1;
+                    
+                    // Build a detailed error message with specific guidance
+                    let mut error_msg = "[SYSTEM] VALIDATION ERROR: Tool calls rejected due to missing required arguments:\n\n".to_string();
+                    for rejected in &rejected_tools {
+                        error_msg.push_str(&format!("❌ {}\n", rejected));
+                    }
+                    error_msg.push_str("\n📋 REQUIRED ARGUMENTS BY TOOL:\n");
+                    error_msg.push_str("• read_file, write_file, edit_file, multi_edit_file, create_file, delete_file, move_file, rename_file: MUST have \"path\"\n");
+                    error_msg.push_str("• run_command: MUST have \"command\"\n");
+                    error_msg.push_str("• grep_search, search_files: MUST have \"query\"\n");
+                    error_msg.push_str("\n✅ EXAMPLE OF CORRECT FORMAT:\n");
+                    error_msg.push_str("{\"thought\": \"Reading the file to understand the issue\", \"tool\": \"read_file\", \"args\": {\"path\": \"src/components/Chat/ChatPanel.tsx\"}}\n");
+                    
+                    // Add aggressive nudge if this is the 3rd consecutive validation error
+                    if validation_error_count >= 3 {
+                        error_msg.push_str("\n🚨 CRITICAL: This is validation error #");
+                        error_msg.push_str(&validation_error_count.to_string());
+                        error_msg.push_str(". You MUST provide ALL required arguments. Your next response MUST be valid JSON with complete arguments or the task will fail.");
+                    } else {
+                        error_msg.push_str("\n🔄 RETRY: Output your tool call with ALL required arguments filled in. Do not skip any required fields.");
+                    }
+                    
+                    tool_results.insert(0, error_msg);
+                    // Don't do stall detection - just inform the LLM to retry
+                    // Continue to add results to turn_messages below
+                } else if raw_llm_text.contains("\"tool\"") && raw_llm_text.len() > 100 {
+                    // LLM tried to output tool calls but they were all rejected
+                    eprintln!("[Agent] ⚠️ LLM output contains tool calls but they were rejected due to validation");
+                    
+                    // Check if this is incomplete JSON (likely truncated response)
+                    let open_braces = raw_llm_text.matches('{').count();
+                    let close_braces = raw_llm_text.matches('}').count();
+                    let is_incomplete_json = open_braces > close_braces;
+                    
+                    if is_incomplete_json {
+                        eprintln!("[Agent] ⚠️ INCOMPLETE JSON DETECTED: {} open braces, {} close braces", open_braces, close_braces);
+                        eprintln!("[Agent] This likely means the LLM response was truncated mid-JSON");
+                        eprintln!("[Agent] === RAW LLM RESPONSE (first 2000 chars) ===");
+                        eprintln!("{}", &raw_llm_text[..raw_llm_text.len().min(2000)]);
+                        eprintln!("[Agent] === END RAW LLM RESPONSE ===");
+                        
+                        // Write to debug file for inspection
+                        let debug_file = format!("incomplete_json_iter_{}.txt", iteration);
+                        let _ = std::fs::write(&debug_file, format!("Iteration: {}\nIncomplete JSON - Open: {}, Close: {}\n\n=== RAW LLM RESPONSE ===\n{}", iteration, open_braces, close_braces, raw_llm_text));
+                        eprintln!("[Agent] Debug output written to: {}", debug_file);
+                        
+                        // Add a message to help the LLM understand the issue
+                        tool_results.insert(0, "[SYSTEM] ERROR: Your response was incomplete or truncated. The JSON object was not fully formed (missing closing braces). Please retry with a complete JSON response: {\"thought\": \"...\", \"tool\": \"...\", \"args\": {...}}".to_string());
+                    } else {
+                        eprintln!("[Agent] === RAW LLM RESPONSE (first 2000 chars) ===");
+                        eprintln!("{}", &raw_llm_text[..raw_llm_text.len().min(2000)]);
+                        eprintln!("[Agent] === END RAW LLM RESPONSE ===");
+                        
+                        // Write to debug file for inspection
+                        let debug_file = format!("validation_error_iter_{}.txt", iteration);
+                        let _ = std::fs::write(&debug_file, format!("Iteration: {}\nValidation Error Count: {}\n\n=== RAW LLM RESPONSE ===\n{}\n\n=== REJECTED TOOLS ===\n{:?}", iteration, validation_error_count, raw_llm_text, rejected_tools));
+                        eprintln!("[Agent] Debug output written to: {}", debug_file);
+                    }
+                    
+                    validation_error_count += 1;
+                    
+                    let mut error_msg = "[SYSTEM] VALIDATION ERROR: Your tool calls were rejected because they are missing required arguments.\n\n📋 REQUIRED ARGUMENTS:\n• read_file, write_file, edit_file, multi_edit_file, create_file, delete_file, move_file, rename_file: MUST have \"path\"\n• run_command: MUST have \"command\"\n• grep_search, search_files: MUST have \"query\"\n\n✅ EXAMPLE:\n{\"thought\": \"Your reasoning\", \"tool\": \"read_file\", \"args\": {\"path\": \"file.tsx\"}}\n\n".to_string();
+                    
+                    // Add aggressive nudge if this is the 3rd consecutive validation error
+                    if validation_error_count >= 3 {
+                        error_msg.push_str("🚨 CRITICAL: This is validation error #");
+                        error_msg.push_str(&validation_error_count.to_string());
+                        error_msg.push_str(". You MUST provide ALL required arguments. Your next response MUST be valid JSON with complete arguments or the task will fail.");
+                    } else {
+                        error_msg.push_str("🔄 RETRY with complete arguments.");
+                    }
+                    
+                    tool_results.insert(0, error_msg);
+                    // Continue to add results to turn_messages below
+                } else {
+                    // No validation error this iteration
+                    validation_error_count = 0;
+                    let looks_complete = raw_llm_text.to_uppercase().contains("TASK COMPLETE")
                     || raw_llm_text.to_uppercase().contains("TASK DONE")
                     || (raw_llm_text.len() < 400 && iteration > 1);
 
@@ -710,6 +827,14 @@ impl StreamingAgentOrchestrator {
                     || raw_llm_text.to_lowercase().contains("please run")
                     || raw_llm_text.to_lowercase().contains("manually")
                     || (raw_llm_text.contains("```") && !raw_llm_text.contains("\'tool\'"));
+
+                // Check for large JSON tool call in prose (common pattern for code generation)
+                let has_large_json_tool = raw_llm_text.contains("\"tool\"") && raw_llm_text.len() > 2000;
+
+                eprintln!("[Agent] looks_complete: {}", looks_complete);
+                eprintln!("[Agent] has_large_json_tool: {}", has_large_json_tool);
+                eprintln!("[Agent] raw_llm_text.len() > 3000: {}", raw_llm_text.len() > 3000);
+                eprintln!("[Agent] raw_llm_text.len() > 1000 && contains \"thought\": {}", raw_llm_text.len() > 1000 && raw_llm_text.contains("\"thought\""));
 
                 if raw_llm_text.contains("{") && (raw_llm_text.contains("\"tool\"") || raw_llm_text.contains("'tool'")) && !looks_complete {
                     // Model tried to call a tool but syntax was broken — single correction
@@ -723,7 +848,7 @@ impl StreamingAgentOrchestrator {
                     correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
                     correction_msgs.push(("user".to_string(),
                         "CRITICAL: Your last response had a JSON syntax error or was incomplete. \
-                         Output ONLY: <thought>brief reason</thought> then ONE valid JSON tool call on the next line. No markdown, no backticks.".to_string()
+                         Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. No markdown, no backticks.".to_string()
                     ));
                     self.suppress_stream = true;
                     let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
@@ -732,14 +857,106 @@ impl StreamingAgentOrchestrator {
                     // Update raw_llm_text so the conversation history reflects the fix
                     raw_llm_text.push_str("\n[Correction]: ");
                     raw_llm_text.push_str(&fix);
+                    if tool_calls.is_empty() { 
+                        response = raw_llm_text.clone();
+                        // Retry correction with a stronger nudge
+                        eprintln!("[Agent] Correction failed — sending stronger nudge");
+                        let mut retry_msgs: Vec<(String, String)> = pinned.to_vec();
+                        retry_msgs.extend_from_slice(recent);
+                        retry_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                        retry_msgs.push(("user".to_string(),
+                            "FINAL WARNING: You MUST use tools. Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. NO OTHER FORMAT.".to_string()
+                        ));
+                        self.suppress_stream = true;
+                        let (retry_fix, _) = self.call_llm_streaming(&retry_msgs, model_name).await?;
+                        self.suppress_stream = false;
+                        tool_calls = extract_tool_calls(&retry_fix);
+                        raw_llm_text.push_str("\n[Retry Correction]: ");
+                        raw_llm_text.push_str(&retry_fix);
+                    }
+                } else if has_large_json_tool {
+                    // LLM output a large JSON tool call in prose instead of using write_file/create_file
+                    eprintln!("[Agent] Large JSON tool in prose detected ({} chars) — sending correction nudge", raw_llm_text.len());
+                    let pinned = &turn_messages[..4.min(turn_messages.len())];
+                    let recent_start = if turn_messages.len() > 4 { turn_messages.len().saturating_sub(4) } else { 4 };
+                    let recent = &turn_messages[recent_start..];
+                    let mut correction_msgs: Vec<(String, String)> = pinned.to_vec();
+                    correction_msgs.extend_from_slice(recent);
+                    correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                    correction_msgs.push(("user".to_string(),
+                        "CRITICAL: You wrote a tool call in your response instead of using the appropriate tool. \
+                         Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. No markdown, no backticks.".to_string()
+                    ));
+                    self.suppress_stream = true;
+                    let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    self.suppress_stream = false;
+                    tool_calls = extract_tool_calls(&fix);
+                    raw_llm_text.push_str("\n[Correction]: ");
+                    raw_llm_text.push_str(&fix);
                     if tool_calls.is_empty() { response = raw_llm_text.clone(); }
+                } else if raw_llm_text.len() > 3000 && !looks_complete {
+                    // LLM is producing prose instead of using tools — force correction
+                    eprintln!("[Agent] Large prose response ({} chars) detected — forcing tool usage", raw_llm_text.len());
+                    let pinned = &turn_messages[..4.min(turn_messages.len())];
+                    let recent_start = if turn_messages.len() > 4 { turn_messages.len().saturating_sub(4) } else { 4 };
+                    let recent = &turn_messages[recent_start..];
+                    let mut correction_msgs: Vec<(String, String)> = pinned.to_vec();
+                    correction_msgs.extend_from_slice(recent);
+                    correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                    correction_msgs.push(("user".to_string(),
+                        "CRITICAL: You produced {} characters of prose instead of using tools. \
+                         You MUST use write_file/create_file to create files. Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}.".to_string()
+                    ));
+                    self.suppress_stream = true;
+                    let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    self.suppress_stream = false;
+                    tool_calls = extract_tool_calls(&fix);
+                    raw_llm_text.push_str("\n[Correction]: ");
+                    raw_llm_text.push_str(&fix);
+                    if tool_calls.is_empty() { response = raw_llm_text.clone(); }
+                } else if raw_llm_text.len() > 1000 && raw_llm_text.contains("\"thought\"") && !looks_complete {
+                    // LLM has reasoning (JSON thought key) but no tools — force correction
+                    eprintln!("[Agent] Reasoning without tools ({} chars) detected — forcing tool usage", raw_llm_text.len());
+                    let pinned = &turn_messages[..4.min(turn_messages.len())];
+                    let recent_start = if turn_messages.len() > 4 { turn_messages.len().saturating_sub(4) } else { 4 };
+                    let recent = &turn_messages[recent_start..];
+                    let mut correction_msgs: Vec<(String, String)> = pinned.to_vec();
+                    correction_msgs.extend_from_slice(recent);
+                    correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                    correction_msgs.push(("user".to_string(),
+                        "CRITICAL: You provided reasoning but no tool calls. You MUST use tools to act. \
+                         Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}.".to_string()
+                    ));
+                    self.suppress_stream = true;
+                    let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    self.suppress_stream = false;
+                    tool_calls = extract_tool_calls(&fix);
+                    raw_llm_text.push_str("\n[Correction]: ");
+                    raw_llm_text.push_str(&fix);
+                    if tool_calls.is_empty() { 
+                        response = raw_llm_text.clone();
+                        // Retry with stronger nudge
+                        eprintln!("[Agent] Correction failed — sending stronger nudge");
+                        let mut retry_msgs: Vec<(String, String)> = pinned.to_vec();
+                        retry_msgs.extend_from_slice(recent);
+                        retry_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                        retry_msgs.push(("user".to_string(),
+                            "FINAL WARNING: You MUST use tools. Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. NO OTHER FORMAT.".to_string()
+                        ));
+                        self.suppress_stream = true;
+                        let (retry_fix, _) = self.call_llm_streaming(&retry_msgs, model_name).await?;
+                        self.suppress_stream = false;
+                        tool_calls = extract_tool_calls(&retry_fix);
+                        raw_llm_text.push_str("\n[Retry Correction]: ");
+                        raw_llm_text.push_str(&retry_fix);
+                    }
                 } else if instructional && !looks_complete {
                     // Model explaining instead of acting — nudge without an LLM call
                     eprintln!("[Agent] Model is explaining instead of acting — nudging");
                     turn_messages.push(("assistant".to_string(), raw_llm_text.clone()));
                     turn_messages.push(("user".to_string(),
                         "STRICT ACTION REQUIRED: Use your tools IMMEDIATELY. \
-                         Output your reasoning in <thought> tags, followed by exactly ONE JSON tool call NOW.".to_string()
+                         Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}} NOW.".to_string()
                     ));
                     continue; // re-enter loop — no extra Ollama call
                 } else {
@@ -747,6 +964,7 @@ impl StreamingAgentOrchestrator {
                     eprintln!("[Agent] Treating as final response");
                     response = raw_llm_text.clone();
                 }
+                } // Close the else block for rejected_tools check
             }
 
             // ── LOOP DETECTION (mirrors Electron's repeatCount + ping-pong guard) ──
@@ -784,7 +1002,7 @@ impl StreamingAgentOrchestrator {
                 }
             }
 
-            if tool_calls.is_empty() && response.is_empty() {
+            if tool_calls.is_empty() && response.is_empty() && tool_results.is_empty() {
                 steps.push(AgentStep {
                     iteration,
                     tool: "reasoning".to_string(),
@@ -826,15 +1044,35 @@ impl StreamingAgentOrchestrator {
 
                 // Detect: LLM wrote code in prose instead of using write_file tool
                 let has_large_code_block = raw_llm_text.contains("```") && raw_llm_text.len() > 2000;
-                if has_large_code_block && tool_calls.iter().all(|tc| tc.tool != "write_file" && tc.tool != "edit_file" && tc.tool != "multi_edit_file") {
-                    tool_results.insert(0, "[SYSTEM] CODE IN PROSE DETECTED: You wrote code in your response instead of using the write_file tool. You MUST use write_file to create files. Do NOT include file contents in your reasoning — call write_file with the path and content directly.".to_string());
-                    eprintln!("[Agent] ⚠️ LLM wrote code in prose — injecting write_file redirect");
+                // Also detect: LLM output a large JSON tool call in prose (common pattern for code generation)
+                let has_large_json_tool = raw_llm_text.contains("\"tool\"") && raw_llm_text.len() > 2000;
+                
+                if (has_large_code_block || has_large_json_tool) && tool_calls.iter().all(|tc| tc.tool != "write_file" && tc.tool != "edit_file" && tc.tool != "multi_edit_file" && tc.tool != "create_file") {
+                    // Automatically parse and extract tool calls from prose instead of just nudging
+                    let prose_tool_calls = extract_tool_calls_from_prose(&raw_llm_text);
+                    
+                    if !prose_tool_calls.is_empty() {
+                        eprintln!("[Agent] ✅ CODE IN PROSE DETECTED - automatically extracting {} tool calls", prose_tool_calls.len());
+                        
+                        // Replace the prose tool calls with the extracted ones
+                        // Keep existing tool_calls that aren't prose-based
+                        for call in prose_tool_calls {
+                            if !tool_calls.iter().any(|tc| tc.tool == call.tool && tc.args == call.args) {
+                                tool_calls.push(call.clone());
+                                all_tool_calls.push(call);
+                            }
+                        }
+                        
+                        // Don't add error message - we handled it automatically
+                    } else {
+                        // No tool calls found in prose, add error message
+                        tool_results.insert(0, "[SYSTEM] CODE IN PROSE DETECTED: You wrote code or a tool call in your response instead of using the appropriate tool. You MUST use write_file/create_file to create files. Do NOT include file contents or tool calls in your reasoning — call the tool directly.".to_string());
+                        eprintln!("[Agent] ⚠️ LLM wrote code/tool in prose — no extractable tool calls found");
+                    }
                 }
 
-                // Enforce <thought> tag protocol — nudge if missing
-                if !raw_llm_text.contains("<thought>") {
-                    tool_results.insert(0, "[SYSTEM] PROTOCOL VIOLATION: You did not include a <thought> tag. You MUST provide your reasoning inside <thought></thought> before calling tools. Do this in your next turn.".to_string());
-                }
+                // Note: JSON format validation is handled by extract_tool_calls() which checks for "tool" field
+                // No need to enforce <thought> tags since we're using JSON-only format
 
                 // ── (b) Single USER message: results + guidance ─────────────────
                 if !tool_results.is_empty() {
@@ -870,7 +1108,7 @@ impl StreamingAgentOrchestrator {
                     }
                     
                     // ── PROTOCOL REMINDER (Essential for local model consistency) ──
-                    results_msg.push_str("\n\nPROMPT: Analyze the results above. Output your reasoning in <thought> tags, followed by exactly ONE JSON tool call.");
+                    results_msg.push_str("\n\nPROMPT: Analyze the results above. Output ONLY valid JSON: {\"thought\": \"your reasoning\", \"tool\": \"tool_name\", \"args\": {...}}");
 
                     turn_messages.push(("user".to_string(), results_msg));
                 }
@@ -1667,6 +1905,7 @@ impl StreamingAgentOrchestrator {
         let mut executed_results = Vec::new();
         let mut json_parser = crate::commands::streaming_agent_flow::IncrementalJsonParser::new();
         let mut tool_counter = 0u32;
+        let mut rejected_tools = Vec::new(); // Track rejected tool calls
 
         // ── Sliding window: same constants as call_llm_streaming ─────────────
         let mut messages_json = Vec::new();
@@ -1764,6 +2003,34 @@ impl StreamingAgentOrchestrator {
                                     for obj in objects {
                                         if let Some(tool_name) = obj.get("tool").and_then(|t| t.as_str()) {
                                             let args = obj.get("args").cloned().unwrap_or(serde_json::json!({}));
+                                            
+                                            // Validate required arguments for critical tools
+                                            let (is_valid, missing_arg) = match tool_name {
+                                                "read_file" | "write_file" | "edit_file" | "multi_edit_file" | "create_file" | "delete_file" | "move_file" | "rename_file" => {
+                                                    if args.get("path").and_then(|p| p.as_str()).is_some() {
+                                                        (true, None)
+                                                    } else {
+                                                        (false, Some("path"))
+                                                    }
+                                                },
+                                                "run_command" => {
+                                                    if args.get("command").and_then(|c| c.as_str()).is_some() {
+                                                        (true, None)
+                                                    } else {
+                                                        (false, Some("command"))
+                                                    }
+                                                },
+                                                _ => (true, None), // Other tools don't have strict validation
+                                            };
+                                            
+                                            if !is_valid {
+                                                eprintln!("[Phase 4] ⚠️ Tool '{}' missing required argument: {:?}, skipping", tool_name, missing_arg);
+                                                let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                                                let missing_info = missing_arg.map(|m| format!(" (missing: \"{}\")", m)).unwrap_or_default();
+                                                rejected_tools.push(format!("Tool '{}'{} with args: {}", tool_name, missing_info, args_str));
+                                                continue;
+                                            }
+                                            
                                             let tool_id = format!("tool_{}_{}", iteration, tool_counter);
                                             tool_counter += 1;
 
@@ -1861,6 +2128,14 @@ impl StreamingAgentOrchestrator {
                 // Flush any remaining events
                 self.flush_events().await;
                 
+                // Add rejected tools as a special entry so the caller can track them
+                if !rejected_tools.is_empty() {
+                    executed_results.push((
+                        ToolCall { tool: "__rejected_tools__".to_string(), args: serde_json::json!({ "tools": rejected_tools }) },
+                        Ok("".to_string()),
+                    ));
+                }
+                
                 // Append sentinel carrying the full raw response text so the caller can
                 // reuse it for stall-detection without making another Ollama call.
                 executed_results.push((
@@ -1925,11 +2200,22 @@ impl StreamingAgentOrchestrator {
         // next agent turn in `turn_messages` so the main agent LLM can self-correct natively.
 
         // Emit final completion or failure status
-        let status = if tool_result.is_ok() { "completed" } else { "failed" };
         let result_text = if tool_result.is_ok() {
             tool_result.as_ref().ok().cloned()
         } else {
             tool_result.as_ref().err().map(|e| e.to_string())
+        };
+
+        // Check if result contains error indicators (even if tool_result.is_ok())
+        // Treat errors in results as failures so the agent knows to retry
+        let has_errors = result_text.as_ref()
+            .map(|r| r.contains("error:") || r.contains("Error") || r.contains("failed") || r.contains("Failed") || r.contains("SyntaxError") || r.contains("TypeError") || r.contains("does not provide") || r.contains("does not export") || r.contains("ERR_UNKNOWN_FILE_EXTENSION") || r.contains("ERR_MODULE_NOT_FOUND"))
+            .unwrap_or(false);
+
+        let status = if tool_result.is_ok() && !has_errors { 
+            "completed" 
+        } else { 
+            "failed" 
         };
 
         let completed_step = AgentStep {
@@ -1945,7 +2231,12 @@ impl StreamingAgentOrchestrator {
         };
         self.emit_step(completed_step).await;
 
-        tool_result
+        // If result contains errors, convert to Err so agent treats it as a failure
+        if has_errors && tool_result.is_ok() {
+            Err(result_text.unwrap_or_else(|| "Tool execution resulted in errors".to_string()).into())
+        } else {
+            tool_result
+        }
     }
 
     /// Ask LLM for recovery strategy when a tool fails
@@ -2309,6 +2600,31 @@ impl StreamingAgentOrchestrator {
                                 for obj in objects {
                                     if let Some(tool_name) = obj.get("tool").and_then(|t| t.as_str()) {
                                         let args = obj.get("args").cloned().unwrap_or(serde_json::json!({}));
+                                        
+                                        // Validate required arguments for critical tools
+                                        let (is_valid, missing_arg) = match tool_name {
+                                            "read_file" | "write_file" | "edit_file" | "multi_edit_file" | "create_file" | "delete_file" | "move_file" | "rename_file" => {
+                                                if args.get("path").and_then(|p| p.as_str()).is_some() {
+                                                    (true, None)
+                                                } else {
+                                                    (false, Some("path"))
+                                                }
+                                            },
+                                            "run_command" => {
+                                                if args.get("command").and_then(|c| c.as_str()).is_some() {
+                                                    (true, None)
+                                                } else {
+                                                    (false, Some("command"))
+                                                }
+                                            },
+                                            _ => (true, None), // Other tools don't have strict validation
+                                        };
+                                        
+                                        if !is_valid {
+                                            eprintln!("[Sub-Agent] ⚠️ Tool '{}' missing required argument: {:?}, skipping", tool_name, missing_arg);
+                                            continue;
+                                        }
+                                        
                                         let tool_id = format!("tool_{}_{}", iteration, tool_counter);
                                         tool_counter += 1;
 
@@ -2358,6 +2674,53 @@ impl StreamingAgentOrchestrator {
                 Err(err_msg.into())
             }
         }
+    }
+
+    // ── INTELLIGENT PROBLEM IDENTIFICATION ──────────────────────────────────
+    /// Analyze the task and generate targeted investigation guidance
+    fn analyze_problem_intelligently(task: &str) -> String {
+        let analysis = ProblemIdentifier::analyze_problem(task);
+        
+        let mut guidance = String::new();
+        guidance.push_str("\n\n<intelligent_investigation>\n");
+        guidance.push_str("## Problem Analysis\n\n");
+        
+        // Keywords
+        if !analysis.keywords.is_empty() {
+            guidance.push_str("**Keywords identified:** ");
+            guidance.push_str(&analysis.keywords.join(", "));
+            guidance.push_str("\n\n");
+        }
+        
+        // Suspected files
+        if !analysis.suspected_files.is_empty() {
+            guidance.push_str("**Suspected files (prioritized by relevance):**\n");
+            for file in &analysis.suspected_files {
+                guidance.push_str(&format!(
+                    "- `{}` (score: {}) - {}\n",
+                    file.path, file.relevance_score, file.reason
+                ));
+            }
+            guidance.push_str("\n");
+        }
+        
+        // Search queries
+        if !analysis.search_queries.is_empty() {
+            guidance.push_str("**Targeted search queries (by priority):**\n");
+            for query in analysis.search_queries.iter().take(5) {
+                guidance.push_str(&format!(
+                    "- Pattern: `{}` in `{}` - {}\n",
+                    query.pattern, query.file_pattern, query.reason
+                ));
+            }
+            guidance.push_str("\n");
+        }
+        
+        // Investigation strategy
+        guidance.push_str(&analysis.investigation_strategy);
+        guidance.push_str("\n</intelligent_investigation>\n");
+        
+        guidance
     }
 
     // ── FIX #2: System prompt now includes active file CONTENT ──────────────
@@ -2918,8 +3281,38 @@ async fn execute_tool_standalone(
                 .and_then(|c| c.as_str())
                 .ok_or("Missing command argument")?;
             
-            // ── SAFETY BLACKLIST (Prevents agent panic-deletions) ────────────────
+            // ── LONG-RUNNING COMMAND DETECTION ──────────────────────────────────
+            // Prevent agent from running dev servers, watchers, and other long-running processes
             let cmd_lower = command.to_lowercase();
+            let long_running_patterns = [
+                "npm run dev", "npm start", "yarn start", "yarn dev",
+                "webpack --watch", "jest --watch", "vitest --watch",
+                "python -m http.server", "python -m SimpleHTTPServer",
+                "node server", "node app", "node index",
+                "npm run watch", "npm run serve",
+                "ng serve", "ng start",
+                "cargo run", "cargo watch",
+                "go run", "go build",
+                "ruby -r webrick", "python manage.py runserver",
+                "rails server", "rails s",
+                "php -S", "php artisan serve",
+                "dotnet run", "dotnet watch",
+            ];
+            
+            let is_long_running = long_running_patterns.iter().any(|p| cmd_lower.contains(p));
+            
+            if is_long_running {
+                eprintln!("[run_command] ⚠️ LONG-RUNNING COMMAND BLOCKED: {}", command);
+                return Err(format!(
+                    "LONG_RUNNING_COMMAND_BLOCKED: '{}' is a development server or watch process that runs indefinitely. \
+                    This would cause the agent to hang. \
+                    If you need to verify the build works, use 'npm run build' instead. \
+                    If you need to run the dev server, do it manually in your terminal.",
+                    command
+                ).into());
+            }
+            
+            // ── SAFETY BLACKLIST (Prevents agent panic-deletions) ────────────────
             let blacklisted_terms = ["rm ", "del ", "remove-item", "rd ", "rmdir", "nuke", "truncate"];
             let is_destructive = blacklisted_terms.iter().any(|t| cmd_lower.contains(t));
             let is_whitelisted = cmd_lower.contains("node_modules") || cmd_lower.contains(".whizcode") || cmd_lower.contains("tmp");
@@ -3193,6 +3586,36 @@ async fn execute_tool_standalone(
                 .or_else(|| tool_call.args.get("message"))
                 .and_then(|q| q.as_str())
                 .unwrap_or("What info do you need?");
+            
+            // Validate that this is actually a question, not a statement
+            let is_question = question.trim().ends_with('?') 
+                || question.to_lowercase().starts_with("what ")
+                || question.to_lowercase().starts_with("which ")
+                || question.to_lowercase().starts_with("where ")
+                || question.to_lowercase().starts_with("when ")
+                || question.to_lowercase().starts_with("why ")
+                || question.to_lowercase().starts_with("how ")
+                || question.to_lowercase().starts_with("do you ")
+                || question.to_lowercase().starts_with("can you ")
+                || question.to_lowercase().starts_with("should ");
+            
+            if !is_question {
+                eprintln!("[ask_user] ⚠️ MISUSE DETECTED: Not actually asking a question");
+                eprintln!("[ask_user] Message: {}", question);
+                
+                // Check if this looks like a completion statement
+                if question.to_lowercase().contains("fixed") 
+                    || question.to_lowercase().contains("complete")
+                    || question.to_lowercase().contains("done")
+                    || question.to_lowercase().contains("created")
+                    || question.to_lowercase().contains("successfully") {
+                    eprintln!("[ask_user] This looks like a completion statement, not a question");
+                    return Ok("[SYSTEM] ERROR: You used 'ask_user' but you're not asking a question. You're making a statement. Use 'done' tool instead to indicate task completion: {\"thought\": \"Task is complete\", \"tool\": \"done\", \"args\": {}}".to_string());
+                }
+                
+                return Ok("[SYSTEM] ERROR: 'ask_user' must be used to ASK a question, not to make statements. Your message should end with '?' and actually request information from the user.".to_string());
+            }
+            
             eprintln!("[ask_user] Question for user: {}", question);
             
             // Emit special event for the frontend to show a prompt
@@ -3429,6 +3852,82 @@ fn extract_tool_calls(response: &str) -> Vec<ToolCall> {
         if !seen.contains(&s) { seen.insert(s); unique.push(call); }
     }
     eprintln!("[EXTRACT] Total unique tool calls: {}", unique.len());
+    unique
+}
+
+fn extract_tool_calls_from_prose(response: &str) -> Vec<ToolCall> {
+    let mut tool_calls = Vec::new();
+    
+    // Look for JSON-like structures in the prose
+    // This handles cases where LLM outputs tool calls in prose format
+    
+    // Pattern 1: Look for ```json ... ``` blocks
+    let json_block_regex = Regex::new(r#"```(?:json)?\s*(\{[\s\S]*?\})\s*```"#).unwrap();
+    for cap in json_block_regex.captures_iter(response) {
+        if let Some(json_str) = cap.get(1) {
+            if let Ok(call) = serde_json::from_str::<ToolCall>(json_str.as_str()) {
+                eprintln!("[EXTRACT_PROSE] Found tool call in JSON block: {}", call.tool);
+                tool_calls.push(call);
+            }
+        }
+    }
+    
+    // Pattern 2: Look for standalone JSON objects with "tool" field
+    let json_obj_regex = Regex::new(r#"\{\s*\"tool\"\s*:\s*\"([^\"]+)\"[\s\S]*?\}"#).unwrap();
+    for cap in json_obj_regex.captures_iter(response) {
+        let json_str = cap.get(0).unwrap().as_str();
+        if let Ok(call) = serde_json::from_str::<ToolCall>(json_str) {
+            eprintln!("[EXTRACT_PROSE] Found tool call in prose JSON: {}", call.tool);
+            tool_calls.push(call);
+        }
+    }
+    
+    // Pattern 3: Look for code blocks with file content that should be write_file
+    let code_block_regex = Regex::new(r#"```(?:\w+)?\s*([\s\S]*?)\s*```"#).unwrap();
+    for cap in code_block_regex.captures_iter(response) {
+        let code_content = cap.get(1).unwrap().as_str();
+        // Check if this looks like code that should be written to a file
+        if code_content.len() > 100 && (code_content.contains("fn ") || code_content.contains("func ") || code_content.contains("def ") || code_content.contains("class ") || code_content.contains("import ") || code_content.contains("use ")) {
+            // Try to extract filename from context
+            let filename_patterns = [
+                r#"filename:\s*([^\s\n]+)"#,
+                r#"file:\s*([^\s\n]+)"#,
+                r#"to\s+(?:file\s+)?([^\s\n]+)"#,
+                r#"in\s+(?:file\s+)?([^\s\n]+)"#,
+            ];
+            
+            let mut extracted_filename = None;
+            for pattern in &filename_patterns {
+                if let Ok(re) = Regex::new(pattern) {
+                    if let Some(cap) = re.captures(response) {
+                        extracted_filename = Some(cap.get(1).unwrap().as_str().trim_matches('`').trim());
+                        break;
+                    }
+                }
+            }
+            
+            if let Some(filename) = extracted_filename {
+                let write_call = ToolCall {
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": filename,
+                        "content": code_content
+                    }),
+                };
+                eprintln!("[EXTRACT_PROSE] Generated write_file from code block for: {}", filename);
+                tool_calls.push(write_call);
+            }
+        }
+    }
+    
+    // Deduplicate
+    let mut unique = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for call in tool_calls {
+        let s = serde_json::to_string(&call).unwrap_or_default();
+        if !seen.contains(&s) { seen.insert(s); unique.push(call); }
+    }
+    eprintln!("[EXTRACT_PROSE] Total unique extracted tool calls: {}", unique.len());
     unique
 }
 

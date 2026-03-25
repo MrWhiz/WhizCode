@@ -23,6 +23,7 @@ export function useAppEventListeners(
       try {
         unlistenStep = await agent.events.onAgentStep((step: AgentStep) => {
           setAgentSteps(prev => {
+            // Always update by requestId first (most reliable)
             if ((step as any).requestId) {
               const existingIdx = prev.findIndex(s => (s as any).requestId === (step as any).requestId)
               if (existingIdx >= 0) {
@@ -33,10 +34,11 @@ export function useAppEventListeners(
               return [...prev, step]
             }
 
+            // For steps without requestId, update by tool+iteration, regardless of summary change
+            // This ensures failed tools update the existing step instead of creating a duplicate
             const existingIdx = prev.findIndex(s =>
               s.tool === step.tool &&
-              s.iteration === step.iteration &&
-              s.summary === step.summary
+              s.iteration === step.iteration
             )
 
             if (existingIdx >= 0) {
@@ -52,16 +54,6 @@ export function useAppEventListeners(
           streamingContentRef.current += token
           const currentContent = streamingContentRef.current
           setLiveStreamingContent(currentContent)
-          
-          setMessages(prev => {
-            const streamMsgIdx = prev.findIndex(m => (m as any).__id === STREAMING_MSG_ID)
-            if (streamMsgIdx >= 0) {
-              const next = [...prev]
-              next[streamMsgIdx] = { ...next[streamMsgIdx], content: currentContent }
-              return next
-            }
-            return [...prev, { role: 'assistant', content: currentContent, __id: STREAMING_MSG_ID } as any]
-          })
         })
 
         unlistenError = await (window as any).__TAURI_INVOKE__?.('listen', {
@@ -100,8 +92,24 @@ export function useAppEventListeners(
 
     const setupWorkspaceListener = async () => {
       try {
-        unlistenWorkspaceRestored = await workspace.events.onWorkspaceRestored((workspacePath: string) => {
-          setWorkspacePath(workspacePath)
+        unlistenWorkspaceRestored = await workspace.events.onWorkspaceRestored((incomingWorkspacePath: string) => {
+          // Check if ANY ignore flag is set (they have timestamps in the name)
+          let shouldIgnore = false
+          for (let i = 0; i < sessionStorage.length; i++) {
+            const key = sessionStorage.key(i)
+            if (key && key.startsWith('_ignoreWorkspaceRestored_')) {
+              shouldIgnore = true
+              break
+            }
+          }
+          
+          if (shouldIgnore) {
+            // Skip this event - we're setting a new workspace
+            return
+          }
+          
+          // Update workspace
+          setWorkspacePath(incomingWorkspacePath)
         })
       } catch (error) {
         console.error('Failed to setup workspace restored listener:', error)

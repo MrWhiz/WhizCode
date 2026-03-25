@@ -127,8 +127,7 @@ function App() {
             if (!result.canceled && result.filePaths.length > 0) {
               const selectedPath = result.filePaths[0]
               
-              // 1. Reset everything first for a clean state
-              setWorkspacePath(null) // Temporarily clear to force sub-components to unmount/reset
+              // Reset UI state FIRST
               setOpenFiles([])
               setActiveFileId(null)
               setMessages([{
@@ -139,13 +138,15 @@ function App() {
               setLiveStreamingContent('')
               setFileErrors({})
               
-              // 2. Set new workspace
-              setTimeout(() => {
-                  setWorkspacePath(selectedPath)
-                  workspace.setWorkspace(selectedPath).catch(err => console.error('Error setting workspace:', err))
-                  setRefreshKey(prev => prev + 1)
-                  setActiveView('explorer')
-              }, 50)
+              // Set workspace path - this is the ONLY state change for workspace
+              setWorkspacePath(selectedPath)
+              
+              // Sync with backend - this MUST happen
+              workspace.setWorkspace(selectedPath)
+                .catch(err => console.error('Error setting workspace:', err))
+              
+              setRefreshKey(prev => prev + 1)
+              setActiveView('explorer')
             }
           })
           .catch(err => console.error('Error opening folder:', err))
@@ -335,14 +336,12 @@ function App() {
       
       setAgentSteps([])
       setMessages(prev => {
-        const withoutStream = prev.filter(m => (m as any).__id !== STREAMING_MSG_ID)
-        return [...withoutStream, { role: 'assistant', content: response, steps: [...toolSteps, ...steps].length > 0 ? [...toolSteps, ...steps] : undefined }]
+        return [...prev, { role: 'assistant', content: response, steps: [...toolSteps, ...steps].length > 0 ? [...toolSteps, ...steps] : undefined }]
       })
     } catch (err) {
       console.error('Agent error:', err)
       setMessages(prev => {
-        const withoutStream = prev.filter(m => (m as any).__id !== STREAMING_MSG_ID)
-        return [...withoutStream, { role: 'assistant', content: `Error communicating with agent: ${err instanceof Error ? err.message : String(err)}` }]
+        return [...prev, { role: 'assistant', content: `Error communicating with agent: ${err instanceof Error ? err.message : String(err)}` }]
       })
     } finally {
       setIsLoading(false)

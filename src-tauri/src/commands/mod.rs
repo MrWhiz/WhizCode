@@ -48,6 +48,7 @@ pub mod failure_learning;
 pub mod streaming_tool_executor;
 pub mod sequential_executor;
 pub mod streaming_agent_flow;
+pub mod problem_identifier;
 pub mod task_commands;
 pub mod task_manager;
 pub mod whizcode_commands;

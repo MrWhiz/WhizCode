@@ -3,7 +3,7 @@
  * Handles WhizCode events and metrics from the backend
  */
 
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 export interface PhaseChangeEvent {
   phase: string;

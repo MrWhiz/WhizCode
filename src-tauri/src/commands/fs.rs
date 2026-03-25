@@ -20,6 +20,9 @@ pub struct FileEntry {
 #[derive(Serialize, Clone)]
 struct FileChangedPayload {
     path: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_path: Option<String>,
 }
 
 #[tauri::command]
@@ -98,7 +101,11 @@ pub async fn write_file(
 
     // Add small delay to prevent queue overflow
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-    handle.emit("file:changed", FileChangedPayload { path: path.clone() }).map_err(|e| e.to_string())?;
+    handle.emit("file:changed", FileChangedPayload {
+        path: path.clone(),
+        kind: "modify".to_string(),
+        old_path: None,
+    }).map_err(|e| e.to_string())?;
     
     Ok(())
 }
@@ -205,7 +212,11 @@ pub async fn create_file(
         .map_err(ApiError::from)?;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    handle.emit("file:changed", FileChangedPayload {
+        path,
+        kind: "create".to_string(),
+        old_path: None,
+    }).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -232,7 +243,11 @@ pub async fn create_directory(
         .map_err(ApiError::from)?;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    handle.emit("file:changed", FileChangedPayload {
+        path,
+        kind: "create".to_string(),
+        old_path: None,
+    }).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -281,7 +296,11 @@ pub async fn delete_file(
     }
     
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    handle.emit("file:changed", FileChangedPayload {
+        path,
+        kind: "delete".to_string(),
+        old_path: None,
+    }).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -330,7 +349,11 @@ pub async fn delete_directory(
     }
     
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-    handle.emit("file:changed", FileChangedPayload { path }).map_err(|e| e.to_string())?;
+    handle.emit("file:changed", FileChangedPayload {
+        path,
+        kind: "delete".to_string(),
+        old_path: None,
+    }).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -383,9 +406,11 @@ pub async fn rename_file(
     }
     
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-    handle.emit("file:changed", FileChangedPayload { path: old_path }).map_err(|e| e.to_string())?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-    handle.emit("file:changed", FileChangedPayload { path: new_path }).map_err(|e| e.to_string())?;
+    handle.emit("file:changed", FileChangedPayload {
+        path: new_path,
+        kind: "rename".to_string(),
+        old_path: Some(old_path),
+    }).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -435,9 +460,16 @@ pub async fn watch_directory(
                 Ok(Ok(event)) => {
                     use notify::EventKind;
                     if matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)) {
+                        let kind = match event.kind {
+                            notify::EventKind::Create(_) => "create",
+                            notify::EventKind::Remove(_) => "delete",
+                            notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => "rename",
+                            _ => "modify",
+                        }.to_string();
+
                         for p in event.paths {
                             if !utils::should_skip_file(&p) {
-                                pending_paths.insert(p.to_string_lossy().to_string());
+                                pending_paths.insert((p.to_string_lossy().to_string(), kind.clone()));
                             }
                         }
                     }
@@ -447,8 +479,8 @@ pub async fn watch_directory(
 
             // Emit batched events if window passed or set is large
             if !pending_paths.is_empty() && (last_emit.elapsed() >= debounce_window || pending_paths.len() > 20) {  // Reduced from 50 to 20
-                for path in pending_paths.drain() {
-                    let _ = handle.emit("file:changed", FileChangedPayload { path });
+                for (path, kind) in pending_paths.drain() {
+                    let _ = handle.emit("file:changed", FileChangedPayload { path, kind, old_path: None });
                 }
                 last_emit = std::time::Instant::now();
             }

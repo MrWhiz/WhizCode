@@ -17,6 +17,8 @@ pub struct SubAgentInfo {
 pub struct SubAgentExecution {
     pub agent_name: String,
     pub task: String,
+    pub owner: Option<String>,
+    pub owned_paths: Vec<String>,
     pub status: String,
     pub result: String,
     pub iterations: u32,
@@ -29,7 +31,24 @@ pub struct SubAgentResult {
     pub response: String,
     pub iterations: u32,
     pub tools_used: Vec<String>,
+    pub owner: Option<String>,
+    pub owned_paths: Vec<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubAgentWorkItem {
+    pub agent_name: String,
+    pub task: String,
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub owned_paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubAgentOrchestrationResult {
+    pub summary: String,
+    pub results: Vec<SubAgentResult>,
 }
 
 pub struct SubAgentExecutor {
@@ -49,6 +68,8 @@ impl SubAgentExecutor {
         &self,
         agent_name: String,
         task: String,
+        owner: Option<String>,
+        owned_paths: Vec<String>,
         _workspace_path: Option<String>,
     ) -> Result<SubAgentResult> {
         eprintln!("[SUB_AGENT] Executing sub-agent: {}", agent_name);
@@ -58,12 +79,13 @@ impl SubAgentExecutor {
             .into_iter()
             .find(|a| a.name == agent_name)
             .ok_or_else(|| format!("Sub-agent '{}' not found", agent_name))?;
+        let ownership_prompt = build_ownership_prompt(owner.as_deref(), &owned_paths);
 
         // ── PHASE 3A: INITIALIZE SUB-AGENT ────────────────────────────
         eprintln!("[SUB_AGENT] Initializing sub-agent with system prompt");
         let mut messages = vec![
             ("system".to_string(), config.system_prompt.clone()),
-            ("user".to_string(), task.clone()),
+            ("user".to_string(), format!("{}\n\n{}", ownership_prompt, task.clone())),
         ];
 
         let mut iterations = 0u32;
@@ -107,6 +129,8 @@ impl SubAgentExecutor {
         let execution = SubAgentExecution {
             agent_name: agent_name.clone(),
             task,
+            owner: owner.clone(),
+            owned_paths: owned_paths.clone(),
             status: "completed".to_string(),
             result: final_response.clone(),
             iterations,
@@ -124,6 +148,8 @@ impl SubAgentExecutor {
             response: final_response,
             iterations,
             tools_used,
+            owner,
+            owned_paths,
             error: None,
         })
     }
@@ -188,6 +214,21 @@ fn get_sub_agents() -> Vec<SubAgentConfig> {
     prompts::get_sub_agents()
 }
 
+fn build_ownership_prompt(owner: Option<&str>, owned_paths: &[String]) -> String {
+    let owner_label = owner.unwrap_or("unassigned");
+    let owned_scope = if owned_paths.is_empty() {
+        "No explicit file ownership was assigned. Keep edits minimal and avoid unrelated files.".to_string()
+    } else {
+        format!("Your owned files or scopes: {}", owned_paths.join(", "))
+    };
+
+    format!(
+        "Execution owner: {}.\n{}\nYou are collaborating with other agents and the user. Do not revert unrelated work and stay within your owned scope unless clearly necessary.",
+        owner_label,
+        owned_scope
+    )
+}
+
 #[tauri::command]
 pub async fn list_sub_agents() -> Result<Vec<SubAgentInfo>> {
     let agents = get_sub_agents();
@@ -215,8 +256,62 @@ pub async fn invoke_sub_agent(
 
     let executor = SubAgentExecutor::new();
     executor
-        .execute_sub_agent(agent_name, task_description, None)
+        .execute_sub_agent(agent_name, task_description, None, Vec::new(), None)
         .await
+}
+
+#[tauri::command]
+pub async fn orchestrate_sub_agents(
+    work_items: Vec<SubAgentWorkItem>,
+) -> Result<SubAgentOrchestrationResult> {
+    let executor = Arc::new(SubAgentExecutor::new());
+    let mut handles = Vec::new();
+
+    for item in work_items {
+        let executor = Arc::clone(&executor);
+        handles.push(tokio::spawn(async move {
+            executor
+                .execute_sub_agent(
+                    item.agent_name,
+                    item.task,
+                    item.owner,
+                    item.owned_paths,
+                    None,
+                )
+                .await
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(error)) => results.push(SubAgentResult {
+                success: false,
+                response: String::new(),
+                iterations: 0,
+                tools_used: Vec::new(),
+                owner: None,
+                owned_paths: Vec::new(),
+                error: Some(error.to_string()),
+            }),
+            Err(error) => results.push(SubAgentResult {
+                success: false,
+                response: String::new(),
+                iterations: 0,
+                tools_used: Vec::new(),
+                owner: None,
+                owned_paths: Vec::new(),
+                error: Some(format!("Sub-agent join failed: {}", error)),
+            }),
+        }
+    }
+
+    let completed = results.iter().filter(|result| result.success).count();
+    Ok(SubAgentOrchestrationResult {
+        summary: format!("Completed {} of {} delegated sub-agent task(s)", completed, results.len()),
+        results,
+    })
 }
 
 fn extract_tool_calls(response: &str) -> Vec<String> {

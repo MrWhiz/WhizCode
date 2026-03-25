@@ -222,11 +222,12 @@ pub const CONTEXT_GATHERER_PROMPT: &str = r#"You are a specialized Context Gathe
 
 <approach>
 1. Start by understanding the problem/issue
-2. Use list_directory to explore the project structure
+2. Start from cached workspace context, semantic_search, find_symbols, and suspected files before opening files
 3. Use search_files and grepSearch to find relevant code
-4. Use read_file or readCode to examine key files
-5. Identify dependencies and related components
-6. Provide a summary of relevant files and their purposes
+4. Only use read_file after you have narrowed to likely files
+5. When an error line or file is mentioned, read only a narrow line window first
+6. Identify dependencies and related components
+7. Provide a summary of relevant files and their purposes
 </approach>
 
 <output>
@@ -241,6 +242,8 @@ Provide a clear summary including:
 - Focus on exploration and analysis, not implementation
 - Be thorough but efficient - don't read every file
 - Prioritize files most likely to be relevant
+- Never begin by reading broad sets of files when semantic_search, find_symbols, or explicit file references can narrow the scope first
+- Prefer read_file with start_line/end_line for targeted debugging
 - Explain your reasoning for file selections
 </rules>"#;
 
@@ -267,6 +270,8 @@ pub const GENERAL_TASK_EXECUTION_PROMPT: &str = r#"You are a general-purpose tas
 <rules>
 - Complete the delegated task fully
 - Use tools efficiently
+- Do not begin by reading the whole repository or many full files
+- Prefer semantic_search, find_symbols, and narrow read_file line ranges before broad file reads
 - Verify your changes work correctly
 - Provide clear status updates
 - If you encounter issues, explain them clearly

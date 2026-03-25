@@ -192,6 +192,11 @@ impl VectorSearchSystem {
         let mut results = Vec::new();
         for chunk_res in chunk_iter {
             if let Ok(chunk) = chunk_res {
+                if let Some(file_path) = &query.file_path {
+                    if !chunk.file_path.contains(file_path) {
+                        continue;
+                    }
+                }
                 let similarity = self.cosine_similarity(&query_embedding, &chunk.embedding);
                 if similarity > 0.3 { // Threshold
                     results.push(SearchResult {
@@ -209,6 +214,53 @@ impl VectorSearchSystem {
         }
 
         Ok(results)
+    }
+
+    fn index_single_file(&self, path: &Path) -> crate::error::Result<()> {
+        if crate::utils::should_skip_file(path) || !path.is_file() {
+            return Ok(());
+        }
+
+        let file_path = path.to_string_lossy().to_string();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if !matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "md" | "json" | "toml") {
+            return Ok(());
+        }
+
+        let conn = self.db.lock().unwrap();
+        conn.execute("DELETE FROM code_chunks WHERE file_path = ?", params![file_path.clone()])
+            .map_err(|e| format!("Failed to clear file chunks: {}", e))?;
+
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read file for indexing: {}", e))?;
+        let chunks = self.chunk_file(&content, &file_path);
+        let mtime = fs::metadata(path)
+            .and_then(|m| m.modified().map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))
+            .unwrap_or(0) as i64;
+
+        for chunk in chunks {
+            let embedding_json = serde_json::to_string(&chunk.embedding).unwrap_or_default();
+            let deps_json = serde_json::to_string(&chunk.dependencies).unwrap_or_default();
+            conn.execute(
+                "INSERT INTO code_chunks (id, file_path, chunk_type, symbol_name, content, start_line, end_line, embedding, complexity, dependencies, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    chunk.id,
+                    chunk.file_path,
+                    chunk.chunk_type,
+                    chunk.symbol_name,
+                    chunk.content,
+                    chunk.start_line,
+                    chunk.end_line,
+                    embedding_json,
+                    chunk.complexity as i32,
+                    deps_json,
+                    mtime,
+                ],
+            ).map_err(|e| format!("Failed to insert file chunk: {}", e))?;
+        }
+
+        Ok(())
     }
 
     fn generate_embedding(&self, text: &str) -> Vec<f32> {
@@ -518,25 +570,43 @@ pub async fn vector_get_index_stats(
 
 #[tauri::command]
 pub async fn vector_find_similar(
-    _query: String,
-    _state: State<'_, Arc<Mutex<VectorSearchSystem>>>,
+    query: String,
+    state: State<'_, Arc<Mutex<VectorSearchSystem>>>,
 ) -> Result<Vec<SearchResult>> {
-    Ok(vec![])
+    let system = state.lock().unwrap();
+    system.semantic_search(&SemanticQuery {
+        query,
+        file_path: None,
+        limit: Some(5),
+    })
 }
 
 #[tauri::command]
 pub async fn vector_get_recommendations(
-    _state: State<'_, Arc<Mutex<VectorSearchSystem>>>,
+    state: State<'_, Arc<Mutex<VectorSearchSystem>>>,
 ) -> Result<Vec<String>> {
-    Ok(vec![])
+    let system = state.lock().unwrap();
+    let stats = system.get_index_stats().map_err(|e| format!("DB failed: {}", e))?;
+    let mut recommendations = Vec::new();
+    if stats.total_chunks == 0 {
+        recommendations.push("Vector index is empty; run a full workspace index before semantic search.".to_string());
+    }
+    if stats.total_files < 25 {
+        recommendations.push("Workspace grounding is shallow; consider a full embedding index for better semantic recall.".to_string());
+    }
+    if recommendations.is_empty() {
+        recommendations.push("Vector search index is healthy.".to_string());
+    }
+    Ok(recommendations)
 }
 
 #[tauri::command]
 pub async fn vector_update_file(
-    _path: String,
-    _state: State<'_, Arc<Mutex<VectorSearchSystem>>>,
+    path: String,
+    state: State<'_, Arc<Mutex<VectorSearchSystem>>>,
 ) -> Result<()> {
-    Ok(())
+    let system = state.lock().unwrap();
+    system.index_single_file(Path::new(&path))
 }
 
 #[tauri::command]

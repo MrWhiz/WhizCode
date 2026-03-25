@@ -2,6 +2,44 @@ import { useEffect, useRef } from 'react'
 import type { AgentStep } from '../types'
 import { agent, events, fs, workspace } from '../lib/tauri-api'
 
+function isMeaningfulString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isRichLogReplacement(previousLogs?: string[], nextLogs?: string[]): boolean {
+  if (!previousLogs || previousLogs.length === 0 || !nextLogs || nextLogs.length === 0) {
+    return false
+  }
+
+  if (nextLogs.length !== 1) {
+    return false
+  }
+
+  const [onlyLog] = nextLogs
+  return previousLogs.length > 1 && /^Status:\s+/m.test(onlyLog) && /\nLogs:\n/m.test(onlyLog)
+}
+
+function mergeAgentStep(previous: AgentStep, incoming: AgentStep): AgentStep {
+  const merged: AgentStep = {
+    ...previous,
+    ...incoming,
+  }
+
+  merged.summary = isMeaningfulString(incoming.summary) ? incoming.summary : previous.summary
+  merged.result = isMeaningfulString(incoming.result) ? incoming.result : previous.result
+  merged.requestId = isMeaningfulString(incoming.requestId) ? incoming.requestId : previous.requestId
+  merged.persona = isMeaningfulString(incoming.persona) ? incoming.persona : previous.persona
+  merged.data = incoming.data ?? previous.data
+
+  if (incoming.logs && incoming.logs.length > 0) {
+    merged.logs = isRichLogReplacement(previous.logs, incoming.logs) ? previous.logs : incoming.logs
+  } else {
+    merged.logs = previous.logs
+  }
+
+  return merged
+}
+
 export function useAppEventListeners(
   setAgentSteps: (steps: AgentStep[] | ((prev: AgentStep[]) => AgentStep[])) => void,
   setMessages: (msg: any[] | ((prev: any[]) => any[])) => void,
@@ -28,7 +66,7 @@ export function useAppEventListeners(
               const existingIdx = prev.findIndex(s => (s as any).requestId === (step as any).requestId)
               if (existingIdx >= 0) {
                 const newSteps = [...prev]
-                newSteps[existingIdx] = step
+                newSteps[existingIdx] = mergeAgentStep(newSteps[existingIdx], step)
                 return newSteps
               }
               return [...prev, step]
@@ -43,7 +81,7 @@ export function useAppEventListeners(
 
             if (existingIdx >= 0) {
               const newSteps = [...prev]
-              newSteps[existingIdx] = step
+              newSteps[existingIdx] = mergeAgentStep(newSteps[existingIdx], step)
               return newSteps
             }
             return [...prev, step]
@@ -131,29 +169,56 @@ export function useAppEventListeners(
 
     const setupFileChangeListener = async () => {
       try {
-        unlistenFileChanged = await events.onFileChanged(({ path, content }) => {
-          // Debounce refreshKey increment to prevent flickering
+        unlistenFileChanged = await events.onFileChanged(({ path, kind, old_path, content }) => {
+          const refreshDelay = kind === 'modify' ? 300 : 50
+
           if (refreshTimeoutRef.current) {
             clearTimeout(refreshTimeoutRef.current)
           }
           refreshTimeoutRef.current = setTimeout(() => {
             setRefreshKey(prev => prev + 1)
-          }, 1000)
+          }, refreshDelay)
+
+          if (kind === 'rename' && old_path) {
+            setOpenFiles(prev => prev.map(file => {
+              if (file.path === old_path) {
+                const newName = path.split(/[/\\]/).pop() || file.name
+                return { ...file, path, name: newName }
+              }
+              if (file.path.startsWith(old_path + '/')
+                || file.path.startsWith(old_path + '\\')) {
+                return { ...file, path: path + file.path.slice(old_path.length) }
+              }
+              return file
+            }))
+            return
+          }
+
+          if (kind === 'delete') {
+            setOpenFiles(prev => prev.filter(file =>
+              file.path !== path
+              && !file.path.startsWith(path + '/')
+              && !file.path.startsWith(path + '\\')
+            ))
+            return
+          }
 
           setOpenFiles(prev => {
             const fileExists = prev.some(f => f.path === path)
-            if (fileExists) {
-              if (content !== undefined) {
-                return prev.map(f => f.path === path ? { ...f, content } : f)
-              } else {
-                fs.readFile(path).then(newContent => {
-                  setOpenFiles(current => 
-                    current.map(f => f.path === path ? { ...f, content: newContent } : f)
-                  )
-                }).catch(err => console.error('Failed to reload changed file:', path, err))
-                return prev
-              }
+            if (!fileExists) {
+              return prev
             }
+
+            if (content !== undefined) {
+              return prev.map(f => f.path === path ? { ...f, content } : f)
+            }
+
+            fs.readFile(path).then(newContent => {
+              setOpenFiles(current =>
+                current.map(f => f.path === path ? { ...f, content: newContent } : f)
+              )
+            }).catch(err => console.error('Failed to reload changed file:', path, err))
+
             return prev
           })
         })

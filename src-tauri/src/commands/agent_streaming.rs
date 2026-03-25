@@ -82,6 +82,39 @@ fn sanitize_command_for_powershell(cmd: &str) -> String {
     result
 }
 
+fn extract_completion_logs(tool_name: &str, result_text: Option<&String>) -> Option<Vec<String>> {
+    match result_text {
+        Some(result) if tool_name == "run_command" => {
+            if let Some((_, logs)) = result.split_once("\nLogs:\n") {
+                Some(vec![logs.to_string()])
+            } else {
+                Some(vec![result.clone()])
+            }
+        }
+        Some(result) => Some(vec![result.clone()]),
+        None => None,
+    }
+}
+
+fn is_high_risk_command(command: &str) -> bool {
+    let normalized = command.to_lowercase();
+    let high_risk_patterns = [
+        "rm -rf",
+        "remove-item -recurse -force",
+        "git reset --hard",
+        "git checkout --",
+        "del /f",
+        "rmdir /s",
+        "format ",
+        "drop database",
+        "truncate table",
+    ];
+
+    high_risk_patterns
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+}
+
 // ─────────────────────────────────────────────
 // Data structures
 // ─────────────────────────────────────────────
@@ -192,7 +225,10 @@ impl StreamingAgentOrchestrator {
     // Batch events to prevent IPC queue overflow
     async fn emit_step(&mut self, step: AgentStep) {
         // Always emit immediately for critical status changes
-        let is_critical = matches!(step.status.as_str(), "completed" | "failed" | "running" | "skipped" | "alternative");
+        let is_critical = matches!(
+            step.status.as_str(),
+            "completed" | "failed" | "running" | "skipped" | "alternative" | "awaiting_permission"
+        );
         
         if is_critical {
             // Flush any pending batched events first
@@ -239,6 +275,45 @@ impl StreamingAgentOrchestrator {
                 }
             }
             self.last_emit_time = std::time::Instant::now();
+        }
+    }
+
+    async fn request_iteration_continuation(&mut self, iteration: u32) -> Result<bool> {
+        let request_id = format!("iteration_limit_{}", iteration);
+        let question = format!(
+            "WhizCode has reached {} iterations without finishing this task. Do you want it to continue for 30 more iterations?",
+            iteration
+        );
+
+        let step = AgentStep {
+            iteration,
+            tool: "reasoning".to_string(),
+            status: "awaiting_permission".to_string(),
+            summary: question.clone(),
+            result: None,
+            logs: Some(vec![
+                "Iteration safety limit reached.".to_string(),
+                "Approve to continue the current task for another 30 iterations.".to_string(),
+            ]),
+            persona: Some("agent".to_string()),
+            request_id: Some(request_id),
+            data: Some(serde_json::json!({
+                "reason": "iteration_limit",
+                "iteration": iteration,
+                "extension": 30,
+            })),
+        };
+        self.emit_step(step).await;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        {
+            let mut permission_tx = crate::commands::agent::PERMISSION_TX.lock().unwrap();
+            *permission_tx = Some(tx);
+        }
+
+        match rx.await {
+            Ok(approved) => Ok(approved),
+            Err(_) => Err("Failed waiting for user response at iteration limit.".into()),
         }
     }
 
@@ -548,7 +623,9 @@ impl StreamingAgentOrchestrator {
         let mut tool_sig_history: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(4);
         let mut validation_error_count = 0u32; // Track consecutive validation errors
 
-        while iteration < self.max_iterations * 3 {
+        let iteration_extension = self.max_iterations * 3;
+        let mut iteration_limit = self.max_iterations * 3;
+        while iteration < iteration_limit {
             if crate::commands::agent::is_agent_cancelled() { break; }
 
             iteration += 1;
@@ -1117,9 +1194,51 @@ impl StreamingAgentOrchestrator {
             }
 
             if done { break; }
+
+            if iteration >= iteration_limit {
+                match self.request_iteration_continuation(iteration).await {
+                    Ok(true) => {
+                        iteration_limit += iteration_extension;
+                        let continuation_step = AgentStep {
+                            iteration,
+                            tool: "reasoning".to_string(),
+                            status: "alternative".to_string(),
+                            summary: format!("User approved continuation. Extending limit to {} iterations.", iteration_limit),
+                            result: None,
+                            logs: Some(vec![format!("Continuing task after reaching {} iterations.", iteration)]),
+                            persona: Some("agent".to_string()),
+                            request_id: Some(format!("iteration_limit_continue_{}", iteration)),
+                            data: Some(serde_json::json!({
+                                "reason": "iteration_limit_extended",
+                                "new_limit": iteration_limit,
+                            })),
+                        };
+                        self.emit_step(continuation_step).await;
+                    }
+                    Ok(false) => {
+                        status = "max_iterations_reached".to_string();
+                        break;
+                    }
+                    Err(error) => {
+                        status = "max_iterations_reached".to_string();
+                        steps.push(AgentStep {
+                            iteration,
+                            tool: "reasoning".to_string(),
+                            status: "failed".to_string(),
+                            summary: "Failed to prompt for continuation".to_string(),
+                            result: Some(error.to_string()),
+                            logs: None,
+                            persona: Some("agent".to_string()),
+                            request_id: Some(format!("iteration_limit_failed_{}", iteration)),
+                            data: None,
+                        });
+                        break;
+                    }
+                }
+            }
         }
 
-        if iteration >= self.max_iterations * 3 {
+        if iteration >= iteration_limit && status != "completed" {
             eprintln!("[Agent] Global max iterations reached ({})", iteration);
             status = "max_iterations_reached".to_string();
         }
@@ -1251,10 +1370,51 @@ impl StreamingAgentOrchestrator {
     ) -> Result<String> {
         let config = crate::commands::prompts::get_sub_agent_config("context-gatherer")
             .ok_or_else(|| "Context Gatherer config not found".to_string())?;
+        let grounding_context = {
+            let mut summary = String::new();
+            if let Ok(intel) = code_intel.lock() {
+                if let Ok(context) = intel.analyze_workspace_if_stale(workspace_path.to_string()) {
+                    let top_symbols = context.symbols.iter().take(8)
+                        .map(|symbol| format!("{} ({})", symbol.name, symbol.symbol_type))
+                        .collect::<Vec<_>>();
+                    summary.push_str(&format!(
+                        "<workspace_grounding>\nFiles analyzed: {}\nSymbols: {}\nPatterns: {}\nTop symbols: {}\n</workspace_grounding>\n",
+                        context.metrics.total_files,
+                        context.metrics.total_symbols,
+                        context.patterns.len(),
+                        if top_symbols.is_empty() { "none".to_string() } else { top_symbols.join(", ") },
+                    ));
+                }
+            }
+            if let Ok(system) = vector_system.lock() {
+                if let Ok(stats) = system.get_index_stats() {
+                    summary.push_str(&format!(
+                        "<semantic_index>\nChunks: {}\nFiles indexed: {}\nLast updated: {}\n</semantic_index>\n",
+                        stats.total_chunks,
+                        stats.total_files,
+                        stats.last_updated,
+                    ));
+                }
+            }
+            summary
+        };
+        let issue_focus = self.build_issue_focus_context(
+            &Some(workspace_path.to_string()),
+            active_file,
+            task,
+            code_intel.clone(),
+        );
 
         let mut sub_agent_msgs = vec![
             ("system".to_string(), config.system_prompt),
-            ("user".to_string(), format!("CODEBASE RESEARCH TASK:\n{}\n\nWorkspace: {}\nActive File: {:?}", task, workspace_path, active_file)),
+            ("user".to_string(), format!(
+                "CODEBASE RESEARCH TASK:\n{}\n\nWorkspace: {}\nActive File: {:?}\n\n{}{}\n<research_rules>\n- Prefer local repository sources first: semantic_search, find_symbols, search_files, read_file.\n- Do not start by reading whole files when cached workspace context, semantic search, or symbol search can narrow the scope.\n- When an error mentions a file or line, inspect that file and a narrow line window first.\n- Expand to dependent files only after you identify the local cause.\n- Use external web research only when local evidence is insufficient.\n- When using external sources, cite URLs and clearly separate external findings from local codebase findings.\n- Call out uncertainty instead of presenting guesses as facts.\n</research_rules>",
+                task,
+                workspace_path,
+                active_file,
+                grounding_context,
+                issue_focus
+            )),
         ];
 
         self.run_sub_agent_loop(
@@ -1355,7 +1515,7 @@ impl StreamingAgentOrchestrator {
             if i <= 3 || included_indices.contains(&i) { continue; }
             // Budget: 4 chars ≈ 1 token; reserve tokens for the LLM's response
             // Aim to keep the prompt size within context limit
-            let limit = (self.context_length as usize * 4).saturating_sub(8_000).max(10_000);
+            let limit = (self.context_length as usize * 4).saturating_sub(4_000).max(8_000);
             if char_count + content.len() < limit {
                 included_indices.insert(i);
                 char_count += content.len();
@@ -1386,14 +1546,17 @@ impl StreamingAgentOrchestrator {
                 "num_ctx": self.context_length,
                 // Penalise repetition — prevents looping on quantised models
                 "repeat_penalty": 1.1f32,
+                "num_thread": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             }
         });
 
         let mut response_text = String::new();
         let mut token_count = 0u32;
         let mut token_batch = String::new();
-        // FIX: 100-token batches prevent Windows message-queue overflow
-        const BATCH_SIZE: usize = 100;
+        let llm_start = std::time::Instant::now();
+        let mut last_stream_emit = std::time::Instant::now();
+        // Smaller batches keep the UI responsive without overwhelming IPC.
+        const BATCH_SIZE: usize = 16;
 
         match self.client
             .post("http://localhost:11434/api/chat")
@@ -1413,16 +1576,24 @@ impl StreamingAgentOrchestrator {
                                 token_batch.push_str(token);
                                 token_count += 1;
 
-                                if token_count % BATCH_SIZE as u32 == 0 {
+                                let should_emit = token_count % BATCH_SIZE as u32 == 0
+                                    || last_stream_emit.elapsed().as_millis() >= 120;
+                                if should_emit {
                                     if let Some(app) = &self.app_handle {
-                                        if !self.suppress_stream {
+                                        if !self.suppress_stream && !token_batch.is_empty() {
                                             let _ = app.emit("agent:stream", StreamToken {
                                                 token: token_batch.clone(),
                                                 iteration: 0,
                                             });
                                             token_batch.clear();
                                         }
+                                        let elapsed = llm_start.elapsed().as_secs_f32().max(0.1);
+                                        let _ = app.emit("agent:metrics", &serde_json::json!({
+                                            "tokens_per_second": token_count as f32 / elapsed,
+                                            "total_tokens": token_count,
+                                        }));
                                     }
+                                    last_stream_emit = std::time::Instant::now();
                                 }
                             }
                         }
@@ -1438,6 +1609,11 @@ impl StreamingAgentOrchestrator {
                                 iteration: 0,
                             });
                         }
+                        let elapsed = llm_start.elapsed().as_secs_f32().max(0.1);
+                        let _ = app.emit("agent:metrics", &serde_json::json!({
+                            "tokens_per_second": token_count as f32 / elapsed,
+                            "total_tokens": token_count,
+                        }));
                     }
                 }
                 eprintln!("[LLM] Response received: {} tokens", token_count);
@@ -1635,7 +1811,12 @@ impl StreamingAgentOrchestrator {
                 match tc.args.get("path").and_then(|p| p.as_str()) {
                     Some(p) => {
                         let full = normalize_path(p);
-                        tokio::fs::read_to_string(&full).await.map_err(|e| format!("Read failed: {}", e))
+                        let content = tokio::fs::read_to_string(&full)
+                            .await
+                            .map_err(|e| format!("Read failed: {}", e))?;
+                        let start_line = tc.args.get("start_line").and_then(|s| s.as_u64()).map(|n| n as usize);
+                        let end_line = tc.args.get("end_line").and_then(|e| e.as_u64()).map(|n| n as usize);
+                        Ok(format_read_file_output(&content, start_line, end_line))
                     }
                     None => Err("No path provided".to_string())
                 }
@@ -1906,6 +2087,11 @@ impl StreamingAgentOrchestrator {
         let mut json_parser = crate::commands::streaming_agent_flow::IncrementalJsonParser::new();
         let mut tool_counter = 0u32;
         let mut rejected_tools = Vec::new(); // Track rejected tool calls
+        let llm_start = std::time::Instant::now();
+        let mut streamed_token_count = 0u32;
+        let mut stream_batch = String::new();
+        let mut last_stream_emit = std::time::Instant::now();
+        const STREAM_BATCH_SIZE: usize = 12;
 
         // ── Sliding window: same constants as call_llm_streaming ─────────────
         let mut messages_json = Vec::new();
@@ -1922,7 +2108,7 @@ impl StreamingAgentOrchestrator {
 
         for (i, (_role, content)) in iter_messages {
             if i <= 3 || included_indices.contains(&i) { continue; }
-            let limit = (self.context_length as usize * 4).saturating_sub(8_000).max(10_000);
+            let limit = (self.context_length as usize * 4).saturating_sub(4_000).max(8_000);
             if char_count + content.len() < limit {
                 included_indices.insert(i);
                 char_count += content.len();
@@ -1963,6 +2149,7 @@ impl StreamingAgentOrchestrator {
             "options": {
                 "num_ctx": self.context_length,
                 "repeat_penalty": 1.1f32,
+                "num_thread": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             }
         });
 
@@ -1995,6 +2182,29 @@ impl StreamingAgentOrchestrator {
                                         
                                         // Store for the caller to reuse (Stall Detection)
                                         raw_llm_text.push_str(token);
+                                        stream_batch.push_str(token);
+                                        streamed_token_count += 1;
+
+                                        let should_emit_stream = streamed_token_count % STREAM_BATCH_SIZE as u32 == 0
+                                            || last_stream_emit.elapsed().as_millis() >= 120;
+                                        if should_emit_stream {
+                                            if let Some(app) = &self.app_handle {
+                                                if !stream_batch.is_empty() {
+                                                    let _ = app.emit("agent:stream", StreamToken {
+                                                        token: stream_batch.clone(),
+                                                        iteration,
+                                                    });
+                                                    stream_batch.clear();
+                                                }
+
+                                                let elapsed = llm_start.elapsed().as_secs_f32().max(0.1);
+                                                let _ = app.emit("agent:metrics", &serde_json::json!({
+                                                    "tokens_per_second": streamed_token_count as f32 / elapsed,
+                                                    "total_tokens": streamed_token_count,
+                                                }));
+                                            }
+                                            last_stream_emit = std::time::Instant::now();
+                                        }
 
                                         // Feed to incremental JSON parser
                                         let objects = json_parser.feed(token);
@@ -2071,6 +2281,20 @@ impl StreamingAgentOrchestrator {
                 }
 
                 eprintln!("[Phase 4] PHASE 1 COMPLETE: {} tools identified and queued", tool_queue.len());
+                if !stream_batch.is_empty() {
+                    if let Some(app) = &self.app_handle {
+                        let _ = app.emit("agent:stream", StreamToken {
+                            token: stream_batch,
+                            iteration,
+                        });
+
+                        let elapsed = llm_start.elapsed().as_secs_f32().max(0.1);
+                        let _ = app.emit("agent:metrics", &serde_json::json!({
+                            "tokens_per_second": streamed_token_count as f32 / elapsed,
+                            "total_tokens": streamed_token_count,
+                        }));
+                    }
+                }
 
                 // ─────────────────────────────────────────────────────────
                 // PHASE 2: EXECUTE TOOLS SEQUENTIALLY
@@ -2173,6 +2397,84 @@ impl StreamingAgentOrchestrator {
     ) -> Result<String> {
         let args_json = serde_json::to_string(&tool_call.args)
             .unwrap_or_else(|_| "{}".to_string());
+        let request_id = format!("tool_{}_{}", iteration, tool_idx);
+
+        if tool_call.tool == "run_command" {
+            if let Some(command) = tool_call.args.get("command").and_then(|value| value.as_str()) {
+                if is_high_risk_command(command) {
+                    let approval_step = AgentStep {
+                        iteration,
+                        tool: tool_call.tool.clone(),
+                        status: "awaiting_permission".to_string(),
+                        summary: format!("Explicit approval required for high-risk command: {}", command),
+                        result: None,
+                        logs: Some(vec![format!("$ {}", command)]),
+                        persona: Some("agent".to_string()),
+                        request_id: Some(request_id.clone()),
+                        data: Some(serde_json::json!({
+                            "riskLevel": "high",
+                            "requiresExplicitApproval": true,
+                            "command": command,
+                        })),
+                    };
+                    self.emit_step(approval_step).await;
+
+                    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                    {
+                        let mut permission_tx = crate::commands::agent::PERMISSION_TX.lock().unwrap();
+                        *permission_tx = Some(tx);
+                    }
+
+                    match rx.await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let denied_step = AgentStep {
+                                iteration,
+                                tool: tool_call.tool.clone(),
+                                status: "skipped".to_string(),
+                                summary: format!("High-risk command blocked by user: {}", command),
+                                result: Some("Permission denied for high-risk command.".to_string()),
+                                logs: Some(vec![
+                                    format!("$ {}", command),
+                                    "Execution blocked because explicit approval was denied.".to_string(),
+                                ]),
+                                persona: Some("agent".to_string()),
+                                request_id: Some(request_id.clone()),
+                                data: Some(serde_json::json!({
+                                    "riskLevel": "high",
+                                    "requiresExplicitApproval": true,
+                                    "command": command,
+                                })),
+                            };
+                            self.emit_step(denied_step).await;
+                            return Err("Permission denied for high-risk command.".into());
+                        }
+                        Err(_) => {
+                            let failed_step = AgentStep {
+                                iteration,
+                                tool: tool_call.tool.clone(),
+                                status: "failed".to_string(),
+                                summary: format!("High-risk approval request failed: {}", command),
+                                result: Some("Failed waiting for permission response.".to_string()),
+                                logs: Some(vec![
+                                    format!("$ {}", command),
+                                    "The backend did not receive a permission response.".to_string(),
+                                ]),
+                                persona: Some("agent".to_string()),
+                                request_id: Some(request_id.clone()),
+                                data: Some(serde_json::json!({
+                                    "riskLevel": "high",
+                                    "requiresExplicitApproval": true,
+                                    "command": command,
+                                })),
+                            };
+                            self.emit_step(failed_step).await;
+                            return Err("Failed waiting for permission response.".into());
+                        }
+                    }
+                }
+            }
+        }
 
         // Emit "running" status
         let running_step = AgentStep {
@@ -2183,7 +2485,7 @@ impl StreamingAgentOrchestrator {
             result: None,
             logs: None,
             persona: Some("agent".to_string()),
-            request_id: Some(format!("tool_{}_{}", iteration, tool_idx)),
+            request_id: Some(request_id.clone()),
             data: None,
         };
         self.emit_step(running_step).await;
@@ -2224,9 +2526,9 @@ impl StreamingAgentOrchestrator {
             status: status.to_string(),
             summary: format!("Executed {} with args: {}", tool_call.tool, args_json),
             result: result_text.clone(),
-            logs: result_text.as_ref().map(|r| vec![r.clone()]),
+            logs: extract_completion_logs(&tool_call.tool, result_text.as_ref()),
             persona: Some("agent".to_string()),
-            request_id: Some(format!("tool_{}_{}", iteration, tool_idx)),
+            request_id: Some(request_id),
             data: None,
         };
         self.emit_step(completed_step).await;
@@ -2496,7 +2798,7 @@ impl StreamingAgentOrchestrator {
                 status: status.to_string(),
                 summary: format!("Executed {} with args: {}", tool_call.tool, args_json),
                 result: result_text.clone(),
-                logs: result_text.as_ref().map(|r| vec![r.clone()]),
+                logs: extract_completion_logs(&tool_call.tool, result_text.as_ref()),
                 persona: Some("agent".to_string()),
                 request_id: Some(format!("tool_{}_{}", iteration, tool_idx)),
                 data: None,
@@ -2723,6 +3025,138 @@ impl StreamingAgentOrchestrator {
         guidance
     }
 
+    fn build_issue_focus_context(
+        &self,
+        workspace_path: &Option<String>,
+        active_file: &Option<serde_json::Value>,
+        user_message: &str,
+        code_intel: Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
+    ) -> String {
+        let mut ctx = String::new();
+        let analysis = ProblemIdentifier::analyze_problem(user_message);
+        let line_regex = Regex::new(r":(\d+)(?::\d+)?").ok();
+        let explicit_file_regex = Regex::new(r"([A-Za-z0-9_./\\-]+\.(?:tsx?|jsx?|rs|py|go|json|toml|md))").ok();
+
+        let mut candidate_files: Vec<String> = analysis
+            .suspected_files
+            .iter()
+            .take(5)
+            .map(|file| file.path.clone())
+            .collect();
+
+        if let Some(regex) = explicit_file_regex {
+            for capture in regex.captures_iter(user_message) {
+                if let Some(candidate) = capture.get(1).map(|m| m.as_str().to_string()) {
+                    if !candidate_files.contains(&candidate) {
+                        candidate_files.insert(0, candidate);
+                    }
+                }
+            }
+        }
+
+        let referenced_line = line_regex
+            .as_ref()
+            .and_then(|regex| regex.captures(user_message))
+            .and_then(|capture| capture.get(1))
+            .and_then(|value| value.as_str().parse::<usize>().ok());
+
+        if candidate_files.is_empty() && active_file.is_none() {
+            return ctx;
+        }
+
+        ctx.push_str("<issue_focus>\n");
+        ctx.push_str("Use this focused scope before broad exploration.\n");
+
+        if !candidate_files.is_empty() {
+            ctx.push_str("Priority files:\n");
+            for file in candidate_files.iter().take(5) {
+                ctx.push_str(&format!("- {}\n", file));
+            }
+        }
+
+        if let Some(line) = referenced_line {
+            let start = line.saturating_sub(20).max(1);
+            let end = line + 20;
+            ctx.push_str(&format!("Referenced line window: {}-{}\n", start, end));
+        }
+
+        if let Some(file) = active_file {
+            if let Some(path) = file.get("path").and_then(|p| p.as_str()) {
+                ctx.push_str(&format!("Active file: {}\n", path));
+            }
+        }
+
+        if let Some(ws) = workspace_path {
+            if let Ok(intel) = code_intel.lock() {
+                if let Ok(context) = intel.analyze_workspace_if_stale(ws.to_string()) {
+                    let related_symbols: Vec<String> = context.symbols
+                        .iter()
+                        .filter(|symbol| {
+                            candidate_files.iter().any(|candidate| symbol.file_path.contains(candidate))
+                                || analysis.keywords.iter().any(|keyword| symbol.name.to_lowercase().contains(&keyword.to_lowercase()))
+                        })
+                        .take(10)
+                        .map(|symbol| format!("{} ({} @ {}:{})", symbol.name, symbol.symbol_type, symbol.file_path, symbol.line_number))
+                        .collect();
+
+                    if !related_symbols.is_empty() {
+                        ctx.push_str("Related symbols from cached context:\n");
+                        for symbol in related_symbols {
+                            ctx.push_str(&format!("- {}\n", symbol));
+                        }
+                    }
+                }
+            }
+        }
+
+        ctx.push_str("Investigation policy:\n");
+        ctx.push_str("- Start with semantic_search or find_symbols using the issue keywords.\n");
+        ctx.push_str("- If you must read a file, read only the suspected file or referenced line window first.\n");
+        ctx.push_str("- Expand to dependent files only after the local cause is identified.\n");
+        ctx.push_str("- Reuse cached workspace structure and related symbols before opening additional files.\n");
+        ctx.push_str("</issue_focus>\n\n");
+        ctx
+    }
+
+    fn extract_referenced_line(user_message: &str) -> Option<usize> {
+        Regex::new(r":(\d+)(?::\d+)?")
+            .ok()
+            .and_then(|regex| regex.captures(user_message))
+            .and_then(|capture| capture.get(1))
+            .and_then(|value| value.as_str().parse::<usize>().ok())
+    }
+
+    #[allow(dead_code)]
+    fn format_active_file_context(path: &str, content: &str, referenced_line: Option<usize>) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            return format!("<active_file_content path=\"{}\" />\n", path);
+        }
+
+        let (start, end, truncated) = if let Some(line) = referenced_line {
+            let start = line.saturating_sub(20).max(1);
+            let end = (line + 20).min(lines.len());
+            (start, end, start > 1 || end < lines.len())
+        } else {
+            const MAX_ACTIVE_FILE_LINES: usize = 120;
+            let end = lines.len().min(MAX_ACTIVE_FILE_LINES);
+            (1, end, lines.len() > MAX_ACTIVE_FILE_LINES)
+        };
+
+        let displayed = lines[start - 1..end].join("\n");
+        if truncated {
+            format!(
+                "<active_file_content path=\"{}\" start_line=\"{}\" end_line=\"{}\" truncated=\"true\">\n{}\n... (use read_file with start_line/end_line to inspect more)\n</active_file_content>\n",
+                path, start, end, displayed
+            )
+        } else {
+            format!(
+                "<active_file_content path=\"{}\" start_line=\"{}\" end_line=\"{}\">\n{}\n</active_file_content>\n",
+                path, start, end, displayed
+            )
+        }
+    }
+
     // ── FIX #2: System prompt now includes active file CONTENT ──────────────
     /// Lean system prompt: only static rules + shell environment + learned insights.
     /// Stable across all iterations — fits in the model's system-prompt cache.
@@ -2802,6 +3236,12 @@ impl StreamingAgentOrchestrator {
         }
 
         if let Some(ws) = workspace_path {
+            let issue_focus = self.build_issue_focus_context(
+                workspace_path,
+                active_file,
+                user_message,
+                code_intel.clone(),
+            );
             ctx.push_str(&format!(
                 "<workspace_root>{}\nIMPORTANT: Use this EXACT path in all file operations.</workspace_root>\n\n",
                 ws
@@ -2830,6 +3270,9 @@ impl StreamingAgentOrchestrator {
                 }
             };
             ctx.push_str(&format!("<workspace_structure>\n{}\n</workspace_structure>\n\n", file_tree));
+            if !issue_focus.is_empty() {
+                ctx.push_str(&issue_focus);
+            }
 
             // ── DYNAMIC PROMPT FRAGMENTS (extensions derived from file tree) ─
             // Extract real extensions from the file tree instead of a hardcoded list
@@ -2918,10 +3361,18 @@ impl StreamingAgentOrchestrator {
         if let Some(file) = active_file {
             if let Some(path) = file.get("path").and_then(|p| p.as_str()) {
                 if let Some(content) = file.get("content").and_then(|c| c.as_str()) {
-                    let lines: Vec<&str> = content.lines().collect();
-                    const MAX_ACTIVE_FILE_LINES: usize = 300;
+                    let focused_content = if let Some(line) = Self::extract_referenced_line(user_message) {
+                        let content_lines: Vec<&str> = content.lines().collect();
+                        let start = line.saturating_sub(20).max(1);
+                        let end = (line + 20).min(content_lines.len());
+                        content_lines[start - 1..end].join("\n")
+                    } else {
+                        content.to_string()
+                    };
+                    let lines: Vec<&str> = focused_content.lines().collect();
+                    const MAX_ACTIVE_FILE_LINES: usize = 120;
                     if lines.len() <= MAX_ACTIVE_FILE_LINES {
-                        ctx.push_str(&format!("<active_file_content path=\"{}\">\n{}\n</active_file_content>\n", path, content));
+                        ctx.push_str(&format!("<active_file_content path=\"{}\">\n{}\n</active_file_content>\n", path, focused_content));
                     } else {
                         let displayed = lines.iter().take(MAX_ACTIVE_FILE_LINES).cloned().collect::<Vec<_>>().join("\n");
                         ctx.push_str(&format!(
@@ -2943,6 +3394,42 @@ impl StreamingAgentOrchestrator {
 // ─────────────────────────────────────────────
 // Standalone tool executor (used by parallel futures)
 // ─────────────────────────────────────────────
+
+fn format_read_file_output(content: &str, start_line: Option<usize>, end_line: Option<usize>) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return "File contents (0 lines):".to_string();
+    }
+
+    let (start, end, truncated) = if start_line.is_none() && end_line.is_none() {
+        const DEFAULT_PREVIEW_LINES: usize = 120;
+        let end = lines.len().min(DEFAULT_PREVIEW_LINES);
+        (1, end, lines.len() > DEFAULT_PREVIEW_LINES)
+    } else {
+        let start = start_line.unwrap_or(1).max(1);
+        let end = end_line.unwrap_or(lines.len()).min(lines.len());
+        (start, end.max(start), false)
+    };
+
+    let numbered_slice = lines[start - 1..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:4} | {}", start + i, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if truncated {
+        format!(
+            "File preview (lines {}-{} of {}):\n{}\n... (preview truncated; use read_file with start_line/end_line for a specific range)",
+            start,
+            end,
+            lines.len(),
+            numbered_slice
+        )
+    } else {
+        format!("File contents (lines {}-{}):\n{}", start, end, numbered_slice)
+    }
+}
 
 #[allow(dead_code)]
 async fn execute_tool_standalone(
@@ -2983,26 +3470,7 @@ async fn execute_tool_standalone(
             let content = tokio::fs::read_to_string(resolve(path)).await?;
             let start_line = tool_call.args.get("start_line").and_then(|s| s.as_u64()).map(|n| n as usize);
             let end_line   = tool_call.args.get("end_line").and_then(|e| e.as_u64()).map(|n| n as usize);
-
-            let lines: Vec<&str> = content.lines().collect();
-            
-            if start_line.is_none() && end_line.is_none() {
-                let numbered = lines.iter().enumerate()
-                    .map(|(i, line)| format!("{:4} | {}", i + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return Ok(format!("File contents ({} lines):\n{}", lines.len(), numbered));
-            }
-
-            let start = start_line.unwrap_or(1).saturating_sub(1);
-            let end   = end_line.unwrap_or(lines.len()).min(lines.len());
-            
-            let numbered_slice = lines[start..end].iter().enumerate()
-                .map(|(i, line)| format!("{:4} | {}", start + i + 1, line))
-                .collect::<Vec<_>>()
-                .join("\n");
-                
-            Ok(format!("File contents (lines {}-{}):\n{}", start + 1, end, numbered_slice))
+            Ok(format_read_file_output(&content, start_line, end_line))
         }
 
         "view_structure" => {
@@ -3559,9 +4027,17 @@ async fn execute_tool_standalone(
         "search_web" => {
             let query = tool_call.args.get("query").and_then(|q| q.as_str()).ok_or("Missing query")?;
             let results = crate::commands::web_search::search_web(query.to_string()).await?;
-            let mut out = format!("Search results for '{}':\n", query);
+            let mut out = format!("Search results for '{}' (external sources; verify against local code when possible):\n", query);
             for (i, r) in results.iter().enumerate() {
-                out.push_str(&format!("{}. {} ({})\n   {}\n", i + 1, r.title, r.url, r.snippet));
+                out.push_str(&format!(
+                    "{}. {} ({})\n   Domain: {} | Retrieved: {}\n   {}\n",
+                    i + 1,
+                    r.title,
+                    r.url,
+                    r.domain,
+                    r.retrieved_at,
+                    r.snippet
+                ));
             }
             Ok(out)
         }
@@ -3569,7 +4045,7 @@ async fn execute_tool_standalone(
         "read_url_content" => {
             let url = tool_call.args.get("url").and_then(|u| u.as_str()).ok_or("Missing url")?;
             let content = crate::commands::web_search::read_url_content(url.to_string()).await?;
-            Ok(format!("Content from {}:\n\n{}", url, content))
+            Ok(format!("External content from {}:\n\n{}", url, content))
         }
 
         "generate_image" => {
@@ -3649,14 +4125,19 @@ async fn execute_tool_standalone(
         if let Some(path_arg) = tool_call.args.get("path").and_then(|p| p.as_str()) {
             let mut linter_output = String::new();
             if path_arg.ends_with(".ts") || path_arg.ends_with(".tsx") || path_arg.ends_with(".js") || path_arg.ends_with(".jsx") {
-                // Try tsc for TS, fall back to a simple node -c for JS/JSX syntax checking if tsc is missing or not configured
+                let is_typescript = path_arg.ends_with(".ts") || path_arg.ends_with(".tsx");
+                let is_plain_js = path_arg.ends_with(".js") || path_arg.ends_with(".mjs") || path_arg.ends_with(".cjs");
+
+                // Prefer TypeScript-aware validation for TS/TSX. Avoid node --check for TSX because Node cannot parse it.
                 if let Ok(cmd) = tokio::process::Command::new("npx").args(["tsc", "--noEmit"]).current_dir(ws_root).output().await {
                     if !cmd.status.success() {
-                        linter_output = String::from_utf8_lossy(&cmd.stdout).to_string();
+                        let stdout = String::from_utf8_lossy(&cmd.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&cmd.stderr).to_string();
+                        linter_output = if stdout.trim().is_empty() { stderr } else { stdout };
                     }
                 }
-                if linter_output.is_empty() {
-                    // Quick syntax check for JS/JSX if no heavy linter result
+
+                if linter_output.is_empty() && !is_typescript && is_plain_js {
                     if let Ok(cmd) = tokio::process::Command::new("node").args(["--check", path_arg]).current_dir(ws_root).output().await {
                         if !cmd.status.success() {
                             linter_output = String::from_utf8_lossy(&cmd.stderr).to_string();

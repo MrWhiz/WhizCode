@@ -160,6 +160,9 @@ fn main() {
             
             // Git operations
             commands::git::git_status,
+            commands::git::git_stage,
+            commands::git::git_commit,
+            commands::git::git_review,
             
             // Diagnostics operations
             commands::diagnostics::diagnostics_check,
@@ -202,6 +205,7 @@ fn main() {
             commands::sub_agents::list_sub_agents,
             commands::sub_agents::get_sub_agent_config,
             commands::sub_agents::invoke_sub_agent,
+            commands::sub_agents::orchestrate_sub_agents,
             
             // Learning operations
             commands::learning::learning_analyze_patterns,
@@ -228,6 +232,9 @@ fn main() {
             commands::context_memory::context_memory_get_all_projects,
             commands::context_memory::context_memory_get_statistics,
             commands::context_memory::context_memory_clear_old_data,
+            commands::context_memory::context_memory_get_snapshot,
+            commands::context_memory::context_memory_delete_preference,
+            commands::context_memory::context_memory_delete_project,
             
             // Hooks operations
             commands::hooks::hooks_list_all,

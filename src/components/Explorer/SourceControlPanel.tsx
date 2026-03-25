@@ -3,7 +3,15 @@ import { git } from '../../lib/tauri-api'
 
 interface GitStatus {
     branch: string
-    changes: Array<{ file: string, status: string }>
+    changes: Array<{ file: string, status: string, staged?: boolean }>
+}
+
+interface ReviewFinding {
+    file: string
+    severity: string
+    line: number
+    message: string
+    suggestion?: string
 }
 
 interface SourceControlPanelProps {
@@ -14,6 +22,8 @@ export const SourceControlPanel = ({ workspacePath }: SourceControlPanelProps) =
     const [gitStatus, setGitStatus] = useState<GitStatus | null>(null)
     const [commitMessage, setCommitMessage] = useState('')
     const [isLoading, setIsLoading] = useState(false)
+    const [reviewFindings, setReviewFindings] = useState<ReviewFinding[]>([])
+    const [isReviewing, setIsReviewing] = useState(false)
 
     useEffect(() => {
         if (workspacePath) {
@@ -36,14 +46,43 @@ export const SourceControlPanel = ({ workspacePath }: SourceControlPanelProps) =
 
     const handleCommit = async () => {
         if (!commitMessage.trim() || !workspacePath) return
-        // TODO: wire up git:commit Tauri command when available
-        console.warn('git commit not yet implemented via Tauri API')
+        setIsLoading(true)
+        try {
+            await git.commit(workspacePath, commitMessage.trim())
+            setCommitMessage('')
+            await refreshStatus()
+        } catch (err) {
+            console.error('Git commit error:', err)
+        } finally {
+            setIsLoading(false)
+        }
     }
 
     const handleStage = async (file: string) => {
         if (!workspacePath) return
-        // TODO: wire up git:stage Tauri command when available
-        console.warn('git stage not yet implemented via Tauri API', file)
+        setIsLoading(true)
+        try {
+            const status = await git.stageFile(workspacePath, file)
+            setGitStatus(status)
+        } catch (err) {
+            console.error('Git stage error:', err)
+        } finally {
+            setIsLoading(false)
+        }
+    }
+
+    const handleReview = async () => {
+        if (!workspacePath) return
+        setIsReviewing(true)
+        try {
+            const report = await git.reviewWorkingTree(workspacePath)
+            setReviewFindings(report.findings)
+        } catch (err) {
+            console.error('Git review error:', err)
+            setReviewFindings([])
+        } finally {
+            setIsReviewing(false)
+        }
     }
 
     const getStatusIcon = (status: string) => {
@@ -144,6 +183,24 @@ export const SourceControlPanel = ({ workspacePath }: SourceControlPanelProps) =
                 >
                     Commit
                 </button>
+                <button
+                    onClick={handleReview}
+                    disabled={isReviewing || gitStatus.changes.length === 0}
+                    style={{
+                        width: '100%',
+                        marginTop: '8px',
+                        padding: '6px',
+                        fontSize: '12px',
+                        backgroundColor: '#3b82f6',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '4px',
+                        cursor: isReviewing || gitStatus.changes.length === 0 ? 'not-allowed' : 'pointer',
+                        opacity: isReviewing || gitStatus.changes.length === 0 ? 0.5 : 1
+                    }}
+                >
+                    {isReviewing ? 'Reviewing...' : 'Review Changes'}
+                </button>
             </div>
 
             <div style={{ flex: 1, overflowY: 'auto' }}>
@@ -168,6 +225,11 @@ export const SourceControlPanel = ({ workspacePath }: SourceControlPanelProps) =
                             <span style={{ color: getStatusColor(change.status), fontWeight: 'bold' }}>
                                 {getStatusIcon(change.status)}
                             </span>
+                            {change.staged && (
+                                <span style={{ fontSize: '10px', color: '#89d185', fontWeight: 700 }}>
+                                    STAGED
+                                </span>
+                            )}
                             <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                 {change.file}
                             </span>
@@ -176,6 +238,41 @@ export const SourceControlPanel = ({ workspacePath }: SourceControlPanelProps) =
                 ) : (
                     <div className="empty-state">No changes</div>
                 )}
+                <div style={{ padding: '12px', borderTop: '1px solid var(--border-color)' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', marginBottom: '8px' }}>
+                        Review Findings ({reviewFindings.length})
+                    </div>
+                    {reviewFindings.length > 0 ? (
+                        reviewFindings.map((finding, idx) => (
+                            <div
+                                key={`${finding.file}:${finding.line}:${idx}`}
+                                style={{
+                                    padding: '8px',
+                                    borderRadius: '4px',
+                                    marginBottom: '8px',
+                                    background: 'rgba(255,255,255,0.03)',
+                                    borderLeft: `3px solid ${finding.severity === 'error' ? '#f14c4c' : '#f59e0b'}`
+                                }}
+                            >
+                                <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginBottom: '4px' }}>
+                                    {finding.file}:{finding.line}
+                                </div>
+                                <div style={{ fontSize: '12px', color: 'var(--text-primary)', marginBottom: '4px' }}>
+                                    {finding.message}
+                                </div>
+                                {finding.suggestion && (
+                                    <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                                        Suggestion: {finding.suggestion}
+                                    </div>
+                                )}
+                            </div>
+                        ))
+                    ) : (
+                        <div className="empty-state" style={{ padding: '8px 0' }}>
+                            {isReviewing ? 'Review in progress...' : 'No review findings yet'}
+                        </div>
+                    )}
+                </div>
             </div>
         </div>
     )

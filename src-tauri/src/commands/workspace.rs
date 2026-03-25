@@ -17,6 +17,7 @@ pub async fn set_workspace(
     path: String,
     state: State<'_, Arc<RwLock<AppState>>>,
     vector_state: State<'_, Arc<std::sync::Mutex<crate::commands::vector_search::VectorSearchSystem>>>,
+    history_state: State<'_, Arc<std::sync::Mutex<crate::commands::history::HistoryService>>>,
 ) -> Result<()> {
     let workspace_path = PathBuf::from(&path);
     
@@ -33,6 +34,11 @@ pub async fn set_workspace(
     if let Ok(new_system) = crate::commands::vector_search::VectorSearchSystem::new(&path) {
         let mut vs = vector_state.lock().unwrap();
         *vs = new_system;
+    }
+
+    {
+        let mut history_service = history_state.lock().unwrap();
+        history_service.set_workspace_path(&path)?;
     }
 
     let mut app_state = state.write();

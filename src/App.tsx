@@ -24,9 +24,9 @@ import { useFileExistenceCheck } from './hooks/useFileExistenceCheck'
 import { useAutoScroll } from './hooks/useAutoScroll'
 
 // Types
-import type { Message } from './types'
+import type { AgentStep, Message } from './types'
 
-import { agent, dialog, workspace, fs } from './lib/tauri-api'
+import { agent, dialog, workspace, fs, history, git, errorRecovery } from './lib/tauri-api'
 import { loadAppState } from './lib/appState'
 
 import { WhizLogo } from './components/Branding/WhizLogo'
@@ -36,6 +36,9 @@ import './App.css'
 
 function App() {
   const savedState = loadAppState()
+  const latestAgentStepsRef = React.useRef<AgentStep[]>([])
+  const historyLoadedWorkspaceRef = React.useRef<string | null>(null)
+  const isHydratingHistoryRef = React.useRef(false)
 
   // Use custom hooks for state management
   const appState = useAppState()
@@ -235,6 +238,59 @@ function App() {
   // Auto-scroll
   useAutoScroll(messagesEndRef, messages, agentSteps)
 
+  React.useEffect(() => {
+    latestAgentStepsRef.current = agentSteps
+  }, [agentSteps])
+
+  React.useEffect(() => {
+    if (!workspacePath) {
+      historyLoadedWorkspaceRef.current = null
+      return
+    }
+
+    if (historyLoadedWorkspaceRef.current === workspacePath) {
+      return
+    }
+
+    const loadWorkspaceHistory = async () => {
+      isHydratingHistoryRef.current = true
+      try {
+        const thread = await history.get(getWorkspaceThreadId(workspacePath))
+        const savedMessages = Array.isArray(thread.messages) ? thread.messages as Message[] : []
+        if (savedMessages.length > 0) {
+          setMessages(savedMessages)
+        }
+      } catch (error) {
+        console.debug('No existing workspace history to restore:', workspacePath, error)
+      } finally {
+        historyLoadedWorkspaceRef.current = workspacePath
+        isHydratingHistoryRef.current = false
+      }
+    }
+
+    loadWorkspaceHistory()
+  }, [workspacePath, setMessages])
+
+  React.useEffect(() => {
+    if (!workspacePath || isHydratingHistoryRef.current || historyLoadedWorkspaceRef.current !== workspacePath) {
+      return
+    }
+
+    const persistMessages = async () => {
+      try {
+        await history.save(
+          getWorkspaceThreadId(workspacePath),
+          getWorkspaceThreadTitle(workspacePath),
+          messages
+        )
+      } catch (error) {
+        console.error('Failed to persist workspace history:', error)
+      }
+    }
+
+    persistMessages()
+  }, [workspacePath, messages])
+
   // Resize handlers
   const handleSidebarResize = (e: React.MouseEvent) => {
     e.preventDefault()
@@ -324,19 +380,45 @@ function App() {
         context_length: contextLength,
       })
       const response = result?.response || 'No response'
-      const steps = result?.steps || []
-      const toolCalls = result?.tool_calls || []
-      
-      const toolSteps = toolCalls.map((call: any, idx: number) => ({
-        tool: call.tool,
-        iteration: idx + 1,
-        status: 'done' as const,
-        summary: `Executed ${call.tool} with args: ${JSON.stringify(call.args)}`
-      }))
-      
+      const finalSteps = collectResultSteps(result, latestAgentStepsRef.current)
+      let verificationSteps = workspacePath
+        ? await buildVerificationSteps(workspacePath, finalSteps)
+        : []
+      let allSteps = [...finalSteps, ...verificationSteps]
+      let finalResponse = appendVerificationSummary(response, verificationSteps)
+
+      const repairOutcome = workspacePath
+        ? await runAutomaticRepairPass({
+            workspacePath,
+            originalTask: userMsg.content,
+            initialResponse: response,
+            initialSteps: finalSteps,
+            initialVerificationSteps: verificationSteps,
+            conversationHistory: [
+              ...conversationHistory,
+              { role: 'user', content: userMsg.content },
+              { role: 'assistant', content: finalResponse },
+            ],
+            modelProvider,
+            model,
+            activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
+            contextLength,
+            latestAgentStepsRef,
+            setAgentSteps,
+            setLiveStreamingContent,
+            streamingContentRef,
+          })
+        : null
+
+      if (repairOutcome) {
+        allSteps = repairOutcome.steps
+        verificationSteps = repairOutcome.verificationSteps
+        finalResponse = repairOutcome.response
+      }
+
       setAgentSteps([])
       setMessages(prev => {
-        return [...prev, { role: 'assistant', content: response, steps: [...toolSteps, ...steps].length > 0 ? [...toolSteps, ...steps] : undefined }]
+        return [...prev, { role: 'assistant', content: finalResponse, steps: allSteps.length > 0 ? allSteps : undefined }]
       })
     } catch (err) {
       console.error('Agent error:', err)
@@ -787,6 +869,228 @@ function App() {
       )}
     </div>
   )
+}
+
+function getWorkspaceThreadId(workspacePath: string): string {
+  const slug = workspacePath
+    .replace(/^[A-Za-z]:/, '')
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase()
+
+  return `workspace-main-${slug || 'default'}`
+}
+
+function getWorkspaceThreadTitle(workspacePath: string): string {
+  const parts = workspacePath.split(/[/\\]/).filter(Boolean)
+  return parts[parts.length - 1] || 'Workspace Chat'
+}
+
+function collectResultSteps(result: any, liveSteps: AgentStep[]): AgentStep[] {
+  const steps = result?.steps || []
+  const toolCalls = result?.tool_calls || []
+
+  const toolSteps = toolCalls.map((call: any, idx: number) => ({
+    tool: call.tool,
+    iteration: idx + 1,
+    status: 'done' as const,
+    summary: `Executed ${call.tool} with args: ${JSON.stringify(call.args)}`,
+  }))
+
+  return liveSteps.length > 0
+    ? [...liveSteps]
+    : [...toolSteps, ...steps]
+}
+
+function shouldRunVerification(steps: AgentStep[]): boolean {
+  return steps.some(step => [
+    'write_file',
+    'edit_file',
+    'run_command',
+    'create_file',
+    'delete_file',
+    'rename_file',
+    'git',
+  ].includes(step.tool))
+}
+
+function getFailedReviewStep(verificationSteps: AgentStep[]): AgentStep | undefined {
+  return verificationSteps.find(step => step.tool === 'review' && step.status === 'failed')
+}
+
+function summarizeReviewFindings(reviewStep: AgentStep): string[] {
+  return (reviewStep.logs || [])
+    .filter(log => typeof log === 'string' && log.trim().length > 0)
+    .slice(0, 5)
+}
+
+function remapRepairSteps(steps: AgentStep[], iterationOffset: number): AgentStep[] {
+  return steps.map((step, index) => ({
+    ...step,
+    iteration: (step.iteration || index + 1) + iterationOffset,
+    requestId: step.requestId ? `repair-${step.requestId}` : `repair-step-${iterationOffset + index + 1}`,
+  }))
+}
+
+async function buildVerificationSteps(workspacePath: string, steps: AgentStep[]): Promise<AgentStep[]> {
+  if (!shouldRunVerification(steps)) {
+    return []
+  }
+
+  try {
+    const report = await git.reviewWorkingTree(workspacePath)
+    const findingsText = report.findings.length > 0
+      ? report.findings
+          .slice(0, 10)
+          .map(finding => `${finding.severity.toUpperCase()} ${finding.file}:${finding.line} ${finding.message}${finding.suggestion ? ` (${finding.suggestion})` : ''}`)
+      : ['No review findings in changed files.']
+
+    const reviewStep: AgentStep = {
+      tool: 'review',
+      status: report.findings.length > 0 ? 'failed' : 'completed',
+      summary: report.findings.length > 0
+        ? `Review found ${report.findings.length} issue(s) across ${report.files_reviewed} file(s)`
+        : `Review passed for ${report.files_reviewed} file(s)`,
+      logs: findingsText,
+      persona: 'reviewer',
+      planPhase: 'summary',
+    }
+
+    if (report.findings.length === 0) {
+      return [reviewStep]
+    }
+
+    const primaryFinding = report.findings[0]
+    const recovery = await errorRecovery.handle(
+      `${primaryFinding.severity}: ${primaryFinding.message}`,
+      'review',
+      workspacePath
+    )
+
+    const recoveryLogs = [
+      recovery.message,
+      ...(recovery.suggested_action ? [`Suggested action: ${recovery.suggested_action}`] : []),
+      ...recovery.fallback_recommendations.map(item => `Fallback: ${item}`),
+    ]
+
+    const recoveryStep: AgentStep = {
+      tool: 'recovery',
+      status: 'alternative',
+      summary: 'Recovery guidance prepared from review findings',
+      logs: recoveryLogs,
+      persona: 'reviewer',
+      planPhase: 'summary',
+    }
+
+    return [reviewStep, recoveryStep]
+  } catch (error) {
+    console.debug('Automatic verification skipped:', error)
+    return []
+  }
+}
+
+function appendVerificationSummary(response: string, verificationSteps: AgentStep[]): string {
+  if (verificationSteps.length === 0) {
+    return response
+  }
+
+  const reviewStep = verificationSteps.find(step => step.tool === 'review')
+  if (!reviewStep) {
+    return response
+  }
+
+  return `${response}\n\nVerification: ${reviewStep.summary}`
+}
+
+async function runAutomaticRepairPass(params: {
+  workspacePath: string
+  originalTask: string
+  initialResponse: string
+  initialSteps: AgentStep[]
+  initialVerificationSteps: AgentStep[]
+  conversationHistory: Array<{ role: string; content: string }>
+  modelProvider: string
+  model: string
+  activeFile: { path: string; content: string } | null
+  contextLength: number
+  latestAgentStepsRef: React.MutableRefObject<AgentStep[]>
+  setAgentSteps: (steps: AgentStep[] | ((prev: AgentStep[]) => AgentStep[])) => void
+  setLiveStreamingContent: (content: string) => void
+  streamingContentRef: React.MutableRefObject<string>
+}): Promise<{ steps: AgentStep[]; verificationSteps: AgentStep[]; response: string } | null> {
+  const failedReview = getFailedReviewStep(params.initialVerificationSteps)
+  if (!failedReview) {
+    return null
+  }
+
+  const findings = summarizeReviewFindings(failedReview)
+  if (findings.length === 0) {
+    return null
+  }
+
+  const repairRequest = [
+    `Automatic repair pass for the previous task: ${params.originalTask}`,
+    'Address the verification findings below with the smallest safe set of code changes.',
+    'Do not make unrelated refactors. When you finish, stop and summarize what you changed.',
+    '',
+    'Verification findings:',
+    ...findings.map(item => `- ${item}`),
+  ].join('\n')
+
+  params.setAgentSteps([])
+  params.streamingContentRef.current = ''
+  params.setLiveStreamingContent('')
+
+  try {
+    const repairResult = await agent.executeLoopStreaming({
+      task: repairRequest,
+      model: {
+        provider: params.modelProvider,
+        model: params.model,
+      },
+      workspacePath: params.workspacePath,
+      activeFile: params.activeFile,
+      conversationHistory: params.conversationHistory,
+      context_length: params.contextLength,
+    })
+
+    const repairResponse = repairResult?.response || 'Automatic repair pass completed.'
+    const repairSteps = remapRepairSteps(
+      collectResultSteps(repairResult, params.latestAgentStepsRef.current),
+      Math.max(...params.initialSteps.map(step => step.iteration || 0), 0),
+    )
+    const combinedSteps = [...params.initialSteps, ...params.initialVerificationSteps, ...repairSteps]
+    const reverifiedSteps = await buildVerificationSteps(params.workspacePath, combinedSteps)
+    const reviewAfterRepair = getFailedReviewStep(reverifiedSteps)
+    const repairNote = reviewAfterRepair
+      ? `Auto-repair attempted one corrective pass, but ${reviewAfterRepair.summary.toLowerCase()}.`
+      : 'Auto-repair applied one corrective pass and verification passed.'
+    const response = `${appendVerificationSummary(params.initialResponse, reverifiedSteps)}\n\n${repairNote}\nRepair summary: ${repairResponse}`
+
+    return {
+      steps: [...combinedSteps, ...reverifiedSteps],
+      verificationSteps: reverifiedSteps,
+      response,
+    }
+  } catch (error) {
+    const failureMessage = error instanceof Error ? error.message : String(error)
+    const failureStep: AgentStep = {
+      tool: 'repair',
+      status: 'failed',
+      summary: 'Automatic repair pass failed',
+      logs: [failureMessage],
+      persona: 'reviewer',
+      planPhase: 'summary',
+      iteration: Math.max(...params.initialSteps.map(step => step.iteration || 0), 0) + 1,
+      requestId: 'repair-failed',
+    }
+
+    return {
+      steps: [...params.initialSteps, ...params.initialVerificationSteps, failureStep],
+      verificationSteps: params.initialVerificationSteps,
+      response: `${appendVerificationSummary(params.initialResponse, params.initialVerificationSteps)}\n\nAuto-repair attempted one corrective pass but failed: ${failureMessage}`,
+    }
+  }
 }
 
 export default App

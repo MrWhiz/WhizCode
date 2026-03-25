@@ -264,6 +264,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
     const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null)
     const [newItemDialog, setNewItemDialog] = useState<{ type: 'file' | 'folder', parentPath: string } | null>(null)
     const [newItemName, setNewItemName] = useState('')
+    const combinedRefreshKey = externalRefreshKey + refreshKey
 
     // Persist expanded folders per workspace path
     const storageKey = `filetree-expanded:${path}`
@@ -354,7 +355,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
 
     useEffect(() => {
         fetchFiles()
-    }, [path, externalRefreshKey, fetchFiles])
+    }, [path, combinedRefreshKey, fetchFiles])
 
     // Handle collapseAll
     useEffect(() => {
@@ -483,7 +484,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
                     entry={file} 
                     level={0} 
                     onFileOpen={onFileOpen} 
-                    refreshKey={refreshKey} 
+                    refreshKey={combinedRefreshKey} 
                     onContextMenu={handleContextMenu}
                     collapseAll={collapseAll}
                     fileFilter={fileFilter}

@@ -65,6 +65,7 @@ pub struct SemanticContext {
     pub patterns: Vec<CodePattern>,
     pub metrics: CodeMetrics,
     pub last_analyzed: u64,
+    pub scan_signature: u64,
 }
 
 pub struct CodeIntelligence {
@@ -85,12 +86,51 @@ impl CodeIntelligence {
             .as_secs()
     }
 
+    fn workspace_scan_signature(workspace_path: &str) -> u64 {
+        let mut latest_seen = 0u64;
+        let mut file_count = 0u64;
+
+        for entry in WalkDir::new(workspace_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+        {
+            let path = entry.path();
+            if utils::should_skip_file(path) {
+                continue;
+            }
+
+            file_count += 1;
+            let modified = fs::metadata(path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            latest_seen = latest_seen.max(modified);
+        }
+
+        latest_seen ^ file_count
+    }
+
+    pub fn analyze_workspace_if_stale(&self, workspace_path: String) -> Result<SemanticContext> {
+        let current_signature = Self::workspace_scan_signature(&workspace_path);
+        if let Some(existing) = self.contexts.lock().unwrap().get(&workspace_path).cloned() {
+            if existing.scan_signature == current_signature {
+                return Ok(existing);
+            }
+        }
+
+        self.analyze_workspace(workspace_path)
+    }
+
     pub fn analyze_workspace(&self, workspace_path: String) -> Result<SemanticContext> {
         eprintln!("[INTEL] Analyzing workspace: {}", workspace_path);
 
         let mut symbols = Vec::new();
         let mut file_count = 0;
         let mut total_complexity = 0.0;
+        let scan_signature = Self::workspace_scan_signature(&workspace_path);
 
         for entry in WalkDir::new(&workspace_path)
             .into_iter()
@@ -104,7 +144,7 @@ impl CodeIntelligence {
 
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
             if !matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go") {
-                // continue; // Original line, removed by edit
+                continue;
             }
             if let Ok(content) = fs::read_to_string(path) {
                 let file_path = path.to_string_lossy().to_string();
@@ -125,7 +165,7 @@ impl CodeIntelligence {
             workspace_path: workspace_path.clone(),
             symbols: symbols.clone(),
             relationships: vec![],
-            patterns: vec![],
+            patterns: self.extract_patterns(&symbols),
             metrics: CodeMetrics {
                 total_files: file_count,
                 total_symbols,
@@ -136,6 +176,7 @@ impl CodeIntelligence {
                 cyclomatic_complexity: avg_complexity * 1.5,
             },
             last_analyzed: Self::current_timestamp(),
+            scan_signature,
         };
 
         // ── 2. RELATIONSHIP ANALYSIS ─────────────────────────────────────
@@ -187,6 +228,28 @@ impl CodeIntelligence {
         }
 
         relationships
+    }
+
+    fn extract_patterns(&self, symbols: &[CodeSymbol]) -> Vec<CodePattern> {
+        let mut patterns = Vec::new();
+        let large_files = symbols.iter().fold(HashMap::new(), |mut acc, symbol| {
+            *acc.entry(symbol.file_path.clone()).or_insert(0u32) += 1;
+            acc
+        });
+
+        for (file_path, count) in large_files {
+            if count >= 10 {
+                patterns.push(CodePattern {
+                    id: format!("dense-symbols:{}", file_path),
+                    pattern_name: "dense-symbol-cluster".to_string(),
+                    description: format!("{} declares {} symbols and may benefit from decomposition", file_path, count),
+                    occurrences: count,
+                    severity: "medium".to_string(),
+                });
+            }
+        }
+
+        patterns
     }
 
     fn extract_symbols(&self, file_path: &str, content: &str) -> Vec<CodeSymbol> {
@@ -246,8 +309,7 @@ impl CodeIntelligence {
     }
 
     pub fn get_symbol_info(&self, workspace_path: &str, symbol_name: &str) -> Option<CodeSymbol> {
-        let contexts = self.contexts.lock().unwrap();
-        contexts
+        self.contexts.lock().unwrap()
             .get(workspace_path)
             .and_then(|ctx| {
                 ctx.symbols
@@ -289,6 +351,76 @@ impl CodeIntelligence {
         }
         suggestions
     }
+
+    pub fn get_all_relationships(&self, workspace_path: &str) -> Vec<CodeRelationship> {
+        self.contexts
+            .lock()
+            .unwrap()
+            .get(workspace_path)
+            .map(|ctx| ctx.relationships.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn get_all_patterns(&self, workspace_path: &str) -> Vec<CodePattern> {
+        self.contexts
+            .lock()
+            .unwrap()
+            .get(workspace_path)
+            .map(|ctx| ctx.patterns.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn find_related_symbols(&self, workspace_path: &str, symbol_name: &str) -> Vec<CodeSymbol> {
+        let contexts = self.contexts.lock().unwrap();
+        let Some(ctx) = contexts.get(workspace_path) else {
+            return Vec::new();
+        };
+
+        let mut related_names = Vec::new();
+        for relationship in &ctx.relationships {
+            if relationship.to_symbol.ends_with(&format!(":{}", symbol_name)) {
+                if let Some(source_file) = relationship.from_symbol.split(':').next() {
+                    related_names.push(source_file.to_string());
+                }
+            }
+            if relationship.from_symbol.ends_with(symbol_name) {
+                related_names.push(relationship.to_symbol.clone());
+            }
+        }
+
+        ctx.symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.name == symbol_name
+                    || related_names.iter().any(|candidate| {
+                        candidate.contains(&symbol.name) || candidate == &symbol.file_path
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn impact_analysis(&self, workspace_path: &str, symbol_id: &str) -> HashMap<String, Vec<String>> {
+        let contexts = self.contexts.lock().unwrap();
+        let Some(ctx) = contexts.get(workspace_path) else {
+            return HashMap::new();
+        };
+
+        let mut impact = HashMap::new();
+        if let Some(symbol) = ctx.symbols.iter().find(|item| item.id == symbol_id || item.name == symbol_id) {
+            impact.insert("symbol".to_string(), vec![symbol.name.clone()]);
+            impact.insert(
+                "files".to_string(),
+                ctx.relationships
+                    .iter()
+                    .filter(|rel| rel.to_symbol.contains(&symbol.name))
+                    .map(|rel| rel.from_symbol.clone())
+                    .collect(),
+            );
+        }
+
+        impact
+    }
 }
 
 // Tauri commands
@@ -298,7 +430,7 @@ pub async fn code_intelligence_analyze_workspace(
     state: tauri::State<'_, Arc<std::sync::Mutex<CodeIntelligence>>>,
 ) -> Result<SemanticContext> {
     let intel = state.lock().unwrap();
-    intel.analyze_workspace(workspace_path)
+    intel.analyze_workspace_if_stale(workspace_path)
 }
 
 #[tauri::command]
@@ -340,18 +472,31 @@ pub async fn code_intelligence_suggest_refactoring(
 }
 
 #[tauri::command]
-pub async fn code_intelligence_find_related_symbols(_workspace_path: String, _symbol_name: String) -> Result<Vec<CodeSymbol>> {
-    Ok(vec![])
+pub async fn code_intelligence_find_related_symbols(
+    workspace_path: String,
+    symbol_name: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<CodeIntelligence>>>,
+) -> Result<Vec<CodeSymbol>> {
+    let intel = state.lock().unwrap();
+    Ok(intel.find_related_symbols(&workspace_path, &symbol_name))
 }
 
 #[tauri::command]
-pub async fn code_intelligence_get_all_relationships(_workspace_path: String) -> Result<Vec<CodeRelationship>> {
-    Ok(vec![])
+pub async fn code_intelligence_get_all_relationships(
+    workspace_path: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<CodeIntelligence>>>,
+) -> Result<Vec<CodeRelationship>> {
+    let intel = state.lock().unwrap();
+    Ok(intel.get_all_relationships(&workspace_path))
 }
 
 #[tauri::command]
-pub async fn code_intelligence_get_all_patterns(_workspace_path: String) -> Result<Vec<CodePattern>> {
-    Ok(vec![])
+pub async fn code_intelligence_get_all_patterns(
+    workspace_path: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<CodeIntelligence>>>,
+) -> Result<Vec<CodePattern>> {
+    let intel = state.lock().unwrap();
+    Ok(intel.get_all_patterns(&workspace_path))
 }
 
 #[tauri::command]
@@ -360,6 +505,11 @@ pub async fn code_intelligence_find_circular_dependencies(_workspace_path: Strin
 }
 
 #[tauri::command]
-pub async fn code_intelligence_impact_analysis(_workspace_path: String, _symbol_id: String) -> Result<HashMap<String, Vec<String>>> {
-    Ok(HashMap::new())
+pub async fn code_intelligence_impact_analysis(
+    workspace_path: String,
+    symbol_id: String,
+    state: tauri::State<'_, Arc<std::sync::Mutex<CodeIntelligence>>>,
+) -> Result<HashMap<String, Vec<String>>> {
+    let intel = state.lock().unwrap();
+    Ok(intel.impact_analysis(&workspace_path, &symbol_id))
 }

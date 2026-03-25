@@ -15,20 +15,37 @@ export const StreamingDisplay: React.FC<StreamingDisplayProps> = ({ content, isS
     setDisplayContent(content)
   }, [content])
 
+  const sanitizeThought = (value: string) =>
+    value
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, '\\')
+      .replace(/",?\s*"tool"\s*:\s*[^]*$/, '')
+      .replace(/\}\s*$/, '')
+      .replace(/^[{\s"]+/, '')
+      .replace(/^thought\b[:\s-]*/i, '')
+      .trim()
+
   const parsed = useMemo(() => {
     const parts: Array<{ type: 'thought' | 'tool', content: string }> = []
     
     try {
-      // Try to parse as JSON
-      // Handle incomplete JSON while streaming by finding the last complete object
       let jsonStr = displayContent.trim()
-      
-      // If it looks like JSON, try to parse it
+
       if (jsonStr.startsWith('{')) {
-        // Find the last complete JSON object
+        const completeThought = jsonStr.match(/"thought"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/)
+        const partialThought = jsonStr.match(/"thought"\s*:\s*"([^]*)$/)
+
+        const thoughtValue = completeThought?.[1] || partialThought?.[1]
+        const cleanedThought = thoughtValue ? sanitizeThought(thoughtValue) : ''
+        if (cleanedThought) {
+          parts.push({
+            type: 'thought',
+            content: cleanedThought,
+          })
+        }
+
         let braceCount = 0
         let lastCompleteIdx = -1
-        
         for (let i = 0; i < jsonStr.length; i++) {
           if (jsonStr[i] === '{') braceCount++
           else if (jsonStr[i] === '}') {
@@ -36,25 +53,23 @@ export const StreamingDisplay: React.FC<StreamingDisplayProps> = ({ content, isS
             if (braceCount === 0) lastCompleteIdx = i
           }
         }
-        
+
         if (lastCompleteIdx > 0) {
           const completeJson = jsonStr.substring(0, lastCompleteIdx + 1)
           try {
             const obj = JSON.parse(completeJson)
-            
-            // Extract thought if present
-            if (obj.thought && typeof obj.thought === 'string') {
-              parts.push({ type: 'thought', content: obj.thought })
-            }
-            
-            // Extract tool call if present
             if (obj.tool && typeof obj.tool === 'string') {
               const toolObj = { tool: obj.tool, args: obj.args || {} }
               parts.push({ type: 'tool', content: JSON.stringify(toolObj, null, 2) })
             }
           } catch (e) {
-            // JSON parsing failed, skip
+            // Skip malformed tool snippets while streaming
           }
+        }
+      } else if (isStreaming && jsonStr) {
+        const fallbackThought = sanitizeThought(jsonStr)
+        if (fallbackThought) {
+          parts.push({ type: 'thought', content: fallbackThought })
         }
       }
     } catch (e) {

@@ -7,6 +7,9 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    pub domain: String,
+    pub source_type: String,
+    pub retrieved_at: i64,
 }
 
 #[tauri::command]
@@ -34,9 +37,20 @@ pub async fn search_web(query: String) -> Result<Vec<SearchResult>> {
                 .unwrap_or_else(|| title_el.value().attr("href").unwrap_or("").to_string());
                 
             let snippet = snippet_el.text().collect::<String>().trim().to_string();
+            let domain = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|parsed| parsed.domain().map(|value| value.to_string()))
+                .unwrap_or_else(|| "unknown".to_string());
             
             if !title.is_empty() && !url.is_empty() {
-                results.push(SearchResult { title, url, snippet });
+                results.push(SearchResult {
+                    title,
+                    url,
+                    snippet,
+                    domain,
+                    source_type: "external_web".to_string(),
+                    retrieved_at: chrono::Utc::now().timestamp(),
+                });
             }
         }
     }

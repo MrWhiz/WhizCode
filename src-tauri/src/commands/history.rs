@@ -45,6 +45,21 @@ impl HistoryService {
         })
     }
 
+    pub fn set_workspace_path(&mut self, workspace_path: &str) -> Result<(), String> {
+        let history_dir = Path::new(workspace_path)
+            .join(".whizcode")
+            .join("history");
+
+        fs::create_dir_all(&history_dir)
+            .map_err(|e| format!("Failed to create history directory: {}", e))?;
+
+        self.history_dir = history_dir;
+        let mut threads = self.threads.lock().unwrap();
+        threads.clear();
+
+        Ok(())
+    }
+
     pub fn save_thread(
         &self,
         id: String,

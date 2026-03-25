@@ -50,6 +50,21 @@ const LogContainer = ({ logs }: { logs: string[] }) => {
     );
 };
 
+const isHighRiskPermissionSummary = (summary: string): boolean => {
+    const normalized = summary.toLowerCase();
+    return [
+        'rm -rf',
+        'remove-item -recurse -force',
+        'git reset --hard',
+        'git checkout --',
+        'del /f',
+        'rmdir /s',
+        'format ',
+        'drop database',
+        'truncate table',
+    ].some(pattern => normalized.includes(pattern));
+};
+
 // Smart summary formatter — turns raw "Executed X with args: {...}" into readable text
 const formatStepSummary = (tool: string, summary: string): string => {
     // Try to extract args JSON from the summary
@@ -652,15 +667,17 @@ export const ChatPanel = ({
     const pendingPermissionStepIdx = agentSteps.findIndex((s, i) => 
         s.status === 'awaiting_permission' && !respondedSteps[i]
     );
+    const pendingPermissionStep = pendingPermissionStepIdx >= 0 ? agentSteps[pendingPermissionStepIdx] : null;
+    const isHighRiskPermission = pendingPermissionStep ? isHighRiskPermissionSummary(pendingPermissionStep.summary) : false;
 
     // Handle auto-run logic
     React.useEffect(() => {
-        if (alwaysRun && pendingPermissionStepIdx >= 0 && !respondedSteps[pendingPermissionStepIdx] && countdown === null) {
+        if (alwaysRun && !isHighRiskPermission && pendingPermissionStepIdx >= 0 && !respondedSteps[pendingPermissionStepIdx] && countdown === null) {
             setCountdown(3); // 3 second countdown
-        } else if (!alwaysRun || pendingPermissionStepIdx < 0) {
+        } else if (!alwaysRun || isHighRiskPermission || pendingPermissionStepIdx < 0) {
             setCountdown(null);
         }
-    }, [alwaysRun, pendingPermissionStepIdx, respondedSteps]);
+    }, [alwaysRun, isHighRiskPermission, pendingPermissionStepIdx, respondedSteps]);
 
     React.useEffect(() => {
         if (countdown !== null && countdown > 0) {
@@ -673,18 +690,29 @@ export const ChatPanel = ({
 
     const getCurrentThought = (content: string) => {
         if (!content) return null;
-        
-        // Extract thought from JSON format: {"thought": "...", ...}
-        // Look for the "thought" key in JSON
-        const jsonThoughtRegex = /"thought"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/;
-        const match = content.match(jsonThoughtRegex);
-        
-        if (match && match[1]) {
-            const thought = match[1]
+        const sanitizeThought = (value: string) =>
+            value
                 .replace(/\\"/g, '"')
                 .replace(/\\\\/g, '\\')
+                .replace(/",?\s*"tool"\s*:\s*[^]*$/, '')
+                .replace(/\}\s*$/, '')
+                .replace(/^[{\s"]+/, '')
+                .replace(/^thought\b[:\s-]*/i, '')
                 .trim();
+        
+        // Extract thought from JSON format: {"thought": "...", ...}
+        const completeThoughtRegex = /"thought"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/;
+        const partialThoughtRegex = /"thought"\s*:\s*"([^]*)$/;
+        const match = content.match(completeThoughtRegex) || content.match(partialThoughtRegex);
+        
+        if (match && match[1]) {
+            const thought = sanitizeThought(match[1]);
             return thought.length > 150 ? '...' + thought.slice(-150) : thought;
+        }
+
+        const fallback = sanitizeThought(content);
+        if (fallback && fallback !== content.trim()) {
+            return fallback.length > 150 ? '...' + fallback.slice(-150) : fallback;
         }
         
         return null;
@@ -891,6 +919,19 @@ export const ChatPanel = ({
                                     }}>
                                         {agentSteps[pendingPermissionStepIdx].summary}
                                     </div>
+                                    {isHighRiskPermission && (
+                                        <div style={{
+                                            marginTop: '8px',
+                                            fontSize: '11px',
+                                            color: '#f9e2af',
+                                            background: 'rgba(249, 226, 175, 0.08)',
+                                            border: '1px solid rgba(249, 226, 175, 0.2)',
+                                            padding: '6px',
+                                            borderRadius: '4px'
+                                        }}>
+                                            High-risk command detected. Auto-run is disabled for this step.
+                                        </div>
+                                    )}
                                 </div>
                             </div>
 
@@ -900,9 +941,12 @@ export const ChatPanel = ({
                                         type="checkbox"
                                         checked={alwaysRun}
                                         onChange={(e) => setAlwaysRun(e.target.checked)}
+                                        disabled={isHighRiskPermission}
                                         style={{ accentColor: 'var(--accent-primary)' }}
                                     />
-                                    <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>Always run in this interaction</span>
+                                    <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                                        {isHighRiskPermission ? 'Always run disabled for high-risk commands' : 'Always run in this interaction'}
+                                    </span>
                                 </label>
 
                                 <div style={{ display: 'flex', gap: '8px' }}>

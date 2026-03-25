@@ -44,6 +44,59 @@ export interface WorkspaceInfo {
   path: string
 }
 
+export interface HistoryThread {
+  id: string
+  title: string
+  messages: any[]
+  created_at: number
+  updated_at: number
+}
+
+export interface HistoryThreadMetadata {
+  id: string
+  title: string
+  created_at: number
+  updated_at: number
+  message_count: number
+}
+
+export interface GitReviewFinding {
+  file: string
+  severity: string
+  line: number
+  message: string
+  suggestion?: string
+}
+
+export interface GitReviewReport {
+  branch: string
+  files_reviewed: number
+  findings: GitReviewFinding[]
+}
+
+export interface RecoveryResult {
+  recovered: boolean
+  message: string
+  suggested_action?: string
+  fallback_recommendations: string[]
+}
+
+export interface SubAgentWorkItem {
+  agent_name: string
+  task: string
+  owner?: string | null
+  owned_paths?: string[]
+}
+
+export interface ContextMemorySnapshot {
+  patterns: any[]
+  preferences: any[]
+  error_patterns: any[]
+  strategies: any[]
+  projects: any[]
+  stats: any
+}
+
 // Error handling
 export class TauriError extends Error {
   code: string
@@ -371,9 +424,9 @@ export const workspace = {
 
 // Event Listeners
 export const events = {
-  async onFileChanged(callback: (data: { path: string; content?: string }) => void): Promise<() => void> {
+  async onFileChanged(callback: (data: { path: string; kind?: string; old_path?: string; content?: string }) => void): Promise<() => void> {
     const unlisten = await listen('file:changed', (event) => {
-      callback(event.payload as { path: string; content?: string })
+      callback(event.payload as { path: string; kind?: string; old_path?: string; content?: string })
     })
     return unlisten
   },
@@ -466,6 +519,30 @@ export const git = {
       throw handleError(error)
     }
   },
+
+  async stageFile(workspacePath: string, file: string): Promise<any> {
+    try {
+      return await invoke('git_stage', { path: workspacePath, file })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async commit(workspacePath: string, message: string): Promise<any> {
+    try {
+      return await invoke('git_commit', { path: workspacePath, message })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async reviewWorkingTree(workspacePath: string): Promise<GitReviewReport> {
+    try {
+      return await invoke('git_review', { path: workspacePath })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
 }
 
 // Dialog Commands
@@ -478,6 +555,40 @@ export const dialog = {
       } else {
         return { canceled: true, filePaths: [] }
       }
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+}
+
+export const history = {
+  async save(id: string, title: string, messages: any[]): Promise<string> {
+    try {
+      return await invoke('history_save', { id, title, messages })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async list(): Promise<HistoryThreadMetadata[]> {
+    try {
+      return await invoke('history_list')
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async get(id: string): Promise<HistoryThread> {
+    try {
+      return await invoke('history_get', { id })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async update(id: string, title?: string, messages?: any[]): Promise<void> {
+    try {
+      return await invoke('history_update', { id, title: title ?? null, messages: messages ?? null })
     } catch (error) {
       throw handleError(error)
     }
@@ -698,6 +809,18 @@ export const cache = {
 
 // Error Recovery Commands
 export const errorRecovery = {
+  async handle(error: string, tool: string, workspacePath?: string): Promise<RecoveryResult> {
+    try {
+      return await invoke('error_recovery_handle', {
+        error,
+        tool,
+        workspacePath: workspacePath ?? null,
+      })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
   async getStatistics(): Promise<any> {
     try {
       return await invoke('error_recovery_get_statistics')
@@ -768,6 +891,14 @@ export const subAgents = {
   async invoke(agentName: string, taskDescription: string): Promise<string> {
     try {
       return await invoke('invoke_sub_agent', { agentName, taskDescription })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async orchestrate(workItems: SubAgentWorkItem[]): Promise<any> {
+    try {
+      return await invoke('orchestrate_sub_agents', { workItems })
     } catch (error) {
       throw handleError(error)
     }
@@ -872,6 +1003,30 @@ export const contextMemory = {
       throw handleError(error)
     }
   },
+
+  async getSnapshot(): Promise<ContextMemorySnapshot> {
+    try {
+      return await invoke('context_memory_get_snapshot')
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async deletePreference(key: string): Promise<boolean> {
+    try {
+      return await invoke('context_memory_delete_preference', { key })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async deleteProject(workspacePath: string): Promise<boolean> {
+    try {
+      return await invoke('context_memory_delete_project', { workspacePath })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
 }
 
 export const hooks = {
@@ -960,6 +1115,38 @@ export const codeIntelligence = {
   async findRelatedSymbols(workspacePath: string, symbolName: string): Promise<any[]> {
     try {
       return await invoke('code_intelligence_find_related_symbols', { workspacePath, symbolName })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async getAllSymbols(workspacePath: string): Promise<any[]> {
+    try {
+      return await invoke('code_intelligence_get_all_symbols', { workspacePath })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async getRelationships(workspacePath: string): Promise<any[]> {
+    try {
+      return await invoke('code_intelligence_get_all_relationships', { workspacePath })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async getPatterns(workspacePath: string): Promise<any[]> {
+    try {
+      return await invoke('code_intelligence_get_all_patterns', { workspacePath })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
+  async impactAnalysis(workspacePath: string, symbolId: string): Promise<Record<string, string[]>> {
+    try {
+      return await invoke('code_intelligence_impact_analysis', { workspacePath, symbolId })
     } catch (error) {
       throw handleError(error)
     }
@@ -1108,6 +1295,7 @@ export default {
   diagnostics,
   git,
   dialog,
+  history,
   agent,
   ollama,
   azure,

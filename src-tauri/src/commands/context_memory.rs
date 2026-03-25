@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::Result;
+use tauri::State;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodePattern {
@@ -68,6 +69,16 @@ pub struct ContextMemoryStats {
     pub most_used_language: Option<String>,
     pub most_common_error: Option<String>,
     pub best_strategy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextMemorySnapshot {
+    pub patterns: Vec<CodePattern>,
+    pub preferences: Vec<UserPreference>,
+    pub error_patterns: Vec<ErrorPattern>,
+    pub strategies: Vec<SuccessfulStrategy>,
+    pub projects: Vec<ProjectContext>,
+    pub stats: ContextMemoryStats,
 }
 
 pub struct ContextMemory {
@@ -340,19 +351,39 @@ impl ContextMemory {
         let mut errors = self.error_patterns.lock().unwrap();
         errors.retain(|e| e.last_seen > cutoff_time);
     }
+
+    pub fn remove_user_preference(&self, key: &str) -> bool {
+        let mut preferences = self.user_preferences.lock().unwrap();
+        preferences.remove(key).is_some()
+    }
+
+    pub fn remove_project_context(&self, workspace_path: &str) -> bool {
+        let mut projects = self.project_contexts.lock().unwrap();
+        projects.remove(workspace_path).is_some()
+    }
+
+    pub fn snapshot(&self) -> ContextMemorySnapshot {
+        ContextMemorySnapshot {
+            patterns: self.code_patterns.lock().unwrap().clone(),
+            preferences: self.get_all_preferences(),
+            error_patterns: self.get_all_error_patterns(),
+            strategies: self.get_all_strategies(),
+            projects: self.get_all_project_contexts(),
+            stats: self.get_statistics(),
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn context_memory_record_pattern(
     pattern: String,
-    _context: String,
+    context: String,
     language: String,
     project_type: String,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
 ) -> Result<()> {
-    eprintln!(
-        "Recording code pattern: {} in {} ({})",
-        pattern, language, project_type
-    );
+    let memory = state.lock().unwrap();
+    memory.record_code_pattern(pattern, context, language, project_type);
     Ok(())
 }
 
@@ -360,12 +391,10 @@ pub async fn context_memory_record_pattern(
 pub async fn context_memory_get_patterns(
     context: String,
     language: Option<String>,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
 ) -> Result<Vec<CodePattern>> {
-    eprintln!(
-        "Getting patterns for context: {} (language: {:?})",
-        context, language
-    );
-    Ok(vec![])
+    let memory = state.lock().unwrap();
+    Ok(memory.get_relevant_code_patterns(&context, language.as_deref()))
 }
 
 #[tauri::command]
@@ -373,74 +402,89 @@ pub async fn context_memory_record_preference(
     key: String,
     value: serde_json::Value,
     confidence: f32,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
 ) -> Result<()> {
-    eprintln!("Recording user preference: {} = {:?} (confidence: {})", key, value, confidence);
+    let memory = state.lock().unwrap();
+    memory.record_user_preference(key, value, confidence);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn context_memory_get_preference(key: String) -> Result<Option<serde_json::Value>> {
-    eprintln!("Getting user preference: {}", key);
-    Ok(None)
+pub async fn context_memory_get_preference(
+    key: String,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Option<serde_json::Value>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_user_preference(&key))
 }
 
 #[tauri::command]
-pub async fn context_memory_get_all_preferences() -> Result<Vec<UserPreference>> {
-    eprintln!("Getting all user preferences");
-    Ok(vec![])
+pub async fn context_memory_get_all_preferences(
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Vec<UserPreference>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_all_preferences())
 }
 
 #[tauri::command]
 pub async fn context_memory_record_error(
     error_type: String,
-    _context: String,
-    _solution: String,
+    context: String,
+    solution: String,
     success: bool,
     resolution_time: f32,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
 ) -> Result<()> {
-    eprintln!(
-        "Recording error pattern: {} (success={}, resolution_time={}s)",
-        error_type, success, resolution_time
-    );
+    let memory = state.lock().unwrap();
+    memory.record_error_pattern(error_type, context, solution, success, resolution_time);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn context_memory_get_similar_errors(error_type: String) -> Result<Vec<ErrorPattern>> {
-    eprintln!("Getting similar error patterns for: {}", error_type);
-    Ok(vec![])
+pub async fn context_memory_get_similar_errors(
+    error_type: String,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Vec<ErrorPattern>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_similar_error_patterns(&error_type))
 }
 
 #[tauri::command]
-pub async fn context_memory_get_all_errors() -> Result<Vec<ErrorPattern>> {
-    eprintln!("Getting all error patterns");
-    Ok(vec![])
+pub async fn context_memory_get_all_errors(
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Vec<ErrorPattern>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_all_error_patterns())
 }
 
 #[tauri::command]
 pub async fn context_memory_record_strategy(
     task_type: String,
     strategy: String,
-    _tools: Vec<String>,
+    tools: Vec<String>,
     duration: f32,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
 ) -> Result<()> {
-    eprintln!(
-        "Recording successful strategy: {} for task type {} (duration: {}s)",
-        strategy, task_type, duration
-    );
+    let memory = state.lock().unwrap();
+    memory.record_successful_strategy(task_type, strategy, tools, duration);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn context_memory_get_best_strategies(task_type: String) -> Result<Vec<SuccessfulStrategy>> {
-    eprintln!("Getting best strategies for task type: {}", task_type);
-    Ok(vec![])
+pub async fn context_memory_get_best_strategies(
+    task_type: String,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Vec<SuccessfulStrategy>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_best_strategies(&task_type))
 }
 
 #[tauri::command]
-pub async fn context_memory_get_all_strategies() -> Result<Vec<SuccessfulStrategy>> {
-    eprintln!("Getting all strategies");
-    Ok(vec![])
+pub async fn context_memory_get_all_strategies(
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Vec<SuccessfulStrategy>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_all_strategies())
 }
 
 #[tauri::command]
@@ -448,45 +492,79 @@ pub async fn context_memory_record_project(
     workspace_path: String,
     project_type: String,
     languages: Vec<String>,
-    _frameworks: Vec<String>,
-    _common_files: Vec<String>,
+    frameworks: Vec<String>,
+    common_files: Vec<String>,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
 ) -> Result<()> {
-    eprintln!(
-        "Recording project context: {} (type: {}, languages: {:?})",
-        workspace_path, project_type, languages
-    );
+    let memory = state.lock().unwrap();
+    memory.record_project_context(ProjectContext {
+        workspace_path,
+        project_type,
+        languages,
+        frameworks,
+        common_files,
+        last_analyzed: ContextMemory::current_timestamp(),
+    });
     Ok(())
 }
 
 #[tauri::command]
-pub async fn context_memory_get_project(workspace_path: String) -> Result<Option<ProjectContext>> {
-    eprintln!("Getting project context for: {}", workspace_path);
-    Ok(None)
+pub async fn context_memory_get_project(
+    workspace_path: String,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Option<ProjectContext>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_project_context(&workspace_path))
 }
 
 #[tauri::command]
-pub async fn context_memory_get_all_projects() -> Result<Vec<ProjectContext>> {
-    eprintln!("Getting all project contexts");
-    Ok(vec![])
+pub async fn context_memory_get_all_projects(
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<Vec<ProjectContext>> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_all_project_contexts())
 }
 
 #[tauri::command]
-pub async fn context_memory_get_statistics() -> Result<ContextMemoryStats> {
-    eprintln!("Getting context memory statistics");
-    Ok(ContextMemoryStats {
-        total_patterns: 0,
-        total_preferences: 0,
-        total_error_patterns: 0,
-        total_strategies: 0,
-        total_projects: 0,
-        most_used_language: None,
-        most_common_error: None,
-        best_strategy: None,
-    })
+pub async fn context_memory_get_statistics(
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<ContextMemoryStats> {
+    let memory = state.lock().unwrap();
+    Ok(memory.get_statistics())
 }
 
 #[tauri::command]
-pub async fn context_memory_clear_old_data(days_old: u64) -> Result<()> {
-    eprintln!("Clearing context memory data older than {} days", days_old);
+pub async fn context_memory_clear_old_data(
+    days_old: u64,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<()> {
+    let memory = state.lock().unwrap();
+    memory.clear_old_data(days_old);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn context_memory_get_snapshot(
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<ContextMemorySnapshot> {
+    let memory = state.lock().unwrap();
+    Ok(memory.snapshot())
+}
+
+#[tauri::command]
+pub async fn context_memory_delete_preference(
+    key: String,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<bool> {
+    let memory = state.lock().unwrap();
+    Ok(memory.remove_user_preference(&key))
+}
+
+#[tauri::command]
+pub async fn context_memory_delete_project(
+    workspace_path: String,
+    state: State<'_, Arc<Mutex<ContextMemory>>>,
+) -> Result<bool> {
+    let memory = state.lock().unwrap();
+    Ok(memory.remove_project_context(&workspace_path))
 }

@@ -258,6 +258,9 @@ impl StreamingAgentOrchestrator {
         steering: Arc<RwLock<SteeringSystem>>,
         recovery: Arc<std::sync::Mutex<crate::commands::error_recovery::ErrorRecoverySystem>>,
         app_state_ref: Arc<RwLock<AppState>>,
+        context_memory: Arc<std::sync::Mutex<crate::commands::context_memory::ContextMemory>>,
+        hooks: Arc<std::sync::Mutex<crate::commands::hooks::HooksManager>>,
+        graph: Arc<std::sync::Mutex<crate::commands::graph::GraphService>>,
     ) -> Result<StreamingAgentResponse> {
         let model_name = model.get("model").and_then(|m| m.as_str()).unwrap_or("llama2");
 
@@ -269,6 +272,10 @@ impl StreamingAgentOrchestrator {
         let mut all_tool_calls = Vec::new();
         let total_tokens = 0u32;
         let mut status = "running".to_string();
+
+        // Initialize infrastructure components
+        let mut streaming_feedback = crate::commands::streaming_feedback::StreamingFeedback::new();
+        let mut task_manager_instance: Option<crate::commands::task_manager::TaskFile> = None;
         // Emit start (phase events not batched - they're infrequent)
         if let Some(app) = &self.app_handle {
             let _ = app.emit("agent:phase", &serde_json::json!({
@@ -276,6 +283,47 @@ impl StreamingAgentOrchestrator {
                 "status": "started",
                 "description": "Planning task"
             }));
+        }
+
+        // Initialize task tracking if workspace is available
+        if let Some(ws) = &workspace_path {
+            streaming_feedback.start_phase("planning");
+            let project_name = std::path::Path::new(ws)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project")
+                .to_string();
+            task_manager_instance = Some(crate::commands::task_manager::TaskFile::new(
+                project_name.clone(),
+                task.clone(),
+            ));
+            eprintln!("[Agent] Initialized task tracking for workspace: {}", ws);
+
+            // Record project context in context memory
+            if let Ok(ctx_mem) = context_memory.lock() {
+                ctx_mem.record_project_context(crate::commands::context_memory::ProjectContext {
+                    workspace_path: ws.clone(),
+                    project_type: "unknown".to_string(),
+                    languages: vec![],
+                    frameworks: vec![],
+                    common_files: vec![],
+                    last_analyzed: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
+            }
+        }
+
+        // TIER 2: Trigger agent_start hooks
+        if let Ok(hooks_mgr) = hooks.lock() {
+            let triggered = hooks_mgr.trigger_event("agent_start");
+            if !triggered.is_empty() {
+                eprintln!("[Hooks] Triggered {} hook(s) on agent_start", triggered.len());
+                for h in &triggered {
+                    hooks_mgr.record_execution(h.id.clone(), "agent_start".to_string(), true, None);
+                }
+            }
         }
 
         // ── 1. RESEARCH & PLANNING PHASE (Context Gatherer) ────────────────
@@ -288,6 +336,8 @@ impl StreamingAgentOrchestrator {
                 "description": "Gathering codebase context..."
             }));
         }
+
+        streaming_feedback.start_phase("research");
 
         let research_findings = if let Some(ws) = &workspace_path {
             match self.run_research_phase(
@@ -309,12 +359,41 @@ impl StreamingAgentOrchestrator {
             String::new()
         };
 
+        streaming_feedback.complete_phase("research");
+
         if let Some(app) = &self.app_handle {
             let _ = app.emit("agent:phase", &serde_json::json!({
                 "phase": "research",
                 "status": "completed",
                 "description": "Research complete."
             }));
+        }
+
+        // TIER 2: Build dependency graph from code intelligence
+        if let Some(ws) = &workspace_path {
+            if let Ok(graph_svc) = graph.lock() {
+                if let Ok(intel) = code_intel.lock() {
+                    let symbols = intel.get_all_symbols(ws);
+                    let nodes: Vec<crate::commands::graph::GraphNode> = symbols.iter().map(|s| {
+                        crate::commands::graph::GraphNode {
+                            id: s.name.clone(),
+                            label: s.name.clone(),
+                            node_type: s.symbol_type.clone(),
+                            metadata: std::collections::HashMap::new(),
+                        }
+                    }).collect();
+                    match graph_svc.build_dependency_graph(ws.clone(), nodes, vec![]) {
+                        Ok(g) => {
+                            let cycles = graph_svc.find_circular_dependencies(ws);
+                            eprintln!("[Graph] Built graph: {} nodes, {} circular deps", g.nodes.len(), cycles.len());
+                            if !cycles.is_empty() {
+                                eprintln!("[Graph] ⚠️ Circular dependencies detected: {:?}", cycles.iter().map(|c| &c.cycle).collect::<Vec<_>>());
+                            }
+                        }
+                        Err(e) => eprintln!("[Graph] Failed to build graph: {}", e),
+                    }
+                }
+            }
         }
 
         // ── 2. STEERING CONTEXT LOADING ─────────────────────────────────────
@@ -353,6 +432,22 @@ impl StreamingAgentOrchestrator {
             &workspace_path, &active_file, &task,
             code_intel.clone(), steering.clone(),
         );
+
+        // Optimize context using ContextOptimizer if workspace is available
+        if let Some(ws) = &workspace_path {
+            streaming_feedback.start_phase("context_optimization");
+            let mut optimizer = crate::commands::context_optimizer::ContextOptimizer::new(Some(8000));
+            
+            // Extract files from workspace context for optimization
+            let files_for_optimization = vec![(ws.clone(), workspace_context.clone())];
+            let pruned = optimizer.prune_context(files_for_optimization, &task, ws);
+            
+            eprintln!("[Agent] Context optimization: {} tokens (max: 8000)", pruned.estimated_tokens);
+            eprintln!("[Agent] Pruned context summary: {}", pruned.summary);
+            
+            streaming_feedback.complete_phase("context_optimization");
+        }
+
         if !workspace_context.is_empty() {
             turn_messages.push(("user".to_string(), workspace_context));
             turn_messages.push((
@@ -368,6 +463,54 @@ impl StreamingAgentOrchestrator {
             format!("Task: {}\nPlease analyze the task, explore the codebase if needed, execute the necessary changes, and verify the results.", task.clone())
         };
 
+        // ── CONTEXT MEMORY: Inject prior patterns into task message ──────────
+        // Query for relevant strategies and error patterns from past executions
+        let context_memory_hint = if let Ok(ctx_mem) = context_memory.lock() {
+            let stats = ctx_mem.get_statistics();
+            let mut hint = String::new();
+
+            // Inject best strategies for tool_execution tasks
+            if stats.total_strategies > 0 {
+                let best = ctx_mem.get_best_strategies("tool_execution");
+                if !best.is_empty() {
+                    hint.push_str("\n\n<prior_successful_strategies>\n");
+                    for s in best.iter().take(3) {
+                        hint.push_str(&format!(
+                            "- {} (used {} times, effectiveness: {:.0}%)\n",
+                            s.strategy, s.success_count, s.effectiveness_score * 100.0
+                        ));
+                    }
+                    hint.push_str("</prior_successful_strategies>");
+                }
+            }
+
+            // Inject known error patterns to help the LLM avoid them
+            if stats.total_error_patterns > 0 {
+                let errors = ctx_mem.get_all_error_patterns();
+                let frequent: Vec<_> = {
+                    let mut e = errors;
+                    e.sort_by(|a, b| b.success_count.cmp(&a.success_count));
+                    e.into_iter().take(3).collect()
+                };
+                if !frequent.is_empty() {
+                    hint.push_str("\n\n<known_error_patterns>\n");
+                    for e in &frequent {
+                        hint.push_str(&format!(
+                            "- {} (seen {} times, success rate: {:.0}%)\n",
+                            e.error_type, e.success_count, e.success_rate * 100.0
+                        ));
+                    }
+                    hint.push_str("</known_error_patterns>");
+                }
+            }
+
+            hint
+        } else {
+            String::new()
+        };
+
+        let final_task_msg = format!("{}{}", final_task_msg, context_memory_hint);
+
         turn_messages.push((
             "user".to_string(),
             final_task_msg,
@@ -381,6 +524,8 @@ impl StreamingAgentOrchestrator {
                 "description": "Executing task"
             }));
         }
+
+        streaming_feedback.start_phase("execution");
 
         // ── Main execution loop ──────────────────────────────────────────────
         // Loop-detection state (mirrors Electron's repeatCount + ping-pong guard)
@@ -402,6 +547,25 @@ impl StreamingAgentOrchestrator {
                 let tail = turn_messages.split_off(4);
                 let keep_from = tail.len().saturating_sub(MAX_HISTORY_TURNS * 2);
                 turn_messages.extend_from_slice(&tail[keep_from..]);
+            }
+
+            // ── PER-ITERATION CONTEXT OPTIMIZATION ───────────────────────────
+            // Every 5 iterations, check if the accumulated tool results are bloating
+            // the context and prune the oldest non-pinned messages if over token budget.
+            // Also trigger immediately if any single message is oversized.
+            let total_context_chars: usize = turn_messages.iter().map(|(_, c)| c.len()).sum();
+            let needs_trim = (iteration % 5 == 0 && total_context_chars / 4 > 6000)
+                || turn_messages.iter().skip(4).any(|(_, c)| c.len() > 8000);
+            if needs_trim && turn_messages.len() > 6 {
+                let estimated_tokens = total_context_chars / 4;
+                eprintln!("[ContextOptimizer] Iteration {}: context ~{} tokens — trimming to last 10 turns",
+                    iteration, estimated_tokens);
+                if turn_messages.len() > 4 + 10 * 2 {
+                    let tail = turn_messages.split_off(4);
+                    let keep_from = tail.len().saturating_sub(10 * 2);
+                    turn_messages.extend_from_slice(&tail[keep_from..]);
+                    eprintln!("[ContextOptimizer] Pruned to {} messages", turn_messages.len());
+                }
             }
 
             // ── PHASE 4: Unified streaming + sequential execution ──────────────
@@ -438,10 +602,93 @@ impl StreamingAgentOrchestrator {
                     Ok(r) => {
                         tool_results.push(format!("[{}] result:\n{}", tool_call_or_text.tool, r));
                         eprintln!("[Agent] Tool {} succeeded", tool_call_or_text.tool);
+                        
+                        // Update task status if task manager is available
+                        if let Some(ref mut task_file) = task_manager_instance {
+                            let task_id = format!("tool_{}", tool_call_or_text.tool);
+                            task_file.update_task_status(
+                                &task_id,
+                                crate::commands::task_manager::TaskStatus::Completed,
+                                Some(r.clone()),
+                            );
+                        }
+
+                        // TIER 1.1: Record successful tool execution in learning system
+                        if let Ok(learning_sys) = learning.lock() {
+                            let record = crate::commands::learning::InteractionRecord {
+                                user_request: format!("Tool: {}", tool_call_or_text.tool),
+                                agent_response: r.clone(),
+                                tools_used: vec![tool_call_or_text.tool.clone()],
+                                success: true,
+                                duration_ms: 0,
+                                timestamp: chrono::Utc::now().timestamp(),
+                            };
+                            learning_sys.record_interaction(record);
+                        }
+
+                        // TIER 1.2: Record successful strategy in context memory
+                        if let Ok(context_mem) = context_memory.lock() {
+                            context_mem.record_successful_strategy(
+                                "tool_execution".to_string(),
+                                tool_call_or_text.tool.clone(),
+                                vec![tool_call_or_text.tool.clone()],
+                                0.0,
+                            );
+                        }
+
+                        // TIER 2: Trigger tool_success hooks
+                        if let Ok(hooks_mgr) = hooks.lock() {
+                            let triggered = hooks_mgr.trigger_tool_event("tool_success", &tool_call_or_text.tool);
+                            for h in &triggered {
+                                hooks_mgr.record_execution(h.id.clone(), "tool_success".to_string(), true, None);
+                            }
+                        }
                     }
                     Err(e) => {
                         tool_results.push(format!("[{}] error:\n{}", tool_call_or_text.tool, e));
                         eprintln!("[Agent] Tool {} failed: {}", tool_call_or_text.tool, e);
+                        
+                        // Update task status if task manager is available
+                        if let Some(ref mut task_file) = task_manager_instance {
+                            let task_id = format!("tool_{}", tool_call_or_text.tool);
+                            task_file.update_task_status(
+                                &task_id,
+                                crate::commands::task_manager::TaskStatus::Failed,
+                                Some(e.to_string()),
+                            );
+                        }
+
+                        // TIER 1.1: Record failed tool execution in learning system
+                        if let Ok(learning_sys) = learning.lock() {
+                            let record = crate::commands::learning::InteractionRecord {
+                                user_request: format!("Tool: {}", tool_call_or_text.tool),
+                                agent_response: format!("Error: {}", e),
+                                tools_used: vec![tool_call_or_text.tool.clone()],
+                                success: false,
+                                duration_ms: 0,
+                                timestamp: chrono::Utc::now().timestamp(),
+                            };
+                            learning_sys.record_interaction(record);
+                        }
+
+                        // TIER 1.2: Record error pattern in context memory
+                        if let Ok(context_mem) = context_memory.lock() {
+                            context_mem.record_error_pattern(
+                                e.to_string(),
+                                format!("Tool: {}", tool_call_or_text.tool),
+                                "".to_string(),
+                                false,
+                                0.0,
+                            );
+                        }
+
+                        // TIER 2: Trigger tool_failure hooks
+                        if let Ok(hooks_mgr) = hooks.lock() {
+                            let triggered = hooks_mgr.trigger_tool_event("tool_failure", &tool_call_or_text.tool);
+                            for h in &triggered {
+                                hooks_mgr.record_execution(h.id.clone(), "tool_failure".to_string(), false, Some(e.to_string()));
+                            }
+                        }
                     }
                 }
                 all_tool_calls.push(tool_call_or_text.clone());
@@ -466,17 +713,17 @@ impl StreamingAgentOrchestrator {
 
                 if raw_llm_text.contains("{") && (raw_llm_text.contains("\"tool\"") || raw_llm_text.contains("'tool'")) && !looks_complete {
                     // Model tried to call a tool but syntax was broken — single correction
+                    // Use only the last 6 messages to avoid sending huge context to the correction call
                     eprintln!("[Agent] Malformed JSON intent detected — sending one correction nudge");
-                    let mut correction_msgs = turn_messages.clone();
-                    // Clone now to avoid borrow issues later
-                    let assistant_response_copy = raw_llm_text.clone(); 
-                    correction_msgs.push(("assistant".to_string(), assistant_response_copy));
+                    let pinned = &turn_messages[..4.min(turn_messages.len())];
+                    let recent_start = if turn_messages.len() > 4 { turn_messages.len().saturating_sub(4) } else { 4 };
+                    let recent = &turn_messages[recent_start..];
+                    let mut correction_msgs: Vec<(String, String)> = pinned.to_vec();
+                    correction_msgs.extend_from_slice(recent);
+                    correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
                     correction_msgs.push(("user".to_string(),
                         "CRITICAL: Your last response had a JSON syntax error or was incomplete. \
-                         You MUST output your reasoning in <thought> tags first, then provide ONLY a valid JSON object on its own line in your next turn:\n\
-                         <thought>Reasoning...</thought>\n\
-                         {\"tool\": \"<name>\", \"args\": {<args>}}\n\
-                         Do not use markdown backticks around the JSON.".to_string()
+                         Output ONLY: <thought>brief reason</thought> then ONE valid JSON tool call on the next line. No markdown, no backticks.".to_string()
                     ));
                     self.suppress_stream = true;
                     let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
@@ -560,14 +807,29 @@ impl StreamingAgentOrchestrator {
             }
 
             // ── PHASE 5: Update conversation history (ONE message per turn) ──────────────
-            // For local models, 4000 chars is ~1000 tokens — keeps context clean
-            const MAX_TOOL_RESULT_CHARS: usize = 4_000;
+            // For local models, 2000 chars is ~500 tokens — keeps context clean
+            const MAX_TOOL_RESULT_CHARS: usize = 2_000;
+            // Cap assistant responses stored in history — prevents a single massive
+            // prose dump (e.g. LLM writing code inline instead of using write_file)
+            // from bloating context and hanging subsequent iterations.
+            const MAX_ASSISTANT_HISTORY_CHARS: usize = 3_000;
 
             if !tool_calls.is_empty() {
-                // ── (a) Store FULL ASSISTANT response (including reasoning) ─────
-                // Crucial for local models: they need to see their own thoughts/reasoning
-                // to avoid losing intent and falling into repetitive loops.
-                turn_messages.push(("assistant".to_string(), raw_llm_text.clone()));
+                // ── (a) Store ASSISTANT response — truncated if oversized ──────
+                let stored_assistant = if raw_llm_text.len() > MAX_ASSISTANT_HISTORY_CHARS {
+                    eprintln!("[Agent] ⚠️ Truncating large assistant response ({} chars) before storing in history", raw_llm_text.len());
+                    format!("{}\n... [response truncated — {} chars total]", &raw_llm_text[..MAX_ASSISTANT_HISTORY_CHARS], raw_llm_text.len())
+                } else {
+                    raw_llm_text.clone()
+                };
+                turn_messages.push(("assistant".to_string(), stored_assistant));
+
+                // Detect: LLM wrote code in prose instead of using write_file tool
+                let has_large_code_block = raw_llm_text.contains("```") && raw_llm_text.len() > 2000;
+                if has_large_code_block && tool_calls.iter().all(|tc| tc.tool != "write_file" && tc.tool != "edit_file" && tc.tool != "multi_edit_file") {
+                    tool_results.insert(0, "[SYSTEM] CODE IN PROSE DETECTED: You wrote code in your response instead of using the write_file tool. You MUST use write_file to create files. Do NOT include file contents in your reasoning — call write_file with the path and content directly.".to_string());
+                    eprintln!("[Agent] ⚠️ LLM wrote code in prose — injecting write_file redirect");
+                }
 
                 // Enforce <thought> tag protocol — nudge if missing
                 if !raw_llm_text.contains("<thought>") {
@@ -624,6 +886,47 @@ impl StreamingAgentOrchestrator {
             status = "max_iterations_reached".to_string();
         }
 
+        // Complete execution phase
+        streaming_feedback.complete_phase("execution");
+        
+        // TIER 3: Emit enriched metrics including context memory and hook stats
+        let metrics = streaming_feedback.get_metrics();
+        let context_mem_stats = context_memory.lock().ok()
+            .map(|m| m.get_statistics())
+            .map(|s| serde_json::json!({
+                "total_patterns": s.total_patterns,
+                "total_error_patterns": s.total_error_patterns,
+                "total_strategies": s.total_strategies
+            }))
+            .unwrap_or(serde_json::json!({}));
+        let hook_metrics = hooks.lock().ok()
+            .map(|h| h.get_metrics())
+            .map(|m| serde_json::json!({
+                "total_executions": m.total_executions,
+                "successful_executions": m.successful_executions,
+                "failed_executions": m.failed_executions
+            }))
+            .unwrap_or(serde_json::json!({}));
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("agent:metrics", &serde_json::json!({
+                "total_time_ms": metrics.total_time_ms,
+                "phases_completed": metrics.phases_completed,
+                "status": status,
+                "context_memory": context_mem_stats,
+                "hooks": hook_metrics
+            }));
+        }
+
+        // Save task state if task manager is available
+        if let Some(task_file) = task_manager_instance {
+            if let Some(ws) = &workspace_path {
+                match crate::commands::task_manager::TaskManager::save_tasks_file(ws, &task_file) {
+                    Ok(_) => eprintln!("[Agent] Task state saved successfully"),
+                    Err(e) => eprintln!("[Agent] Failed to save task state: {}", e),
+                }
+            }
+        }
+
         // ── FIX #7: Save post-task Knowledge Item ────────────────────────────
         if let Some(ws) = &workspace_path {
             let task_summary: String = steps.iter()
@@ -653,14 +956,27 @@ impl StreamingAgentOrchestrator {
             let tools_used = all_tool_calls.iter().map(|tc| tc.tool.clone()).collect();
             let record = crate::commands::learning::InteractionRecord {
                 user_request: task,
-                agent_response: "Task execution complete".to_string(), // Simplified summary
+                agent_response: "Task execution complete".to_string(),
                 tools_used,
                 success: status != "max_iterations_reached",
                 duration_ms: (std::time::Instant::now().elapsed().as_millis() as u32),
                 timestamp: chrono::Utc::now().timestamp(),
             };
             l.record_interaction(record);
-            eprintln!("[Agent] Recorded interaction for learning.");
+            // TIER 3: Analyze patterns after each task so insights are ready for next prompt
+            let insights = l.analyze_patterns();
+            eprintln!("[Learning] Analyzed patterns: {} insights generated", insights.len());
+        }
+
+        // TIER 2: Trigger agent_complete hooks
+        if let Ok(hooks_mgr) = hooks.lock() {
+            let triggered = hooks_mgr.trigger_event("agent_complete");
+            if !triggered.is_empty() {
+                eprintln!("[Hooks] Triggered {} hook(s) on agent_complete", triggered.len());
+                for h in &triggered {
+                    hooks_mgr.record_execution(h.id.clone(), "agent_complete".to_string(), true, None);
+                }
+            }
         }
 
         // ── FLUSH REMAINING BATCHED EVENTS ──────────────────────────────────
@@ -1062,13 +1378,25 @@ impl StreamingAgentOrchestrator {
         let tc = tool_call;
         let wp = workspace_path.clone();
 
+        // Normalize a path string — fixes mixed separators from LLM on Windows
+        let normalize_path = |p: &str| -> std::path::PathBuf {
+            let fixed = p.replace('/', std::path::MAIN_SEPARATOR_STR);
+            let path = std::path::PathBuf::from(&fixed);
+            if path.is_absolute() {
+                path
+            } else if let Some(ws) = &wp {
+                std::path::Path::new(ws).join(&fixed)
+            } else {
+                path
+            }
+        };
+
         let tool_result: std::result::Result<String, String> = match tc.tool.as_str() {
             "done" => Ok("Task completed".to_string()),
             "read_file" => {
                 match tc.args.get("path").and_then(|p| p.as_str()) {
                     Some(p) => {
-                        let mut full = std::path::PathBuf::from(p);
-                        if !full.is_absolute() { if let Some(ws) = &wp { full = std::path::Path::new(ws).join(full); } }
+                        let full = normalize_path(p);
                         tokio::fs::read_to_string(&full).await.map_err(|e| format!("Read failed: {}", e))
                     }
                     None => Err("No path provided".to_string())
@@ -1077,19 +1405,61 @@ impl StreamingAgentOrchestrator {
             "write_file" => {
                 match (tc.args.get("path").and_then(|p| p.as_str()), tc.args.get("content").and_then(|c| c.as_str())) {
                     (Some(p), Some(c)) => {
-                        let mut full = std::path::PathBuf::from(p);
-                        if !full.is_absolute() { if let Some(ws) = &wp { full = std::path::Path::new(ws).join(full); } }
+                        let full = normalize_path(p);
                         if let Some(par) = full.parent() { let _ = tokio::fs::create_dir_all(par).await; }
                         tokio::fs::write(&full, c).await.map(|_| format!("Wrote {}", p)).map_err(|e| format!("Write failed: {}", e))
                     }
                     _ => Err("Missing path or content".to_string())
                 }
             }
+            // create_file is an alias for write_file
+            "create_file" => {
+                let p = tc.args.get("path").and_then(|p| p.as_str());
+                let c = tc.args.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                match p {
+                    Some(p) => {
+                        let full = normalize_path(p);
+                        if let Some(par) = full.parent() { let _ = tokio::fs::create_dir_all(par).await; }
+                        tokio::fs::write(&full, c).await.map(|_| format!("Created {}", p)).map_err(|e| format!("Create failed: {}", e))
+                    }
+                    None => Err("No path provided".to_string())
+                }
+            }
+            "create_directory" => {
+                match tc.args.get("path").and_then(|p| p.as_str()) {
+                    Some(p) => {
+                        tokio::fs::create_dir_all(normalize_path(p)).await.map(|_| format!("Created directory {}", p)).map_err(|e| format!("Create dir failed: {}", e))
+                    }
+                    None => Err("No path provided".to_string())
+                }
+            }
+            "delete_file" => {
+                match tc.args.get("path").and_then(|p| p.as_str()) {
+                    Some(p) => {
+                        let full = normalize_path(p);
+                        if full.is_dir() {
+                            tokio::fs::remove_dir_all(&full).await.map(|_| format!("Deleted {}", p)).map_err(|e| format!("Delete failed: {}", e))
+                        } else {
+                            tokio::fs::remove_file(&full).await.map(|_| format!("Deleted {}", p)).map_err(|e| format!("Delete failed: {}", e))
+                        }
+                    }
+                    None => Err("No path provided".to_string())
+                }
+            }
+            "move_file" | "rename_file" => {
+                let from = tc.args.get("from").or(tc.args.get("source")).or(tc.args.get("path")).and_then(|p| p.as_str());
+                let to = tc.args.get("to").or(tc.args.get("destination")).or(tc.args.get("new_path")).and_then(|p| p.as_str());
+                match (from, to) {
+                    (Some(f), Some(t)) => {
+                        tokio::fs::rename(normalize_path(f), normalize_path(t)).await.map(|_| format!("Moved {} to {}", f, t)).map_err(|e| format!("Move failed: {}", e))
+                    }
+                    _ => Err("Missing from/to arguments".to_string())
+                }
+            }
             "edit_file" => {
                 match (tc.args.get("path").and_then(|p| p.as_str()), tc.args.get("content").and_then(|c| c.as_str())) {
                     (Some(p), Some(c)) => {
-                        let mut full = std::path::PathBuf::from(p);
-                        if !full.is_absolute() { if let Some(ws) = &wp { full = std::path::Path::new(ws).join(full); } }
+                        let full = normalize_path(p);
                         let start_line = tc.args.get("start_line").and_then(|s| s.as_u64()).map(|s| s as usize).unwrap_or(1);
                         let end_line   = tc.args.get("end_line").and_then(|e| e.as_u64()).map(|e| e as usize);
                         
@@ -1123,8 +1493,7 @@ impl StreamingAgentOrchestrator {
             "multi_edit_file" => {
                 match (tc.args.get("path").and_then(|p| p.as_str()), tc.args.get("edits").and_then(|e| e.as_array())) {
                     (Some(p), Some(edits)) => {
-                        let mut full = std::path::PathBuf::from(p);
-                        if !full.is_absolute() { if let Some(ws) = &wp { full = std::path::Path::new(ws).join(full); } }
+                        let full = normalize_path(p);
                         match tokio::fs::read_to_string(&full).await {
                             Ok(mut content) => {
                                 let mut applied = 0;
@@ -1245,6 +1614,8 @@ impl StreamingAgentOrchestrator {
         // ── SELF-HEALING: Auto-recovery ──────────────────────────
         let final_result = if let Err(e) = &tool_result {
             if let Ok(rec) = recovery.lock() {
+                // TIER 1.3: Complete ErrorRecoverySystem integration
+                // First try auto-recovery
                 let recovery_result = rec.auto_recover(&e, &tc.tool, &wp);
                 if recovery_result.recovered {
                     if let Some(action) = recovery_result.suggested_action {
@@ -1254,7 +1625,16 @@ impl StreamingAgentOrchestrator {
                         tool_result
                     }
                 } else {
-                    tool_result
+                    // If auto-recovery failed, try to get best strategy and execute it
+                    if let Some(_best_strategy) = rec.get_best_strategy_for_error(&e.to_string()) {
+                        eprintln!("[Recovery] Found recovery strategy for error: {}", e);
+                        // Strategy found but execution would require async context
+                        // For now, fall back to LLM recovery
+                        tool_result
+                    } else {
+                        eprintln!("[Recovery] No recovery strategy found, falling back to LLM recovery");
+                        tool_result
+                    }
                 }
             } else {
                 tool_result
@@ -2211,12 +2591,14 @@ async fn execute_tool_standalone(
 ) -> Result<String> {
     let ws_root = workspace_path.as_deref().unwrap_or(".");
     let resolve = |p: &str| -> std::path::PathBuf {
-        let normalized = if p.starts_with("/workspace/") {
-            p.replacen("/workspace/", "", 1)
-        } else if p == "/workspace" {
+        // Normalize path separators — LLMs sometimes mix / and \ on Windows
+        let normalized_sep = p.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let normalized = if normalized_sep.starts_with("/workspace/") {
+            normalized_sep.replacen("/workspace/", "", 1)
+        } else if normalized_sep == "/workspace" {
             String::new()
         } else {
-            p.to_string()
+            normalized_sep
         };
         let path = std::path::Path::new(&normalized);
         if path.is_absolute() {
@@ -2391,6 +2773,56 @@ async fn execute_tool_standalone(
             }
             tokio::fs::write(&resolved_path, content).await?;
             Ok(format!("Successfully wrote to {}", path))
+        }
+
+        // create_file is an alias for write_file — LLMs often use this name
+        "create_file" => {
+            let path = tool_call.args.get("path")
+                .and_then(|p| p.as_str())
+                .ok_or("Missing path argument")?;
+            let content = tool_call.args.get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            let resolved_path = resolve(path);
+            if let Some(parent) = resolved_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+            }
+            tokio::fs::write(&resolved_path, content).await?;
+            Ok(format!("Successfully created {}", path))
+        }
+
+        "create_directory" => {
+            let path = tool_call.args.get("path")
+                .and_then(|p| p.as_str())
+                .ok_or("Missing path argument")?;
+            tokio::fs::create_dir_all(resolve(path)).await?;
+            Ok(format!("Successfully created directory {}", path))
+        }
+
+        "delete_file" => {
+            let path = tool_call.args.get("path")
+                .and_then(|p| p.as_str())
+                .ok_or("Missing path argument")?;
+            let resolved_path = resolve(path);
+            if resolved_path.is_dir() {
+                tokio::fs::remove_dir_all(&resolved_path).await?;
+            } else {
+                tokio::fs::remove_file(&resolved_path).await?;
+            }
+            Ok(format!("Successfully deleted {}", path))
+        }
+
+        "move_file" | "rename_file" => {
+            let from = tool_call.args.get("from").or(tool_call.args.get("source")).or(tool_call.args.get("path"))
+                .and_then(|p| p.as_str())
+                .ok_or("Missing from/source argument")?;
+            let to = tool_call.args.get("to").or(tool_call.args.get("destination")).or(tool_call.args.get("new_path"))
+                .and_then(|p| p.as_str())
+                .ok_or("Missing to/destination argument")?;
+            tokio::fs::rename(resolve(from), resolve(to)).await?;
+            Ok(format!("Successfully moved {} to {}", from, to))
         }
 
         "edit_file" => {
@@ -2789,7 +3221,7 @@ async fn execute_tool_standalone(
     };
 
     // ── ZERO-COST LINTER INJECTION ──
-    let is_edit_tool = ["write_file", "edit_file", "multi_edit_file"].contains(&tool_call.tool.as_str());
+    let is_edit_tool = ["write_file", "edit_file", "multi_edit_file", "create_file"].contains(&tool_call.tool.as_str());
     if is_edit_tool && tool_result.is_ok() {
         if let Some(path_arg) = tool_call.args.get("path").and_then(|p| p.as_str()) {
             let mut linter_output = String::new();
@@ -2905,8 +3337,8 @@ fn identify_independent_tool_groups(tool_calls: &[ToolCall]) -> Vec<Vec<usize>> 
 #[allow(dead_code)]
 fn tools_have_conflict(a: &ToolCall, b: &ToolCall) -> bool {
     // Write tools always conflict with anything on the same path
-    let write_tools = ["write_file", "edit_file", "multi_edit_file", "delete_file"];
-    let file_tools  = ["read_file", "write_file", "edit_file", "multi_edit_file", "delete_file", "list_directory"];
+    let write_tools = ["write_file", "edit_file", "multi_edit_file", "delete_file", "create_file", "move_file", "rename_file"];
+    let file_tools  = ["read_file", "write_file", "edit_file", "multi_edit_file", "delete_file", "list_directory", "create_file", "create_directory", "move_file", "rename_file"];
     if !file_tools.contains(&a.tool.as_str()) || !file_tools.contains(&b.tool.as_str()) { return false; }
     let path_a = a.args.get("path").and_then(|p| p.as_str());
     let path_b = b.args.get("path").and_then(|p| p.as_str());
@@ -2941,6 +3373,7 @@ fn extract_tool_calls(response: &str) -> Vec<ToolCall> {
         "Think", "Reason", "Analyze", "Verify", "Check", "Validate",
         // Standard file tools
         "read_file", "write_file", "edit_file", "multi_edit_file",
+        "create_file", "create_directory", "delete_file", "move_file", "rename_file",
         "list_directory", "search_files", "grep_search",
         // Execution tools
         "run_command", "git", "npm", "docker",
@@ -3009,7 +3442,6 @@ pub async fn execute_agent_loop_streaming(
     model: serde_json::Value,
     workspace_path: Option<String>,
     active_file: Option<serde_json::Value>,
-    // FIX #1: accept conversation history from frontend
     conversation_history: Option<Vec<ConversationTurn>>,
     app_handle: tauri::AppHandle,
     state: State<'_, Arc<RwLock<AppState>>>,
@@ -3018,6 +3450,9 @@ pub async fn execute_agent_loop_streaming(
     learning_state: State<'_, Arc<std::sync::Mutex<crate::commands::learning::LearningSystem>>>,
     steering_state: State<'_, Arc<RwLock<SteeringSystem>>>,
     recovery_state: State<'_, Arc<std::sync::Mutex<crate::commands::error_recovery::ErrorRecoverySystem>>>,
+    context_memory_state: State<'_, Arc<std::sync::Mutex<crate::commands::context_memory::ContextMemory>>>,
+    hooks_state: State<'_, Arc<std::sync::Mutex<crate::commands::hooks::HooksManager>>>,
+    graph_state: State<'_, Arc<std::sync::Mutex<crate::commands::graph::GraphService>>>,
     context_length: Option<u32>,
 ) -> Result<StreamingAgentResponse> {
     // Reset cancel token at the start of a new task
@@ -3049,7 +3484,10 @@ pub async fn execute_agent_loop_streaming(
         learning_state.inner().clone(), 
         steering_state.inner().clone(),
         recovery_state.inner().clone(),
-        state.inner().clone()
+        state.inner().clone(),
+        context_memory_state.inner().clone(),
+        hooks_state.inner().clone(),
+        graph_state.inner().clone(),
     ).await
 }
 

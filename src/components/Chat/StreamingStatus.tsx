@@ -5,6 +5,9 @@ interface StreamingStatusProps {
   currentPhase: string;
   phases: string[];
   elapsedSeconds: number;
+  tokensPerSecond?: number;
+  estimatedTimeRemaining?: number;
+  totalTokens?: number;
 }
 
 const phaseEmojis: Record<string, string> = {
@@ -49,6 +52,9 @@ export const StreamingStatus: React.FC<StreamingStatusProps> = ({
   currentPhase,
   phases,
   elapsedSeconds,
+  tokensPerSecond,
+  estimatedTimeRemaining,
+  totalTokens,
 }) => {
   if (!isActive) return null;
 
@@ -63,8 +69,8 @@ export const StreamingStatus: React.FC<StreamingStatusProps> = ({
     <div
       style={{
         display: 'flex',
-        alignItems: 'center',
-        gap: '12px',
+        flexDirection: 'column',
+        gap: '8px',
         padding: '10px 12px',
         backgroundColor: 'rgba(59, 130, 246, 0.08)',
         border: '1px solid rgba(59, 130, 246, 0.2)',
@@ -74,54 +80,96 @@ export const StreamingStatus: React.FC<StreamingStatusProps> = ({
         color: '#a0a0a0',
       }}
     >
-      {/* Animated pulse indicator */}
+      {/* Main status row */}
       <div
         style={{
-          width: '8px',
-          height: '8px',
-          borderRadius: '50%',
-          background: '#3b82f6',
-          boxShadow: '0 0 8px #3b82f6',
-          animation: 'pulse 1.5s ease-in-out infinite',
-          flexShrink: 0,
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
         }}
-      />
+      >
+        {/* Animated pulse indicator */}
+        <div
+          style={{
+            width: '8px',
+            height: '8px',
+            borderRadius: '50%',
+            background: '#3b82f6',
+            boxShadow: '0 0 8px #3b82f6',
+            animation: 'pulse 1.5s ease-in-out infinite',
+            flexShrink: 0,
+          }}
+        />
 
-      {/* Phase indicator */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1 }}>
-        <span style={{ fontSize: '14px' }}>{getPhaseEmoji(currentPhase)}</span>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-          <div style={{ fontWeight: '600', color: '#3b82f6', fontSize: '11px', textTransform: 'uppercase' }}>
-            {currentPhase}
-            <AnimatedDots />
-          </div>
-          {phases.length > 0 && (
-            <div style={{ fontSize: '10px', color: '#707070' }}>
-              {phases.map((p, i) => (
-                <span key={i}>
-                  {i > 0 && ' → '}
-                  <span style={{ opacity: 0.6 }}>{p}</span>
-                </span>
-              ))}
+        {/* Phase indicator */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1 }}>
+          <span style={{ fontSize: '14px' }}>{getPhaseEmoji(currentPhase)}</span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+            <div style={{ fontWeight: '600', color: '#3b82f6', fontSize: '11px', textTransform: 'uppercase' }}>
+              {currentPhase}
+              <AnimatedDots />
             </div>
-          )}
+            {phases.length > 0 && (
+              <div style={{ fontSize: '10px', color: '#707070' }}>
+                {phases.map((p, i) => (
+                  <span key={i}>
+                    {i > 0 && ' → '}
+                    <span style={{ opacity: 0.6 }}>{p}</span>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Timer */}
+        <div
+          style={{
+            padding: '2px 6px',
+            backgroundColor: 'rgba(59, 130, 246, 0.15)',
+            borderRadius: '3px',
+            fontSize: '10px',
+            fontWeight: 'bold',
+            color: '#3b82f6',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {formatTime(elapsedSeconds)}
         </div>
       </div>
 
-      {/* Timer */}
-      <div
-        style={{
-          padding: '2px 6px',
-          backgroundColor: 'rgba(59, 130, 246, 0.15)',
-          borderRadius: '3px',
-          fontSize: '10px',
-          fontWeight: 'bold',
-          color: '#3b82f6',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {formatTime(elapsedSeconds)}
-      </div>
+      {/* Metrics row (WhizCode) */}
+      {(tokensPerSecond !== undefined || estimatedTimeRemaining !== undefined || totalTokens !== undefined) && (
+        <div
+          style={{
+            display: 'flex',
+            gap: '12px',
+            fontSize: '10px',
+            color: '#808080',
+            paddingTop: '4px',
+            borderTop: '1px solid rgba(59, 130, 246, 0.1)',
+          }}
+        >
+          {totalTokens !== undefined && (
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              <span style={{ color: '#3b82f6', fontWeight: 'bold' }}>📊</span>
+              <span>{totalTokens} tokens</span>
+            </div>
+          )}
+          {tokensPerSecond !== undefined && (
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              <span style={{ color: '#3b82f6', fontWeight: 'bold' }}>⚡</span>
+              <span>{tokensPerSecond.toFixed(1)} tok/s</span>
+            </div>
+          )}
+          {estimatedTimeRemaining !== undefined && (
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              <span style={{ color: '#3b82f6', fontWeight: 'bold' }}>⏱️</span>
+              <span>~{formatTime(estimatedTimeRemaining)}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       <style>{`
         @keyframes pulse {

@@ -559,6 +559,12 @@ export const ChatPanel = ({
     const [currentPhase, setCurrentPhase] = React.useState<string>('analyzing');
     const [phaseStartTime, setPhaseStartTime] = React.useState<number>(Date.now());
     const [elapsedSeconds, setElapsedSeconds] = React.useState<number>(0);
+    
+    // WhizCode metrics state
+    const [tokensPerSecond, setTokensPerSecond] = React.useState<number | undefined>();
+    const [estimatedTimeRemaining, setEstimatedTimeRemaining] = React.useState<number | undefined>();
+    const [totalTokens, setTotalTokens] = React.useState<number | undefined>();
+    const [phaseHistory, setPhaseHistory] = React.useState<string[]>([]);
 
     React.useEffect(() => {
         const unlistenPhase = (window as any).__TAURI_INVOKE__?.('listen', {
@@ -567,6 +573,12 @@ export const ChatPanel = ({
                 const phase = event.payload?.phase || 'analyzing';
                 setCurrentPhase(phase);
                 setPhaseStartTime(Date.now());
+                // Add to phase history
+                setPhaseHistory(prev => {
+                    const updated = [...prev, phase];
+                    // Keep only last 5 phases to avoid clutter
+                    return updated.slice(-5);
+                });
             }
         }).catch(() => {});
 
@@ -575,15 +587,44 @@ export const ChatPanel = ({
         };
     }, []);
 
+    // Listen for metrics events
+    React.useEffect(() => {
+        const unlistenMetrics = (window as any).__TAURI_INVOKE__?.('listen', {
+            event: 'agent:metrics',
+            handler: (event: any) => {
+                const metrics = event.payload;
+                if (metrics.tokens_per_second !== undefined) {
+                    setTokensPerSecond(metrics.tokens_per_second);
+                }
+                if (metrics.estimated_time_remaining !== undefined) {
+                    setEstimatedTimeRemaining(metrics.estimated_time_remaining);
+                }
+                if (metrics.total_tokens !== undefined) {
+                    setTotalTokens(metrics.total_tokens);
+                }
+            }
+        }).catch(() => {});
+
+        return () => {
+            unlistenMetrics?.then((unlisten: any) => unlisten?.());
+        };
+    }, []);
+
     React.useEffect(() => {
         if (!isLoading) {
             setRespondedSteps({});
             setCountdown(null);
+            // Reset metrics when loading completes
+            setTokensPerSecond(undefined);
+            setEstimatedTimeRemaining(undefined);
+            setTotalTokens(undefined);
+            setPhaseHistory([]);
             // Reset alwaysRun on task completion? Or keep it? Usually better to reset for safety.
             // setAlwaysRun(false); 
         } else {
             // Reset phase start time when loading begins
             setPhaseStartTime(Date.now());
+            setPhaseHistory([]);
         }
     }, [isLoading]);
 
@@ -798,6 +839,39 @@ export const ChatPanel = ({
                                         {elapsedSeconds}s
                                     </span>
                             </div>
+                            
+                            {/* WhizCode Metrics Display */}
+                            {(tokensPerSecond !== undefined || estimatedTimeRemaining !== undefined || totalTokens !== undefined) && (
+                                <div style={{
+                                    display: 'flex',
+                                    gap: '12px',
+                                    fontSize: '10px',
+                                    color: 'var(--text-secondary)',
+                                    padding: '6px 12px',
+                                    backgroundColor: 'rgba(59, 130, 246, 0.05)',
+                                    borderRadius: '4px',
+                                    border: '1px solid rgba(59, 130, 246, 0.1)',
+                                }}>
+                                    {totalTokens !== undefined && (
+                                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>📊</span>
+                                            <span>{totalTokens} tokens</span>
+                                        </div>
+                                    )}
+                                    {tokensPerSecond !== undefined && (
+                                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>⚡</span>
+                                            <span>{tokensPerSecond.toFixed(1)} tok/s</span>
+                                        </div>
+                                    )}
+                                    {estimatedTimeRemaining !== undefined && (
+                                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>⏱️</span>
+                                            <span>~{estimatedTimeRemaining < 60 ? `${estimatedTimeRemaining}s` : `${Math.floor(estimatedTimeRemaining / 60)}m`}</span>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     )}
                     {pendingPermissionStepIdx >= 0 && (

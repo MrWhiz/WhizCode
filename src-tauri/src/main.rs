@@ -353,6 +353,22 @@ fn main() {
             commands::custom_tools::unregister_custom_tool,
             commands::custom_tools::list_custom_tools,
             commands::custom_tools::execute_custom_tool,
+            
+            // WhizCode operations
+            commands::whizcode_commands::analyze_query,
+            commands::whizcode_commands::generate_optimized_prompt,
+            commands::whizcode_commands::optimize_context,
+            commands::whizcode_commands::route_query,
+            commands::whizcode_commands::get_streaming_metrics,
+            
+            // Task management operations
+            commands::task_commands::get_task_progress,
+            commands::task_commands::get_tasks_by_status,
+            commands::task_commands::update_task_status,
+            commands::task_commands::load_tasks_markdown,
+            commands::task_commands::tasks_exist,
+            commands::task_commands::get_pending_tasks_count,
+            commands::task_commands::get_completed_tasks_count,
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();

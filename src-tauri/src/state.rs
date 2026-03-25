@@ -1,39 +1,54 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::AppHandle;
-use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct TerminalSession {
     #[allow(dead_code)]
-    pub id: String,
-    #[allow(dead_code)]
     pub shell_type: String,
     #[allow(dead_code)]
     pub cwd: PathBuf,
+}
+
+impl TerminalSession {
+    pub fn new(shell_type: String, cwd: PathBuf) -> Self {
+        Self { shell_type, cwd }
+    }
+
     #[allow(dead_code)]
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub fn update_cwd(&mut self, new_cwd: PathBuf) {
+        self.cwd = new_cwd;
+    }
+
+    #[allow(dead_code)]
+    pub fn get_shell_command(&self) -> &str {
+        match self.shell_type.as_str() {
+            "powershell" | "pwsh" => "powershell",
+            "cmd" => "cmd",
+            "bash" => "bash",
+            "zsh" => "zsh",
+            "fish" => "fish",
+            _ => "bash",
+        }
+    }
 }
 
 pub struct AppState {
     pub workspace_path: Option<PathBuf>,
-    pub terminals: HashMap<String, TerminalSession>,
     pub app_handle: Option<AppHandle>,
     pub detected_shell: String,
-    // --- STDIN REGISTRY FOR INTERACTIVE TOOLS ---
+    pub terminal_session: Option<TerminalSession>,
     pub tool_inputs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::process::ChildStdin>>>,
     pub tool_killers: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
 }
 
-#[allow(dead_code)]
 impl AppState {
     pub fn new() -> Self {
         let detected_shell = Self::detect_shell();
         AppState {
             workspace_path: None,
-            terminals: HashMap::new(),
             app_handle: None,
             detected_shell,
+            terminal_session: None,
             tool_inputs: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             tool_killers: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
@@ -84,33 +99,25 @@ impl AppState {
     }
 
     pub fn set_workspace(&mut self, path: PathBuf) {
-        self.workspace_path = Some(path);
+        self.workspace_path = Some(path.clone());
+        // Initialize terminal session with workspace as cwd
+        self.terminal_session = Some(TerminalSession::new(
+            self.detected_shell.clone(),
+            path,
+        ));
     }
 
     pub fn get_workspace(&self) -> Option<&PathBuf> {
         self.workspace_path.as_ref()
     }
 
-    pub fn create_terminal(&mut self, shell_type: String, cwd: PathBuf) -> String {
-        let id = Uuid::new_v4().to_string();
-        self.terminals.insert(
-            id.clone(),
-            TerminalSession {
-                id: id.clone(),
-                shell_type,
-                cwd,
-                created_at: chrono::Utc::now(),
-            },
-        );
-        id
-    }
-
-    pub fn remove_terminal(&mut self, id: &str) -> Option<TerminalSession> {
-        self.terminals.remove(id)
+    #[allow(dead_code)]
+    pub fn get_terminal_session(&self) -> Option<&TerminalSession> {
+        self.terminal_session.as_ref()
     }
 
     #[allow(dead_code)]
-    pub fn get_terminal(&self, id: &str) -> Option<&TerminalSession> {
-        self.terminals.get(id)
+    pub fn get_terminal_session_mut(&mut self) -> Option<&mut TerminalSession> {
+        self.terminal_session.as_mut()
     }
 }

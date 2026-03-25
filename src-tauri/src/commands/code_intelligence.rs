@@ -150,20 +150,40 @@ impl CodeIntelligence {
 
     fn analyze_relationships(&self, context: &SemanticContext) -> Vec<CodeRelationship> {
         let mut relationships = Vec::new();
+        let mut symbol_to_file: HashMap<String, String> = HashMap::new();
         
+        // 1. Map symbols to their original defining files
         for symbol in &context.symbols {
-            // Track dependencies (imports/calls)
-            for dep in &symbol.dependencies {
-                relationships.push(CodeRelationship {
-                    from_symbol: symbol.id.clone(),
-                    to_symbol: dep.clone(),
-                    relationship_type: "calls".to_string(),
-                    strength: 1.0,
-                });
-            }
+            symbol_to_file.insert(symbol.name.clone(), symbol.file_path.clone());
+        }
 
-            // Simple heuristic for "References" across files
-            // (In a real implementation, we'd search content for symbol.name)
+        // 2. Scan every file for usage of other files' symbols
+        let ws_root = &context.workspace_path;
+        for entry in WalkDir::new(ws_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+        {
+            let path = entry.path();
+            if crate::utils::should_skip_file(path) { continue; }
+            
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let current_file = path.to_string_lossy().to_string();
+                
+                for (sym_name, sym_file) in &symbol_to_file {
+                    if *sym_file == current_file { continue; } // Skip self-references
+                    
+                    // Fast check for symbol name in content
+                    if content.contains(sym_name) {
+                        relationships.push(CodeRelationship {
+                            from_symbol: current_file.clone(), // In this graph, 'from' is the user
+                            to_symbol: format!("{}:{}", sym_file, sym_name), // 'to' is the definition
+                            relationship_type: "references".to_string(),
+                            strength: 1.0,
+                        });
+                    }
+                }
+            }
         }
 
         relationships

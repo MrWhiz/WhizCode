@@ -366,28 +366,82 @@ impl VectorSearchSystem {
     fn chunk_file(&self, content: &str, file_path: &str) -> Vec<CodeChunk> {
         let mut chunks = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
-        
-        // Very basic chunking by blocks of 30 lines
-        for (i, window) in lines.chunks(30).enumerate() {
-            let start = i * 30;
-            let end = start + window.len();
-            let chunk_content = window.join("\n");
-            let id = format!("{}:{}", file_path, start);
-            
-            chunks.push(CodeChunk {
-                id,
-                file_path: file_path.to_string(),
-                chunk_type: "block".to_string(),
-                symbol_name: None,
-                content: chunk_content.clone(),
-                start_line: (start + 1) as u32,
-                end_line: end as u32,
-                embedding: self.generate_embedding(&chunk_content),
-                complexity: 1,
-                dependencies: vec![],
-            });
+
+        // Regex-free symbol detection (faster for local indexing)
+        let mut current_chunk = Vec::new();
+        let mut chunk_start = 0;
+        let mut current_symbol = None;
+        let mut current_type = "block".to_string();
+
+        let symbols = ["function", "class", "async", "interface", "struct", "enum", "def", "trait", "impl", "pub fn", "fn", "type"];
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let is_symbol_start = symbols.iter().any(|s| trimmed.contains(s)) && (trimmed.contains('{') || trimmed.contains(':'));
+
+            if is_symbol_start && !current_chunk.is_empty() {
+                // Save previous chunk
+                let content = current_chunk.join("\n");
+                chunks.push(self.create_chunk(file_path, &content, chunk_start + 1, i as u32, current_symbol.clone(), &current_type));
+                current_chunk.clear();
+                chunk_start = i as u32;
+
+                // Identify new symbol name
+                for s in symbols {
+                    if trimmed.contains(s) {
+                        current_type = s.to_string();
+                        // Extract approximate name
+                        let parts: Vec<&str> = trimmed.split(|c| " (:{<".contains(c)).collect();
+                        if let Some(name) = parts.iter().skip_while(|p| !p.contains(s)).nth(1) {
+                            current_symbol = Some(name.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+
+            current_chunk.push(*line);
+
+            // Cap chunk size at ~100 lines to prevent context bloat
+            if current_chunk.len() > 100 {
+                let content = current_chunk.join("\n");
+                chunks.push(self.create_chunk(file_path, &content, chunk_start + 1, (i + 1) as u32, current_symbol.clone(), &current_type));
+                current_chunk.clear();
+                chunk_start = (i + 1) as u32;
+                current_symbol = None;
+                current_type = "block".to_string();
+            }
         }
+
+        // Last chunk
+        if !current_chunk.is_empty() {
+            let content = current_chunk.join("\n");
+            chunks.push(self.create_chunk(file_path, &content, chunk_start + 1, lines.len() as u32, current_symbol, &current_type));
+        }
+
         chunks
+    }
+
+    fn create_chunk(&self, file_path: &str, content: &str, start: u32, end: u32, symbol: Option<String>, chunk_type: &str) -> CodeChunk {
+        // ENHANCEMENT: Prepend context to content for better embedding relevance
+        let enhanced_content = if let Some(ref s) = symbol {
+            format!("File: {} | {} {}: {}\n{}", file_path, chunk_type, s, s, content)
+        } else {
+            format!("File: {} | Block:\n{}", file_path, content)
+        };
+
+        CodeChunk {
+            id: format!("{}:{}", file_path, start),
+            file_path: file_path.to_string(),
+            chunk_type: chunk_type.to_string(),
+            symbol_name: symbol,
+            content: content.to_string(),
+            start_line: start,
+            end_line: end,
+            embedding: self.generate_embedding(&enhanced_content),
+            complexity: 1,
+            dependencies: vec![],
+        }
     }
 
     pub fn get_index_stats(&self) -> SqliteResult<IndexStats> {

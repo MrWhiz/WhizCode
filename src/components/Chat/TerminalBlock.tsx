@@ -15,6 +15,7 @@ export const TerminalBlock: React.FC<TerminalBlockProps> = ({ logs, isLive, isRu
     const xtermRef = useRef<Terminal | null>(null);
     const fitAddonRef = useRef<FitAddon | null>(null);
     const lastRenderedIndex = useRef<number>(0);
+    const maxInitialLogLines = 400;
 
     useEffect(() => {
         if (!terminalRef.current) return;
@@ -51,8 +52,14 @@ export const TerminalBlock: React.FC<TerminalBlockProps> = ({ logs, isLive, isRu
         xtermRef.current = term;
         fitAddonRef.current = fitAddon;
 
-        // If we have initial logs, write them
-        logs.forEach(log => term.write(log));
+        // If we have an oversized backlog, keep the newest lines so the terminal stays responsive.
+        const initialLogs = logs.length > maxInitialLogLines
+            ? logs.slice(-maxInitialLogLines)
+            : logs;
+        if (logs.length > maxInitialLogLines) {
+            term.write(`\r\n... ${logs.length - maxInitialLogLines} earlier log lines omitted ...\r\n`);
+        }
+        initialLogs.forEach(log => term.write(log));
         lastRenderedIndex.current = logs.length;
 
         // Handle terminal input
@@ -88,7 +95,13 @@ export const TerminalBlock: React.FC<TerminalBlockProps> = ({ logs, isLive, isRu
         } else if (logs.length < lastRenderedIndex.current) {
             // Logs were reset (e.g. new command)
             term.clear();
-            logs.forEach(log => term.write(log));
+            const resetLogs = logs.length > maxInitialLogLines
+                ? logs.slice(-maxInitialLogLines)
+                : logs;
+            if (logs.length > maxInitialLogLines) {
+                term.write(`\r\n... ${logs.length - maxInitialLogLines} earlier log lines omitted ...\r\n`);
+            }
+            resetLogs.forEach(log => term.write(log));
             lastRenderedIndex.current = logs.length;
         }
     }, [logs]);

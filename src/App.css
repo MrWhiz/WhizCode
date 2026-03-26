@@ -1920,7 +1920,7 @@ body {
   color: var(--vscode-descriptionForeground);
 }
 
-/* Vector and Cache Tabs use existing metrics-grid styles */
+/* Workspace search and cache tabs use existing metrics-grid styles */
 
 /* Tab bar scrolling for many tabs */
 .ai-insights-panel .tab-bar {

@@ -8,6 +8,8 @@ export function useWorkspaceInit(
   setRefreshKey: (key: number | ((prev: number) => number)) => void,
   sidebarWidth: number,
   chatWidth: number,
+  terminalHeight: number,
+  isTerminalOpen: boolean,
   isChatOpen: boolean,
   activeView: string | null,
   workspacePath: string | null,
@@ -67,13 +69,13 @@ export function useWorkspaceInit(
   useEffect(() => {
     setupUIStatePersistence(
       sidebarWidth,
-      0,
+      terminalHeight,
       chatWidth,
-      false,
+      isTerminalOpen,
       isChatOpen,
       activeView
     )
-  }, [sidebarWidth, chatWidth, isChatOpen, activeView])
+  }, [sidebarWidth, terminalHeight, chatWidth, isTerminalOpen, isChatOpen, activeView])
 
   // Persist workspace state whenever it changes
   useEffect(() => {

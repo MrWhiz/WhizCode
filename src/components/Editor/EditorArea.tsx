@@ -267,7 +267,18 @@ export const EditorArea = ({
     };
 
     return (
-        <main className="main-area" style={{ display: 'flex', flexDirection: 'column', position: 'relative' }}>
+        <main
+            className="main-area"
+            style={{
+                display: 'flex',
+                flexDirection: 'column',
+                position: 'relative',
+                flex: '1 1 auto',
+                minHeight: 0,
+                height: 'auto',
+                width: '100%',
+            }}
+        >
             {openFiles.length > 0 ? (
                 <>
                     <div className="tabs" style={{ display: 'flex', overflowX: 'auto' }}>

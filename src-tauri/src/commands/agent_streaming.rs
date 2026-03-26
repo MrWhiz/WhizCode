@@ -1,17 +1,26 @@
 use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::commands::prompts;
-use crate::commands::problem_identifier::ProblemIdentifier;
+use crate::commands::problem_identifier::{ProblemAnalysis, ProblemIdentifier, TaskWorkingState};
+use crate::commands::task_manager::{TaskManager, TaskStateRecord};
+use crate::commands::workspace::{
+    build_workspace_context_snapshot,
+    load_workspace_context_snapshot,
+    save_workspace_context_snapshot,
+    WorkspaceContextSnapshot,
+};
 use tauri::Emitter;
 use tauri::State;
 use std::sync::Arc;
 use parking_lot::RwLock;
+use chrono::Utc;
 use crate::state::AppState;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::commands::retry_manager::{RetryManager, RetryConfig, AutoRecoveryEngine};
 use crate::commands::steering::SteeringSystem;
 use crate::commands::failure_learning::FailureLearningEngine;
+use futures::future::join_all;
 use regex::Regex;
 
 // ─────────────────────────────────────────────
@@ -113,6 +122,535 @@ fn is_high_risk_command(command: &str) -> bool {
     high_risk_patterns
         .iter()
         .any(|pattern| normalized.contains(pattern))
+}
+
+fn normalize_tool_read_path(workspace_path: &Option<String>, raw_path: &str) -> String {
+    let ws_root = workspace_path.as_deref().unwrap_or(".");
+    let normalized_sep = raw_path.replace('/', std::path::MAIN_SEPARATOR_STR);
+    let normalized = if normalized_sep.starts_with("/workspace/") {
+        normalized_sep.replacen("/workspace/", "", 1)
+    } else if normalized_sep == "/workspace" {
+        String::new()
+    } else {
+        normalized_sep
+    };
+
+    let path = std::path::Path::new(&normalized);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else if normalized.is_empty() {
+        std::path::Path::new(ws_root).to_path_buf()
+    } else {
+        std::path::Path::new(ws_root).join(&normalized)
+    };
+
+    resolved.to_string_lossy().replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+fn should_skip_redundant_file_read(
+    tool_call: &ToolCall,
+    workspace_path: &Option<String>,
+    read_counts: &mut std::collections::HashMap<String, u32>,
+    read_windows: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    let tool_name = tool_call.tool.as_str();
+    if !matches!(tool_name, "read_file" | "view_structure") {
+        return None;
+    }
+
+    let path = tool_call.args.get("path").and_then(|value| value.as_str())?;
+    let normalized_path = normalize_tool_read_path(workspace_path, path);
+    let start_line = tool_call
+        .args
+        .get("start_line")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let end_line = tool_call
+        .args
+        .get("end_line")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let window_sig = format!(
+        "{}|{}|{}",
+        normalized_path,
+        start_line.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string()),
+        end_line.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string())
+    );
+
+    if !read_windows.insert(window_sig.clone()) {
+        return Some(format!(
+            "This exact file window was already read. Reuse the content you already have or inspect a different line range: {}",
+            window_sig
+        ));
+    }
+
+    let count = read_counts.entry(normalized_path.clone()).or_insert(0);
+    *count += 1;
+
+    if *count > 3 {
+        return Some(format!(
+            "You have already read {} three times in this run. Reuse the content you have, or switch to semantic_search/find_symbols / a narrower line window instead.",
+            normalized_path
+        ));
+    }
+
+    None
+}
+
+fn refresh_incremental_workspace_indexes(
+    tool_call: &ToolCall,
+    workspace_path: &Option<String>,
+    vector_system: &Arc<std::sync::Mutex<crate::commands::vector_search::VectorSearchSystem>>,
+    code_intel: &Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
+) {
+    let Some(ws) = workspace_path.as_deref() else {
+        return;
+    };
+
+    let mut affected_paths: Vec<(String, bool)> = Vec::new();
+    match tool_call.tool.as_str() {
+        "write_file" | "create_file" | "edit_file" | "multi_edit_file" => {
+            if let Some(path) = tool_call.args.get("path").and_then(|value| value.as_str()) {
+                affected_paths.push((path.to_string(), true));
+            }
+        }
+        "delete_file" => {
+            if let Some(path) = tool_call.args.get("path").and_then(|value| value.as_str()) {
+                affected_paths.push((path.to_string(), false));
+            }
+        }
+        "move_file" | "rename_file" => {
+            let from = tool_call
+                .args
+                .get("from")
+                .or(tool_call.args.get("source"))
+                .or(tool_call.args.get("path"))
+                .and_then(|value| value.as_str());
+            let to = tool_call
+                .args
+                .get("to")
+                .or(tool_call.args.get("destination"))
+                .or(tool_call.args.get("new_path"))
+                .and_then(|value| value.as_str());
+
+            if let Some(from_path) = from {
+                affected_paths.push((from_path.to_string(), false));
+            }
+            if let Some(to_path) = to {
+                affected_paths.push((to_path.to_string(), true));
+            }
+        }
+        _ => return,
+    }
+
+    if affected_paths.is_empty() {
+        return;
+    }
+
+    let mut vector = match vector_system.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    let intel = match code_intel.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    for (path, should_update) in affected_paths {
+        if should_update {
+            if let Err(e) = vector.update_file(&path) {
+                eprintln!("[IncrementalRefresh] vector refresh failed for {}: {}", path, e);
+            }
+            if let Err(e) = intel.update_file(ws, &path) {
+                eprintln!("[IncrementalRefresh] symbol refresh failed for {}: {}", path, e);
+            }
+        } else {
+            if let Err(e) = vector.remove_file(&path) {
+                eprintln!("[IncrementalRefresh] vector removal failed for {}: {}", path, e);
+            }
+            if let Err(e) = intel.remove_file(ws, &path) {
+                eprintln!("[IncrementalRefresh] symbol removal failed for {}: {}", path, e);
+            }
+        }
+    }
+}
+
+fn estimate_line_count(content: &str) -> i64 {
+    content.lines().count() as i64
+}
+
+fn summarize_stall_reason(raw_llm_text: &str, response: &str) -> String {
+    let trimmed_response = response.trim();
+    let trimmed_raw = raw_llm_text.trim();
+
+    if !trimmed_response.is_empty() {
+        return trimmed_response.chars().take(400).collect();
+    }
+
+    if trimmed_raw.is_empty() {
+        return "Model produced no text, no tool calls, and no completion signal.".to_string();
+    }
+
+    let open_braces = trimmed_raw.matches('{').count();
+    let close_braces = trimmed_raw.matches('}').count();
+
+    if trimmed_raw.contains("\"tool\"") && open_braces > close_braces {
+        return "Model response appears truncated while generating a JSON tool call.".to_string();
+    }
+
+    if trimmed_raw.contains("\"tool\"") {
+        return "Model attempted a tool call, but it could not be parsed into an executable action.".to_string();
+    }
+
+    if trimmed_raw.len() > 3000 {
+        return "Model produced a large prose response instead of tool calls or a final completion.".to_string();
+    }
+
+    let snippet: String = trimmed_raw.chars().take(240).collect();
+    format!("Model stopped without a valid action. Last output: {}", snippet)
+}
+
+fn take_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn take_tail_chars(value: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+
+    chars[chars.len() - max_chars..].iter().collect()
+}
+
+fn compact_json_value(value: &serde_json::Value, max_chars: usize) -> String {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    if text.chars().count() <= max_chars {
+        text
+    } else {
+        take_chars(&text, max_chars)
+    }
+}
+
+fn build_assistant_history_entry(
+    raw_llm_text: &str,
+    tool_calls: &[ToolCall],
+    max_chars: usize,
+    artifact_path: Option<&str>,
+) -> String {
+    if tool_calls.is_empty() {
+        let total_chars = raw_llm_text.chars().count();
+        if total_chars <= max_chars {
+            let mut text = raw_llm_text.to_string();
+            if let Some(path) = artifact_path {
+                text.push_str(&format!("\n[Full response archived at: {}]", path));
+            }
+            return text;
+        }
+
+        let head_chars = max_chars / 2;
+        let tail_chars = max_chars.saturating_sub(head_chars);
+        let mut text = format!(
+            "{}\n... [response truncated — {} chars total] ...\n{}",
+            take_chars(raw_llm_text, head_chars),
+            total_chars,
+            take_tail_chars(raw_llm_text, tail_chars)
+        );
+        if let Some(path) = artifact_path {
+            text.push_str(&format!("\n[Full response archived at: {}]", path));
+        }
+        return text;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(format!("Assistant emitted {} tool call(s).", tool_calls.len()));
+    for (idx, call) in tool_calls.iter().enumerate().take(8) {
+        let args = compact_json_value(&call.args, 240);
+        lines.push(format!("{}. {} {}", idx + 1, call.tool, args));
+    }
+
+    if tool_calls.len() > 8 {
+        lines.push(format!("... {} additional tool call(s) omitted from history", tool_calls.len() - 8));
+    }
+
+    if let Some(path) = artifact_path {
+        lines.push(format!("Full response archived at: {}", path));
+    }
+
+    let summary = lines.join("\n");
+    if summary.chars().count() <= max_chars {
+        summary
+    } else {
+        take_chars(&summary, max_chars)
+    }
+}
+
+fn persist_large_assistant_response(
+    workspace_path: Option<&str>,
+    iteration: u32,
+    raw_llm_text: &str,
+    tool_calls: &[ToolCall],
+) -> Option<String> {
+    let ws = workspace_path?;
+    const PERSIST_THRESHOLD: usize = 6_000;
+    if raw_llm_text.len() < PERSIST_THRESHOLD {
+        return None;
+    }
+
+    let debug_dir = std::path::Path::new(ws).join(".whizcode").join("debug").join("assistant_responses");
+    if let Err(err) = std::fs::create_dir_all(&debug_dir) {
+        eprintln!("[Agent] Failed to create assistant debug dir {}: {}", debug_dir.to_string_lossy(), err);
+        return None;
+    }
+
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let file_name = format!("assistant_iter_{}_{}.txt", iteration, timestamp);
+    let file_path = debug_dir.join(file_name);
+
+    let mut header = String::new();
+    header.push_str(&format!("Iteration: {}\n", iteration));
+    header.push_str(&format!("Characters: {}\n", raw_llm_text.chars().count()));
+    header.push_str(&format!("Tool calls: {}\n", tool_calls.len()));
+    header.push_str("\n=== RAW ASSISTANT RESPONSE ===\n");
+    header.push_str(raw_llm_text);
+
+    if let Err(err) = std::fs::write(&file_path, header) {
+        eprintln!("[Agent] Failed to persist large assistant response to {}: {}", file_path.to_string_lossy(), err);
+        return None;
+    }
+
+    Some(file_path.to_string_lossy().to_string())
+}
+
+fn get_model_provider(model_config: &serde_json::Value) -> &str {
+    model_config
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("ollama")
+}
+
+fn get_model_name(model_config: &serde_json::Value) -> &str {
+    model_config
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("qwen3:latest")
+}
+
+fn extract_chat_text_from_openai_payload(payload: &serde_json::Value) -> Option<String> {
+    let content = payload
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))?;
+
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+
+    content.as_array().map(|parts| {
+        parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+            .collect::<Vec<_>>()
+            .join("")
+    })
+}
+
+fn extract_chat_text_from_gemini_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("candidates")
+        .and_then(|candidates| candidates.as_array())
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(|parts| parts.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+}
+
+fn build_plaintext_prompt(messages: &[serde_json::Value]) -> String {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let role = message.get("role").and_then(|value| value.as_str())?;
+            let content = message.get("content").and_then(|value| value.as_str()).unwrap_or("");
+            Some(format!("[{}]\n{}", role.to_uppercase(), content))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn emit_prompt_diagnostics(
+    app_handle: &Option<tauri::AppHandle>,
+    phase: &str,
+    included_messages: usize,
+    total_messages: usize,
+    char_count: usize,
+    limit: usize,
+    omitted_messages: usize,
+) {
+    if let Some(app) = app_handle {
+        let _ = app.emit("agent:diagnostics", &serde_json::json!({
+            "type": "prompt_truncation",
+            "phase": phase,
+            "included_messages": included_messages,
+            "total_messages": total_messages,
+            "omitted_messages": omitted_messages,
+            "approx_chars": char_count,
+            "limit_chars": limit,
+        }));
+    }
+}
+
+fn prompt_has_budget(current_len: usize, extra: usize) -> bool {
+    const WORKSPACE_PROMPT_BUDGET: usize = 18_000;
+    current_len.saturating_add(extra) <= WORKSPACE_PROMPT_BUDGET
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TaskRoutingProfile {
+    include_dynamic_suffix: bool,
+    include_knowledge: bool,
+    include_workflows: bool,
+    include_git_context: bool,
+    research_iterations: u32,
+}
+
+fn get_task_routing_profile(task_kind: &str) -> TaskRoutingProfile {
+    match task_kind {
+        "analysis" | "general" | "agent-flow" => TaskRoutingProfile {
+            include_dynamic_suffix: false,
+            include_knowledge: false,
+            include_workflows: false,
+            include_git_context: false,
+            research_iterations: 3,
+        },
+        "feature-implementation" | "refactoring" | "performance-improvement" => TaskRoutingProfile {
+            include_dynamic_suffix: true,
+            include_knowledge: true,
+            include_workflows: true,
+            include_git_context: true,
+            research_iterations: 5,
+        },
+        "bug-fix" => TaskRoutingProfile {
+            include_dynamic_suffix: true,
+            include_knowledge: true,
+            include_workflows: true,
+            include_git_context: true,
+            research_iterations: 6,
+        },
+        _ => TaskRoutingProfile {
+            include_dynamic_suffix: true,
+            include_knowledge: true,
+            include_workflows: true,
+            include_git_context: false,
+            research_iterations: 4,
+        },
+    }
+}
+
+fn build_step_data(tool_call: &ToolCall) -> Option<serde_json::Value> {
+    let args = &tool_call.args;
+    match tool_call.tool.as_str() {
+        "write_file" | "create_file" => {
+            let path = args.get("path").and_then(|v| v.as_str())?;
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            Some(serde_json::json!({
+                "files": [{
+                    "action": if tool_call.tool == "create_file" { "created" } else { "edited" },
+                    "path": path,
+                    "added": estimate_line_count(content),
+                    "removed": 0
+                }]
+            }))
+        }
+        "edit_file" => {
+            let path = args.get("path").and_then(|v| v.as_str())?;
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let added = estimate_line_count(content);
+            let start_line = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1);
+            let end_line = args.get("end_line").and_then(|v| v.as_u64()).unwrap_or(start_line);
+            let removed = (end_line.saturating_sub(start_line) + 1) as i64;
+            Some(serde_json::json!({
+                "files": [{
+                    "action": "edited",
+                    "path": path,
+                    "added": added,
+                    "removed": removed,
+                    "startLine": start_line,
+                    "endLine": end_line
+                }]
+            }))
+        }
+        "multi_edit_file" => {
+            let path = args.get("path").and_then(|v| v.as_str())?;
+            let edits = args.get("edits").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let added: i64 = edits.iter()
+                .map(|edit| edit.get("replace").and_then(|v| v.as_str()).map(estimate_line_count).unwrap_or(0))
+                .sum();
+            let removed: i64 = edits.iter()
+                .map(|edit| edit.get("search").and_then(|v| v.as_str()).map(estimate_line_count).unwrap_or(0))
+                .sum();
+            Some(serde_json::json!({
+                "files": [{
+                    "action": "edited",
+                    "path": path,
+                    "added": added,
+                    "removed": removed,
+                    "edits": edits.len()
+                }],
+                "edits": edits
+            }))
+        }
+        "move_file" | "rename_file" => {
+            let from = args.get("from").or(args.get("source")).or(args.get("path")).and_then(|v| v.as_str())?;
+            let to = args.get("to").or(args.get("destination")).or(args.get("new_path")).and_then(|v| v.as_str())?;
+            Some(serde_json::json!({
+                "files": [{
+                    "action": "moved",
+                    "path": to,
+                    "from": from,
+                    "to": to
+                }]
+            }))
+        }
+        "delete_file" => {
+            let path = args.get("path").and_then(|v| v.as_str())?;
+            Some(serde_json::json!({
+                "files": [{
+                    "action": "deleted",
+                    "path": path
+                }]
+            }))
+        }
+        "create_directory" => {
+            let path = args.get("path").and_then(|v| v.as_str())?;
+            Some(serde_json::json!({
+                "files": [{
+                    "action": "created_dir",
+                    "path": path
+                }]
+            }))
+        }
+        "read_file" => {
+            let path = args.get("path").and_then(|v| v.as_str())?;
+            Some(serde_json::json!({
+                "files": [{
+                    "action": "read",
+                    "path": path,
+                    "startLine": args.get("start_line").and_then(|v| v.as_u64()),
+                    "endLine": args.get("end_line").and_then(|v| v.as_u64())
+                }]
+            }))
+        }
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -339,8 +877,6 @@ impl StreamingAgentOrchestrator {
         hooks: Arc<std::sync::Mutex<crate::commands::hooks::HooksManager>>,
         graph: Arc<std::sync::Mutex<crate::commands::graph::GraphService>>,
     ) -> Result<StreamingAgentResponse> {
-        let model_name = model.get("model").and_then(|m| m.as_str()).unwrap_or("llama2");
-
         eprintln!("[Backend] Received workspace_path: {:?}", workspace_path);
         eprintln!("[Backend] Prior history turns: {}", prior_history.len());
 
@@ -392,6 +928,31 @@ impl StreamingAgentOrchestrator {
             }
         }
 
+        let active_file_path = active_file
+            .as_ref()
+            .and_then(|f| f.get("path"))
+            .and_then(|p| p.as_str());
+        let task_problem_analysis = ProblemIdentifier::analyze_problem(&task);
+        let mut task_working_state = ProblemIdentifier::build_working_state(
+            &task,
+            workspace_path.as_deref(),
+            active_file_path,
+            &task_problem_analysis,
+        );
+        let mut reused_research = false;
+        let mut workspace_context_snapshot: Option<WorkspaceContextSnapshot> = None;
+
+        if let Some(ws) = &workspace_path {
+            workspace_context_snapshot = load_workspace_context_snapshot(ws).ok().flatten();
+            if let Ok(Some(previous_state)) = TaskManager::load_task_state(ws) {
+                if previous_state.state.task_fingerprint == task_working_state.task_fingerprint {
+                    task_working_state = previous_state.state;
+                    reused_research = task_working_state.research_summary.is_some();
+                    eprintln!("[Agent] Reused saved task state for matching fingerprint");
+                }
+            }
+        }
+
         // TIER 2: Trigger agent_start hooks
         if let Ok(hooks_mgr) = hooks.lock() {
             let triggered = hooks_mgr.trigger_event("agent_start");
@@ -416,15 +977,22 @@ impl StreamingAgentOrchestrator {
 
         streaming_feedback.start_phase("research");
 
-        let research_findings = if let Some(ws) = &workspace_path {
+        let research_findings = if reused_research {
+            task_working_state
+                .research_summary
+                .clone()
+                .unwrap_or_default()
+        } else if let Some(ws) = &workspace_path {
             match self.run_research_phase(
                 &task,
                 ws,
                 &active_file,
-                model_name,
+                &model,
                 vector_system.clone(),
                 code_intel.clone(),
                 app_state_ref.clone(),
+                &task_problem_analysis,
+                &task_working_state,
             ).await {
                 Ok(findings) => findings,
                 Err(e) => {
@@ -435,6 +1003,22 @@ impl StreamingAgentOrchestrator {
         } else {
             String::new()
         };
+
+        if !research_findings.trim().is_empty() {
+            task_working_state.record_research(research_findings.clone());
+            task_working_state.current_goal =
+                "Use the latest research to make the smallest safe change and verify it.".to_string();
+        }
+
+        if let Some(ws) = &workspace_path {
+            let record = TaskStateRecord {
+                workspace_path: ws.clone(),
+                original_query: task.clone(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                state: task_working_state.clone(),
+            };
+            let _ = TaskManager::save_task_state(ws, &record);
+        }
 
         streaming_feedback.complete_phase("research");
 
@@ -476,10 +1060,7 @@ impl StreamingAgentOrchestrator {
         // ── 2. STEERING CONTEXT LOADING ─────────────────────────────────────
         if let Some(ws) = &workspace_path {
             let s = steering.read();
-            let current_file_path = active_file.as_ref()
-                .and_then(|f| f.get("path"))
-                .and_then(|p| p.as_str());
-            let _ = s.load_steering_files_for_context(ws, current_file_path);
+            let _ = s.load_steering_files_for_context(ws, active_file_path);
         }
 
         // ── 3. CONTEXT BUILDING ─────────────────────────────────────────────
@@ -508,6 +1089,9 @@ impl StreamingAgentOrchestrator {
         let mut workspace_context = self.build_workspace_context(
             &workspace_path, &active_file, &task,
             code_intel.clone(), steering.clone(),
+            &task_problem_analysis,
+            &task_working_state,
+            workspace_context_snapshot.as_ref(),
         );
 
         // Optimize context using ContextOptimizer if workspace is available
@@ -541,16 +1125,25 @@ impl StreamingAgentOrchestrator {
         }
 
         // Current task message
-        let final_task_msg = if !research_findings.is_empty() {
-            format!("Task: {}\n\nPlease analyze the task, explore the codebase if needed, execute the necessary changes, and verify the results.\n\n<research_findings>\n{}\n</research_findings>", task.clone(), research_findings)
+        let mut final_task_msg = if !research_findings.is_empty() {
+            format!(
+                "Task: {}\n\n<research_findings>\n{}\n</research_findings>\n",
+                task.clone(),
+                research_findings
+            )
         } else {
-            format!("Task: {}\nPlease analyze the task, explore the codebase if needed, execute the necessary changes, and verify the results.", task.clone())
+            format!("Task: {}\n", task.clone())
         };
 
         // ── INTELLIGENT PROBLEM ANALYSIS ────────────────────────────────────
         // Analyze the problem to provide targeted investigation guidance
-        let problem_analysis = Self::analyze_problem_intelligently(&task);
-        let final_task_msg = format!("{}{}", final_task_msg, problem_analysis);
+        let problem_analysis = format!(
+            "\n\n<intelligent_investigation>\n## Problem Analysis\n\n**Task kind:** {}\n\n**Focus summary:** {}\n\n{}\n</intelligent_investigation>\n",
+            task_problem_analysis.task_kind,
+            task_problem_analysis.focus_summary,
+            task_problem_analysis.investigation_strategy
+        );
+        final_task_msg.push_str(&problem_analysis);
 
         // ── CONTEXT MEMORY: Inject prior patterns into task message ──────────
         // Query for relevant strategies and error patterns from past executions
@@ -598,12 +1191,13 @@ impl StreamingAgentOrchestrator {
             String::new()
         };
 
-        let final_task_msg = format!("{}{}", final_task_msg, context_memory_hint);
+        final_task_msg.push_str(&context_memory_hint);
 
         turn_messages.push((
             "user".to_string(),
             final_task_msg,
         ));
+        let task_state_message_index = turn_messages.len() - 1;
 
         // Emit execution phase
         if let Some(app) = &self.app_handle {
@@ -668,7 +1262,7 @@ impl StreamingAgentOrchestrator {
             // Now: LLM streams → tools identified immediately → first tool executes while LLM continues → remaining tools queue
             let streaming_results = self.execute_tools_from_stream(
                 &turn_messages,
-                model_name,
+                &model,
                 iteration,
                 &workspace_path,
                 recovery.clone(),
@@ -687,12 +1281,13 @@ impl StreamingAgentOrchestrator {
 
             // Collect tool calls, results, and the raw LLM text (no extra Ollama call needed)
             let mut raw_llm_text = String::new();
+            let mut assistant_artifact_path: Option<String> = None;
             for (tool_call_or_text, result) in streaming_results {
                 // The last entry with tool=="__response__" carries the full response text
-                if tool_call_or_text.tool == "__response__" {
-                    raw_llm_text = result.unwrap_or_default();
-                    continue;
-                }
+            if tool_call_or_text.tool == "__response__" {
+                raw_llm_text = result.unwrap_or_default();
+                continue;
+            }
                 
                 // Extract rejected tools from the special marker entry
                 if tool_call_or_text.tool == "__rejected_tools__" {
@@ -709,6 +1304,8 @@ impl StreamingAgentOrchestrator {
                     Ok(r) => {
                         tool_results.push(format!("[{}] result:\n{}", tool_call_or_text.tool, r));
                         eprintln!("[Agent] Tool {} succeeded", tool_call_or_text.tool);
+                        task_working_state.note_iteration(iteration, Some(&tool_call_or_text.tool));
+                        task_working_state.record_tool_success(&tool_call_or_text.tool, r);
                         
                         // Update task status if task manager is available
                         if let Some(ref mut task_file) = task_manager_instance {
@@ -754,6 +1351,8 @@ impl StreamingAgentOrchestrator {
                     Err(e) => {
                         tool_results.push(format!("[{}] error:\n{}", tool_call_or_text.tool, e));
                         eprintln!("[Agent] Tool {} failed: {}", tool_call_or_text.tool, e);
+                        task_working_state.note_iteration(iteration, Some(&tool_call_or_text.tool));
+                        task_working_state.record_tool_failure(&tool_call_or_text.tool, &e.to_string());
                         
                         // Update task status if task manager is available
                         if let Some(ref mut task_file) = task_manager_instance {
@@ -801,11 +1400,38 @@ impl StreamingAgentOrchestrator {
                 all_tool_calls.push(tool_call_or_text.clone());
                 if tool_call_or_text.tool == "done" { done = true; }
             }
+            let done_only_turn = !tool_calls.is_empty() && tool_calls.iter().all(|tc| tc.tool == "done");
+            if done_only_turn {
+                done = true;
+                tool_results.clear();
+            }
+
+            task_working_state.note_iteration(iteration, None);
+            if task_state_message_index < turn_messages.len() {
+                turn_messages[task_state_message_index].1 = task_working_state.to_prompt_block();
+            }
+            if let Some(ws) = &workspace_path {
+                let record = TaskStateRecord {
+                    workspace_path: ws.clone(),
+                    original_query: task.clone(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                    state: task_working_state.clone(),
+                };
+                let _ = TaskManager::save_task_state(ws, &record);
+            }
 
             // ── STALL DETECTION (No extra Ollama calls — reuse already-captured text) ──
             // Mirrors Electron's heuristic: check for thinking-only, instructional prose,
             // malformed JSON intent, or natural completion. Only make a correction call
             // when the model clearly tried to output tool JSON but mangled the syntax.
+            if tool_calls.is_empty() && !done {
+                let recovered_tools = extract_tool_calls(&raw_llm_text);
+                if !recovered_tools.is_empty() {
+                    eprintln!("[Agent] Recovered {} tool call(s) from raw response text", recovered_tools.len());
+                    tool_calls = recovered_tools;
+                }
+            }
+
             if tool_calls.is_empty() && !done {
                 eprintln!("[Agent] No tools in stream — analysing response text...");
                 eprintln!("[Agent] Response length: {} chars", raw_llm_text.len());
@@ -828,9 +1454,11 @@ impl StreamingAgentOrchestrator {
                     error_msg.push_str("\n📋 REQUIRED ARGUMENTS BY TOOL:\n");
                     error_msg.push_str("• read_file, write_file, edit_file, multi_edit_file, create_file, delete_file, move_file, rename_file: MUST have \"path\"\n");
                     error_msg.push_str("• run_command: MUST have \"command\"\n");
-                    error_msg.push_str("• grep_search, search_files: MUST have \"query\"\n");
+                    error_msg.push_str("• grep_search: MUST have \"query\"\n");
+                    error_msg.push_str("• search_files: MUST have \"pattern\"\n");
                     error_msg.push_str("\n✅ EXAMPLE OF CORRECT FORMAT:\n");
-                    error_msg.push_str("{\"thought\": \"Reading the file to understand the issue\", \"tool\": \"read_file\", \"args\": {\"path\": \"src/components/Chat/ChatPanel.tsx\"}}\n");
+                    error_msg.push_str("{\"thought\": \"Narrowing the search space with workspace search before opening files\", \"tool\": \"semantic_search\", \"args\": {\"query\": \"ChatPanel streaming issue\", \"limit\": 5}}\n");
+                    error_msg.push_str("Then, once a likely file is known, use read_file with path and optional start_line/end_line.\n");
                     
                     // Add aggressive nudge if this is the 3rd consecutive validation error
                     if validation_error_count >= 3 {
@@ -875,12 +1503,12 @@ impl StreamingAgentOrchestrator {
                         // Write to debug file for inspection
                         let debug_file = format!("validation_error_iter_{}.txt", iteration);
                         let _ = std::fs::write(&debug_file, format!("Iteration: {}\nValidation Error Count: {}\n\n=== RAW LLM RESPONSE ===\n{}\n\n=== REJECTED TOOLS ===\n{:?}", iteration, validation_error_count, raw_llm_text, rejected_tools));
-                        eprintln!("[Agent] Debug output written to: {}", debug_file);
+                        //eprintln!("[Agent] Debug output written to: {}", debug_file);
                     }
                     
                     validation_error_count += 1;
                     
-                    let mut error_msg = "[SYSTEM] VALIDATION ERROR: Your tool calls were rejected because they are missing required arguments.\n\n📋 REQUIRED ARGUMENTS:\n• read_file, write_file, edit_file, multi_edit_file, create_file, delete_file, move_file, rename_file: MUST have \"path\"\n• run_command: MUST have \"command\"\n• grep_search, search_files: MUST have \"query\"\n\n✅ EXAMPLE:\n{\"thought\": \"Your reasoning\", \"tool\": \"read_file\", \"args\": {\"path\": \"file.tsx\"}}\n\n".to_string();
+                    let mut error_msg = "[SYSTEM] VALIDATION ERROR: Your tool calls were rejected because they are missing required arguments.\n\n📋 REQUIRED ARGUMENTS:\n• read_file, write_file, edit_file, multi_edit_file, create_file, delete_file, move_file, rename_file: MUST have \"path\"\n• run_command: MUST have \"command\"\n• grep_search: MUST have \"query\"\n• search_files: MUST have \"pattern\"\n\n✅ EXAMPLE:\n{\"thought\": \"First narrow the relevant files with workspace search\", \"tool\": \"semantic_search\", \"args\": {\"query\": \"streaming issue in ChatPanel\", \"limit\": 5}}\n\n".to_string();
                     
                     // Add aggressive nudge if this is the 3rd consecutive validation error
                     if validation_error_count >= 3 {
@@ -896,9 +1524,13 @@ impl StreamingAgentOrchestrator {
                 } else {
                     // No validation error this iteration
                     validation_error_count = 0;
-                    let looks_complete = raw_llm_text.to_uppercase().contains("TASK COMPLETE")
-                    || raw_llm_text.to_uppercase().contains("TASK DONE")
-                    || (raw_llm_text.len() < 400 && iteration > 1);
+                    let trimmed_response = raw_llm_text.trim();
+                    let has_meaningful_text = !trimmed_response.is_empty();
+                    let looks_complete = has_meaningful_text && (
+                        raw_llm_text.to_uppercase().contains("TASK COMPLETE")
+                        || raw_llm_text.to_uppercase().contains("TASK DONE")
+                        || (raw_llm_text.len() < 400 && iteration > 1)
+                    );
 
                 let instructional = raw_llm_text.to_lowercase().contains("you should run")
                     || raw_llm_text.to_lowercase().contains("please run")
@@ -912,6 +1544,12 @@ impl StreamingAgentOrchestrator {
                 eprintln!("[Agent] has_large_json_tool: {}", has_large_json_tool);
                 eprintln!("[Agent] raw_llm_text.len() > 3000: {}", raw_llm_text.len() > 3000);
                 eprintln!("[Agent] raw_llm_text.len() > 1000 && contains \"thought\": {}", raw_llm_text.len() > 1000 && raw_llm_text.contains("\"thought\""));
+                assistant_artifact_path = persist_large_assistant_response(
+                    workspace_path.as_deref(),
+                    iteration,
+                    &raw_llm_text,
+                    &tool_calls,
+                );
 
                 if raw_llm_text.contains("{") && (raw_llm_text.contains("\"tool\"") || raw_llm_text.contains("'tool'")) && !looks_complete {
                     // Model tried to call a tool but syntax was broken — single correction
@@ -922,13 +1560,21 @@ impl StreamingAgentOrchestrator {
                     let recent = &turn_messages[recent_start..];
                     let mut correction_msgs: Vec<(String, String)> = pinned.to_vec();
                     correction_msgs.extend_from_slice(recent);
-                    correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                    correction_msgs.push((
+                        "assistant".to_string(),
+                        build_assistant_history_entry(
+                            &raw_llm_text,
+                            &tool_calls,
+                            MAX_ASSISTANT_HISTORY_CHARS,
+                            assistant_artifact_path.as_deref(),
+                        ),
+                    ));
                     correction_msgs.push(("user".to_string(),
                         "CRITICAL: Your last response had a JSON syntax error or was incomplete. \
                          Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. No markdown, no backticks.".to_string()
                     ));
                     self.suppress_stream = true;
-                    let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    let (fix, _) = self.call_llm_streaming_with_config(&correction_msgs, &model).await?;
                     self.suppress_stream = false;
                     tool_calls = extract_tool_calls(&fix);
                     // Update raw_llm_text so the conversation history reflects the fix
@@ -940,12 +1586,20 @@ impl StreamingAgentOrchestrator {
                         eprintln!("[Agent] Correction failed — sending stronger nudge");
                         let mut retry_msgs: Vec<(String, String)> = pinned.to_vec();
                         retry_msgs.extend_from_slice(recent);
-                        retry_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                        retry_msgs.push((
+                            "assistant".to_string(),
+                            build_assistant_history_entry(
+                                &raw_llm_text,
+                                &tool_calls,
+                                MAX_ASSISTANT_HISTORY_CHARS,
+                                assistant_artifact_path.as_deref(),
+                            ),
+                        ));
                         retry_msgs.push(("user".to_string(),
                             "FINAL WARNING: You MUST use tools. Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. NO OTHER FORMAT.".to_string()
                         ));
                         self.suppress_stream = true;
-                        let (retry_fix, _) = self.call_llm_streaming(&retry_msgs, model_name).await?;
+                        let (retry_fix, _) = self.call_llm_streaming_with_config(&retry_msgs, &model).await?;
                         self.suppress_stream = false;
                         tool_calls = extract_tool_calls(&retry_fix);
                         raw_llm_text.push_str("\n[Retry Correction]: ");
@@ -959,13 +1613,21 @@ impl StreamingAgentOrchestrator {
                     let recent = &turn_messages[recent_start..];
                     let mut correction_msgs: Vec<(String, String)> = pinned.to_vec();
                     correction_msgs.extend_from_slice(recent);
-                    correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                    correction_msgs.push((
+                        "assistant".to_string(),
+                        build_assistant_history_entry(
+                            &raw_llm_text,
+                            &tool_calls,
+                            MAX_ASSISTANT_HISTORY_CHARS,
+                            assistant_artifact_path.as_deref(),
+                        ),
+                    ));
                     correction_msgs.push(("user".to_string(),
                         "CRITICAL: You wrote a tool call in your response instead of using the appropriate tool. \
                          Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. No markdown, no backticks.".to_string()
                     ));
                     self.suppress_stream = true;
-                    let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    let (fix, _) = self.call_llm_streaming_with_config(&correction_msgs, &model).await?;
                     self.suppress_stream = false;
                     tool_calls = extract_tool_calls(&fix);
                     raw_llm_text.push_str("\n[Correction]: ");
@@ -979,13 +1641,21 @@ impl StreamingAgentOrchestrator {
                     let recent = &turn_messages[recent_start..];
                     let mut correction_msgs: Vec<(String, String)> = pinned.to_vec();
                     correction_msgs.extend_from_slice(recent);
-                    correction_msgs.push(("assistant".to_string(), raw_llm_text.clone()));
+                    correction_msgs.push((
+                        "assistant".to_string(),
+                        build_assistant_history_entry(
+                            &raw_llm_text,
+                            &tool_calls,
+                            MAX_ASSISTANT_HISTORY_CHARS,
+                            assistant_artifact_path.as_deref(),
+                        ),
+                    ));
                     correction_msgs.push(("user".to_string(),
                         "CRITICAL: You produced {} characters of prose instead of using tools. \
                          You MUST use write_file/create_file to create files. Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}.".to_string()
                     ));
                     self.suppress_stream = true;
-                    let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    let (fix, _) = self.call_llm_streaming_with_config(&correction_msgs, &model).await?;
                     self.suppress_stream = false;
                     tool_calls = extract_tool_calls(&fix);
                     raw_llm_text.push_str("\n[Correction]: ");
@@ -1005,7 +1675,7 @@ impl StreamingAgentOrchestrator {
                          Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}.".to_string()
                     ));
                     self.suppress_stream = true;
-                    let (fix, _) = self.call_llm_streaming(&correction_msgs, model_name).await?;
+                    let (fix, _) = self.call_llm_streaming_with_config(&correction_msgs, &model).await?;
                     self.suppress_stream = false;
                     tool_calls = extract_tool_calls(&fix);
                     raw_llm_text.push_str("\n[Correction]: ");
@@ -1021,7 +1691,7 @@ impl StreamingAgentOrchestrator {
                             "FINAL WARNING: You MUST use tools. Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}}. NO OTHER FORMAT.".to_string()
                         ));
                         self.suppress_stream = true;
-                        let (retry_fix, _) = self.call_llm_streaming(&retry_msgs, model_name).await?;
+                        let (retry_fix, _) = self.call_llm_streaming_with_config(&retry_msgs, &model).await?;
                         self.suppress_stream = false;
                         tool_calls = extract_tool_calls(&retry_fix);
                         raw_llm_text.push_str("\n[Retry Correction]: ");
@@ -1030,22 +1700,48 @@ impl StreamingAgentOrchestrator {
                 } else if instructional && !looks_complete {
                     // Model explaining instead of acting — nudge without an LLM call
                     eprintln!("[Agent] Model is explaining instead of acting — nudging");
-                    turn_messages.push(("assistant".to_string(), raw_llm_text.clone()));
+                    turn_messages.push((
+                        "assistant".to_string(),
+                        build_assistant_history_entry(
+                            &raw_llm_text,
+                            &tool_calls,
+                            MAX_ASSISTANT_HISTORY_CHARS,
+                            assistant_artifact_path.as_deref(),
+                        ),
+                    ));
                     turn_messages.push(("user".to_string(),
                         "STRICT ACTION REQUIRED: Use your tools IMMEDIATELY. \
                          Output ONLY valid JSON: {\"thought\": \"brief reason\", \"tool\": \"tool_name\", \"args\": {...}} NOW.".to_string()
                     ));
                     continue; // re-enter loop — no extra Ollama call
                 } else {
+                    if !has_meaningful_text {
+                        eprintln!("[Agent] Empty response received — requesting a retry instead of treating it as complete");
+                        turn_messages.push((
+                            "assistant".to_string(),
+                            build_assistant_history_entry(
+                                &raw_llm_text,
+                                &tool_calls,
+                                MAX_ASSISTANT_HISTORY_CHARS,
+                                assistant_artifact_path.as_deref(),
+                            ),
+                        ));
+                        turn_messages.push(("user".to_string(),
+                            "[SYSTEM] ERROR: Your last response was empty. You must output either a valid JSON tool call or a completion response with meaningful text.".to_string()
+                        ));
+                        continue;
+                    }
+
                     // Natural language completion or pure thinking — treat as final response
                     eprintln!("[Agent] Treating as final response");
                     response = raw_llm_text.clone();
+                    done = true;
                 }
                 } // Close the else block for rejected_tools check
             }
 
             // ── LOOP DETECTION (mirrors Electron's repeatCount + ping-pong guard) ──
-            if !tool_calls.is_empty() {
+            if !tool_calls.is_empty() && !done_only_turn {
                 let sig: String = tool_calls.iter()
                     .map(|tc| format!("{}:{}", tc.tool,
                         tc.args.get("path").or(tc.args.get("command"))
@@ -1080,13 +1776,17 @@ impl StreamingAgentOrchestrator {
             }
 
             if tool_calls.is_empty() && response.is_empty() && tool_results.is_empty() {
+                let stall_reason = summarize_stall_reason(&raw_llm_text, &response);
                 steps.push(AgentStep {
                     iteration,
                     tool: "reasoning".to_string(),
                     status: "failed".to_string(),
-                    summary: "Agent stalled".to_string(),
-                    result: Some("Model produced no tool calls and no final text response. Task aborted.".to_string()),
-                    logs: None,
+                    summary: format!("Agent stalled: {}", stall_reason),
+                    result: Some(stall_reason.clone()),
+                    logs: Some(vec![
+                        "Agent stopped without producing a valid tool call or final answer.".to_string(),
+                        format!("Reason: {}", stall_reason),
+                    ]),
                     persona: Some("agent".to_string()),
                     request_id: None,
                     data: None,
@@ -1095,7 +1795,7 @@ impl StreamingAgentOrchestrator {
                     let _ = app.emit("agent:phase", &serde_json::json!({
                         "phase": "execution",
                         "status": "failed",
-                        "description": "Agent stalled without finishing."
+                        "description": stall_reason
                     }));
                 }
                 break;
@@ -1111,15 +1811,21 @@ impl StreamingAgentOrchestrator {
 
             if !tool_calls.is_empty() {
                 // ── (a) Store ASSISTANT response — truncated if oversized ──────
-                let stored_assistant = if raw_llm_text.len() > MAX_ASSISTANT_HISTORY_CHARS {
+                let _stored_assistant = if raw_llm_text.len() > MAX_ASSISTANT_HISTORY_CHARS {
                     eprintln!("[Agent] ⚠️ Truncating large assistant response ({} chars) before storing in history", raw_llm_text.len());
                     format!("{}\n... [response truncated — {} chars total]", &raw_llm_text[..MAX_ASSISTANT_HISTORY_CHARS], raw_llm_text.len())
                 } else {
                     raw_llm_text.clone()
                 };
+                let stored_assistant = build_assistant_history_entry(
+                    &raw_llm_text,
+                    &tool_calls,
+                    MAX_ASSISTANT_HISTORY_CHARS,
+                    assistant_artifact_path.as_deref(),
+                );
                 turn_messages.push(("assistant".to_string(), stored_assistant));
 
-                // Detect: LLM wrote code in prose instead of using write_file tool
+                // Detect: LLM wrote code in prose or keeps re-reading the same file instead of using tools well
                 let has_large_code_block = raw_llm_text.contains("```") && raw_llm_text.len() > 2000;
                 // Also detect: LLM output a large JSON tool call in prose (common pattern for code generation)
                 let has_large_json_tool = raw_llm_text.contains("\"tool\"") && raw_llm_text.len() > 2000;
@@ -1143,7 +1849,7 @@ impl StreamingAgentOrchestrator {
                         // Don't add error message - we handled it automatically
                     } else {
                         // No tool calls found in prose, add error message
-                        tool_results.insert(0, "[SYSTEM] CODE IN PROSE DETECTED: You wrote code or a tool call in your response instead of using the appropriate tool. You MUST use write_file/create_file to create files. Do NOT include file contents or tool calls in your reasoning — call the tool directly.".to_string());
+                        tool_results.insert(0, "[SYSTEM] CODE IN PROSE DETECTED: You wrote code or a tool call in your response instead of using the appropriate tool. You MUST use write_file/create_file to create files. Do NOT include file contents or tool calls in your reasoning — call the tool directly. Also, do not reread the same file repeatedly; use semantic_search/find_symbols first, then narrow read_file windows only when needed.".to_string());
                         eprintln!("[Agent] ⚠️ LLM wrote code/tool in prose — no extractable tool calls found");
                     }
                 }
@@ -1156,7 +1862,7 @@ impl StreamingAgentOrchestrator {
                     // Truncate each result individually
                     let truncated: Vec<String> = tool_results.iter().map(|r| {
                         if r.len() > MAX_TOOL_RESULT_CHARS {
-                            format!("{}\n... (truncated for brevity, {} chars total. Use read_file with lines for more context if needed.)", &r[..MAX_TOOL_RESULT_CHARS], r.len())
+                        format!("{}\n... (truncated for brevity, {} chars total. Prefer workspace search (`semantic_search`) or find_symbols to narrow follow-up reads, then use read_file with lines for exact context.)", &r[..MAX_TOOL_RESULT_CHARS], r.len())
                         } else {
                             r.clone()
                         }
@@ -1170,7 +1876,7 @@ impl StreamingAgentOrchestrator {
                     
                     if failed_count > 0 {
                         results_msg.push_str(&format!(
-                            "\n\n⚠️ {} tool(s) failed. Analyze the error above, rethink your approach, and try a more specific command.",
+                        "\n\n⚠️ {} tool(s) failed. Analyze the error above, rethink your approach, and try a more specific command. For repo exploration, prefer workspace search (`semantic_search`) or find_symbols before broad file reads.",
                             failed_count
                         ));
                     }
@@ -1185,12 +1891,20 @@ impl StreamingAgentOrchestrator {
                     }
                     
                     // ── PROTOCOL REMINDER (Essential for local model consistency) ──
-                    results_msg.push_str("\n\nPROMPT: Analyze the results above. Output ONLY valid JSON: {\"thought\": \"your reasoning\", \"tool\": \"tool_name\", \"args\": {...}}");
+                    results_msg.push_str("\n\nPROMPT: Analyze the results above. For exploration, prefer workspace search (`semantic_search`) first, then find_symbols, then narrow read_file. Output ONLY valid JSON: {\"thought\": \"your reasoning\", \"tool\": \"tool_name\", \"args\": {...}}");
 
                     turn_messages.push(("user".to_string(), results_msg));
                 }
             } else if !response.is_empty() {
-                turn_messages.push(("assistant".to_string(), response));
+                turn_messages.push((
+                    "assistant".to_string(),
+                    build_assistant_history_entry(
+                        &response,
+                        &[],
+                        MAX_ASSISTANT_HISTORY_CHARS,
+                        assistant_artifact_path.as_deref(),
+                    ),
+                ));
             }
 
             if done { break; }
@@ -1363,13 +2077,16 @@ impl StreamingAgentOrchestrator {
         task: &str,
         workspace_path: &str,
         active_file: &Option<serde_json::Value>,
-        model_name: &str,
+        model_config: &serde_json::Value,
         vector_system: Arc<std::sync::Mutex<crate::commands::vector_search::VectorSearchSystem>>,
         code_intel: Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
         app_state_ref: Arc<RwLock<AppState>>,
+        problem_analysis: &ProblemAnalysis,
+        task_working_state: &TaskWorkingState,
     ) -> Result<String> {
         let config = crate::commands::prompts::get_sub_agent_config("context-gatherer")
             .ok_or_else(|| "Context Gatherer config not found".to_string())?;
+        let routing = get_task_routing_profile(&problem_analysis.task_kind);
         let grounding_context = {
             let mut summary = String::new();
             if let Ok(intel) = code_intel.lock() {
@@ -1389,10 +2106,13 @@ impl StreamingAgentOrchestrator {
             if let Ok(system) = vector_system.lock() {
                 if let Ok(stats) = system.get_index_stats() {
                     summary.push_str(&format!(
-                        "<semantic_index>\nChunks: {}\nFiles indexed: {}\nLast updated: {}\n</semantic_index>\n",
+                        "<workspace_search>\nChunks: {}\nFiles scanned: {}\nLast updated: {}\n</workspace_search>\n",
                         stats.total_chunks,
                         stats.total_files,
-                        stats.last_updated,
+                        stats
+                            .last_index_time
+                            .map(|timestamp| timestamp.to_string())
+                            .unwrap_or_else(|| "never".to_string()),
                     ));
                 }
             }
@@ -1403,12 +2123,15 @@ impl StreamingAgentOrchestrator {
             active_file,
             task,
             code_intel.clone(),
+            problem_analysis,
+            task_working_state,
+            None,
         );
 
         let mut sub_agent_msgs = vec![
             ("system".to_string(), config.system_prompt),
             ("user".to_string(), format!(
-                "CODEBASE RESEARCH TASK:\n{}\n\nWorkspace: {}\nActive File: {:?}\n\n{}{}\n<research_rules>\n- Prefer local repository sources first: semantic_search, find_symbols, search_files, read_file.\n- Do not start by reading whole files when cached workspace context, semantic search, or symbol search can narrow the scope.\n- When an error mentions a file or line, inspect that file and a narrow line window first.\n- Expand to dependent files only after you identify the local cause.\n- Use external web research only when local evidence is insufficient.\n- When using external sources, cite URLs and clearly separate external findings from local codebase findings.\n- Call out uncertainty instead of presenting guesses as facts.\n</research_rules>",
+                "CODEBASE RESEARCH TASK:\n{}\n\nWorkspace: {}\nActive File: {:?}\n\n{}{}\n<research_rules>\n- Prefer local repository sources first: workspace search (`semantic_search`), find_symbols, search_files, read_file.\n- Do not start by reading whole files when cached workspace context, workspace search, or symbol search can narrow the scope.\n- When an error mentions a file or line, inspect that file and a narrow line window first.\n- Expand to dependent files only after you identify the local cause.\n- Use external web research only when local evidence is insufficient.\n- When using external sources, cite URLs and clearly separate external findings from local codebase findings.\n- Call out uncertainty instead of presenting guesses as facts.\n</research_rules>",
                 task,
                 workspace_path,
                 active_file,
@@ -1419,8 +2142,8 @@ impl StreamingAgentOrchestrator {
 
         self.run_sub_agent_loop(
             &mut sub_agent_msgs,
-            model_name,
-            config.max_iterations.unwrap_or(5),
+            model_config,
+            config.max_iterations.unwrap_or(5).min(routing.research_iterations),
             workspace_path,
             vector_system,
             code_intel,
@@ -1431,7 +2154,7 @@ impl StreamingAgentOrchestrator {
     async fn run_sub_agent_loop(
         &mut self,
         messages: &mut Vec<(String, String)>,
-        model_name: &str,
+        model_config: &serde_json::Value,
         max_iters: u32,
         workspace_path: &str,
         vector_system: Arc<std::sync::Mutex<crate::commands::vector_search::VectorSearchSystem>>,
@@ -1445,14 +2168,14 @@ impl StreamingAgentOrchestrator {
             iteration += 1;
             eprintln!("[Sub-Agent] Iteration {}/{}", iteration, max_iters);
 
-            let (response_text, _) = self.call_llm_streaming(messages, model_name).await?;
+            let (response_text, _) = self.call_llm_streaming_with_config(messages, model_config).await?;
             messages.push(("assistant".to_string(), response_text.clone()));
 
             let tool_calls = extract_tool_calls(&response_text);
             if tool_calls.is_empty() {
                 if iteration == 1 {
                     eprintln!("[Sub-Agent] ⚠️ Agent tried to exit on iteration 1. Forcing tool usage.");
-                    messages.push(("user".to_string(), "[SYSTEM] You did not use any tools. You are a Research Unit. You MUST use tools (like search_files, read_file, or semantic_search) to gather context before returning a summary. Try again.".to_string()));
+            messages.push(("user".to_string(), "[SYSTEM] You did not use any tools. You are a Research Unit. You MUST use tools (like search_files, read_file, or workspace search via `semantic_search`) to gather context before returning a summary. Try again.".to_string()));
                     continue;
                 }
                 final_summary = response_text.clone();
@@ -1460,24 +2183,62 @@ impl StreamingAgentOrchestrator {
             }
 
             let mut results = Vec::new();
-            for tool_call in tool_calls.iter() {
-                eprintln!("[Sub-Agent] Executing tool: {}", tool_call.tool);
-                // Sub-agents always use standalone execution (no complex recovery)
-                let result = execute_tool_standalone(
-                    tool_call,
-                    &Some(workspace_path.to_string()),
-                    &vector_system,
-                    &code_intel,
-                    self.app_handle.as_ref(),
-                ).await;
-                
-                match result {
-                    Ok(r) => results.push(format!("[{}] result:\n{}", tool_call.tool, r)),
-                    Err(e) => results.push(format!("[{}] error:\n{}", tool_call.tool, e)),
+            let tool_groups = identify_independent_tool_groups(&tool_calls);
+
+            for group in tool_groups {
+                if group.is_empty() {
+                    continue;
                 }
-                
-                if tool_call.tool == "done" {
-                    iteration = max_iters; // Break outer loop
+
+                let group_calls: Vec<ToolCall> = group.iter().map(|idx| tool_calls[*idx].clone()).collect();
+                let can_run_parallel = group_calls.len() > 1
+                    && group_calls.iter().all(|call| is_parallel_readonly_tool(call.tool.as_str()));
+
+                if can_run_parallel {
+                    let workspace_for_group = Some(workspace_path.to_string());
+                    eprintln!(
+                        "[Sub-Agent] Executing {} read-only tools in parallel: {}",
+                        group_calls.len(),
+                        group_calls.iter().map(|call| call.tool.clone()).collect::<Vec<_>>().join(", ")
+                    );
+
+                    let futures = group_calls.iter().map(|tool_call| {
+                        execute_tool_standalone(
+                            tool_call,
+                            &workspace_for_group,
+                            &vector_system,
+                            &code_intel,
+                            None,
+                        )
+                    });
+
+                    for (tool_call, result) in group_calls.iter().zip(join_all(futures).await.into_iter()) {
+                        match result {
+                            Ok(r) => results.push(format!("[{}] result:\n{}", tool_call.tool, r)),
+                            Err(e) => results.push(format!("[{}] error:\n{}", tool_call.tool, e)),
+                        }
+                    }
+                } else {
+                    for tool_call in group_calls.iter() {
+                        eprintln!("[Sub-Agent] Executing tool: {}", tool_call.tool);
+                        let result = execute_tool_standalone(
+                            tool_call,
+                            &Some(workspace_path.to_string()),
+                            &vector_system,
+                            &code_intel,
+                            self.app_handle.as_ref(),
+                        ).await;
+
+                        match result {
+                            Ok(r) => results.push(format!("[{}] result:\n{}", tool_call.tool, r)),
+                            Err(e) => results.push(format!("[{}] error:\n{}", tool_call.tool, e)),
+                        }
+                    }
+                }
+
+                if group_calls.iter().any(|tool_call| tool_call.tool == "done") {
+                    iteration = max_iters;
+                    break;
                 }
             }
             
@@ -1492,7 +2253,321 @@ impl StreamingAgentOrchestrator {
         Ok(final_summary)
     }
 
-    async fn call_llm_streaming(&self, messages: &[(String, String)], model: &str) -> Result<(String, u32)> {
+    async fn emit_text_batches(&self, text: &str, iteration: u32) -> u32 {
+        let mut emitted = 0u32;
+        let llm_start = std::time::Instant::now();
+        let chars = text.chars().collect::<Vec<_>>();
+        for chunk in chars.chunks(24) {
+            let piece = chunk.iter().collect::<String>();
+            emitted += piece.chars().count() as u32;
+            if let Some(app) = &self.app_handle {
+                if !self.suppress_stream {
+                    let _ = app.emit("agent:stream", StreamToken {
+                        token: piece,
+                        iteration,
+                    });
+                }
+                let elapsed = llm_start.elapsed().as_secs_f32().max(0.1);
+                let _ = app.emit("agent:metrics", &serde_json::json!({
+                    "tokens_per_second": emitted as f32 / elapsed,
+                    "total_tokens": emitted,
+                }));
+            }
+        }
+        emitted
+    }
+
+    async fn call_provider_text(
+        &self,
+        messages_json: &[serde_json::Value],
+        model_config: &serde_json::Value,
+    ) -> Result<String> {
+        let provider = get_model_provider(model_config);
+        let model_name = get_model_name(model_config);
+
+        match provider {
+            "openai" => {
+                let api_key = model_config
+                    .get("openaiKey")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("OpenAI API key is missing.")?;
+
+                let payload = serde_json::json!({
+                    "model": model_name,
+                    "messages": messages_json,
+                    "temperature": 0.1,
+                });
+
+                let response = self.client
+                    .post("https://api.openai.com/v1/chat/completions")
+                    .bearer_auth(api_key)
+                    .json(&payload)
+                    .timeout(std::time::Duration::from_secs(300))
+                    .send()
+                    .await
+                    .map_err(|error| format!("Failed to reach OpenAI: {}", error))?;
+
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({}));
+                if !status.is_success() {
+                    let message = payload
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(body.as_str());
+                    return Err(format!("OpenAI request failed ({}): {}", status, message).into());
+                }
+
+                extract_chat_text_from_openai_payload(&payload)
+                    .ok_or_else(|| "OpenAI response did not contain assistant text.".into())
+            }
+            "gemini" => {
+                let api_key = model_config
+                    .get("geminiKey")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("Gemini API key is missing.")?;
+
+                let system_instruction = messages_json
+                    .iter()
+                    .find(|message| message.get("role").and_then(|value| value.as_str()) == Some("system"))
+                    .and_then(|message| message.get("content").and_then(|value| value.as_str()))
+                    .map(|text| serde_json::json!({
+                        "parts": [{ "text": text }]
+                    }));
+
+                let contents = messages_json
+                    .iter()
+                    .filter_map(|message| {
+                        let role = message.get("role").and_then(|value| value.as_str())?;
+                        if role == "system" {
+                            return None;
+                        }
+                        let content = message.get("content").and_then(|value| value.as_str()).unwrap_or("");
+                        Some(serde_json::json!({
+                            "role": if role == "assistant" { "model" } else { "user" },
+                            "parts": [{ "text": content }],
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut payload = serde_json::json!({
+                    "contents": contents,
+                    "generationConfig": {
+                        "temperature": 0.1,
+                    }
+                });
+
+                if let Some(instruction) = system_instruction {
+                    payload["system_instruction"] = instruction;
+                }
+
+                let url = format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                    model_name,
+                    api_key
+                );
+
+                let response = self.client
+                    .post(url)
+                    .json(&payload)
+                    .timeout(std::time::Duration::from_secs(300))
+                    .send()
+                    .await
+                    .map_err(|error| format!("Failed to reach Gemini: {}", error))?;
+
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({}));
+                if !status.is_success() {
+                    let message = payload
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(body.as_str());
+                    return Err(format!("Gemini request failed ({}): {}", status, message).into());
+                }
+
+                extract_chat_text_from_gemini_payload(&payload)
+                    .ok_or_else(|| "Gemini response did not contain assistant text.".into())
+            }
+            "azure-gateway" => {
+                let completion_url = model_config
+                    .get("azureCompletionUrl")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("Azure Gateway completion URL is missing.")?;
+
+                let mut request = self.client
+                    .post(completion_url)
+                    .json(&serde_json::json!({
+                        "model": model_name,
+                        "messages": messages_json,
+                        "temperature": 0.1,
+                    }))
+                    .timeout(std::time::Duration::from_secs(300));
+
+                let token = model_config
+                    .get("azureSessionToken")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("Azure session token is missing or expired. Please regenerate it from Azure settings.")?;
+
+                request = request.bearer_auth(token);
+
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|error| format!("Failed to reach Azure Gateway: {}", error))?;
+
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({}));
+                if !status.is_success() {
+                    let message = payload
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(body.as_str());
+                    return Err(format!("Azure Gateway request failed ({}): {}", status, message).into());
+                }
+
+                extract_chat_text_from_openai_payload(&payload)
+                    .or_else(|| payload.get("response").and_then(|value| value.as_str()).map(|value| value.to_string()))
+                    .ok_or_else(|| "Azure Gateway response did not contain assistant text.".into())
+            }
+            "bedrock" => {
+                let region = model_config
+                    .get("bedrockRegion")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("Bedrock region is missing.")?;
+                let access_key = model_config
+                    .get("bedrockAccessKey")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("Bedrock access key is missing.")?;
+                let secret_key = model_config
+                    .get("bedrockSecretKey")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("Bedrock secret key is missing.")?;
+
+                let temp_file = std::env::temp_dir().join(format!("whizcode-bedrock-{}.json", uuid::Uuid::new_v4()));
+                let body = if model_name.starts_with("anthropic.") {
+                    let messages = messages_json.iter().filter_map(|message| {
+                        let role = message.get("role").and_then(|value| value.as_str())?;
+                        if role == "system" {
+                            return None;
+                        }
+                        let content = message.get("content").and_then(|value| value.as_str()).unwrap_or("");
+                        Some(serde_json::json!({
+                            "role": if role == "assistant" { "assistant" } else { "user" },
+                            "content": [{ "type": "text", "text": content }],
+                        }))
+                    }).collect::<Vec<_>>();
+                    serde_json::json!({
+                        "anthropic_version": "bedrock-2023-05-31",
+                        "max_tokens": 4096,
+                        "messages": messages,
+                        "temperature": 0.1,
+                    })
+                } else {
+                    serde_json::json!({
+                        "prompt": build_plaintext_prompt(messages_json),
+                        "max_gen_len": 2048,
+                        "temperature": 0.1,
+                    })
+                };
+
+                let body_string = body.to_string();
+                let output = tokio::process::Command::new("aws")
+                    .args([
+                        "bedrock-runtime",
+                        "invoke-model",
+                        "--model-id",
+                        model_name,
+                        "--region",
+                        region,
+                        "--body",
+                        &body_string,
+                        "--content-type",
+                        "application/json",
+                        "--accept",
+                        "application/json",
+                        "--cli-binary-format",
+                        "raw-in-base64-out",
+                        temp_file.to_string_lossy().as_ref(),
+                    ])
+                    .env("AWS_ACCESS_KEY_ID", access_key)
+                    .env("AWS_SECRET_ACCESS_KEY", secret_key)
+                    .env("AWS_DEFAULT_REGION", region)
+                    .output()
+                    .await
+                    .map_err(|error| format!("Failed to start AWS CLI for Bedrock: {}. Install the AWS CLI or add native Bedrock SDK support.", error))?;
+
+                if !output.status.success() {
+                    return Err(format!(
+                        "Bedrock request failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ).into());
+                }
+
+                let body = tokio::fs::read_to_string(&temp_file)
+                    .await
+                    .map_err(|error| format!("Failed to read Bedrock response: {}", error))?;
+                let _ = tokio::fs::remove_file(&temp_file).await;
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({}));
+
+                if model_name.starts_with("anthropic.") {
+                    payload
+                        .get("content")
+                        .and_then(|content| content.as_array())
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
+                        .ok_or_else(|| "Bedrock response did not contain Claude text.".into())
+                } else {
+                    payload
+                        .get("generation")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string())
+                        .or_else(|| payload.get("output").and_then(|value| value.as_str()).map(|value| value.to_string()))
+                        .ok_or_else(|| "Bedrock response did not contain model text.".into())
+                }
+            }
+            unsupported => Err(format!("Unsupported model provider: {}", unsupported).into()),
+        }
+    }
+
+    async fn call_llm_streaming_with_config(
+        &self,
+        messages: &[(String, String)],
+        model_config: &serde_json::Value,
+    ) -> Result<(String, u32)> {
+        let provider = get_model_provider(model_config);
+        let model = get_model_name(model_config);
+
+        if provider != "ollama" {
+            let mut messages_json = Vec::new();
+            for (role, content) in messages.iter() {
+                messages_json.push(serde_json::json!({
+                    "role": role,
+                    "content": content,
+                }));
+            }
+
+            let response_text = self.call_provider_text(&messages_json, model_config).await?;
+            let token_count = self.emit_text_batches(&response_text, 0).await;
+            return Ok((response_text, token_count));
+        }
+
         let mut messages_json = Vec::new();
         // Context sliding window: always keep system prompt (idx 0) + workspace primer (idx 1, 2)
         // and fill the rest of the budget with the newest messages first.
@@ -1511,11 +2586,11 @@ impl StreamingAgentOrchestrator {
         included_indices.insert(2);
         included_indices.insert(3);
 
+        let limit = (self.context_length as usize * 4).saturating_sub(4_000).max(8_000);
         for (i, (_role, content)) in iter_messages {
             if i <= 3 || included_indices.contains(&i) { continue; }
             // Budget: 4 chars ≈ 1 token; reserve tokens for the LLM's response
             // Aim to keep the prompt size within context limit
-            let limit = (self.context_length as usize * 4).saturating_sub(4_000).max(8_000);
             if char_count + content.len() < limit {
                 included_indices.insert(i);
                 char_count += content.len();
@@ -1531,7 +2606,25 @@ impl StreamingAgentOrchestrator {
             }
         }
 
-        eprintln!("[LLM] Calling chat endpoint {} with {}/{} messages (optimized context)", model, included_indices.len(), messages.len());
+        let omitted_messages = messages.len().saturating_sub(included_indices.len());
+        eprintln!(
+            "[LLM] Calling chat endpoint {} with {}/{} messages (~{} chars, limit {}, omitted {})",
+            model,
+            included_indices.len(),
+            messages.len(),
+            char_count,
+            limit,
+            omitted_messages
+        );
+        emit_prompt_diagnostics(
+            &self.app_handle,
+            "call_llm_streaming",
+            included_indices.len(),
+            messages.len(),
+            char_count,
+            limit,
+            omitted_messages,
+        );
 
         let payload = serde_json::json!({
             "model": model,
@@ -2072,7 +3165,7 @@ impl StreamingAgentOrchestrator {
     async fn execute_tools_from_stream(
         &mut self,
         messages: &[(String, String)],
-        model_name: &str,
+        model_config: &serde_json::Value,
         iteration: u32,
         workspace_path: &Option<String>,
         recovery: Arc<std::sync::Mutex<crate::commands::error_recovery::ErrorRecoverySystem>>,
@@ -2082,11 +3175,74 @@ impl StreamingAgentOrchestrator {
     // Returns tool results PLUS a sentinel entry (tool=="__response__", result=Ok(full_text))
     // so the caller can reuse the already-streamed LLM text without a second Ollama call.
     ) -> Result<Vec<(ToolCall, Result<String>)>> {
+        if get_model_provider(model_config) != "ollama" {
+            let mut messages_json = Vec::new();
+            for (role, content) in messages.iter() {
+                messages_json.push(serde_json::json!({
+                    "role": role,
+                    "content": content,
+                }));
+            }
+
+            let response_text = self.call_provider_text(&messages_json, model_config).await?;
+            let _ = self.emit_text_batches(&response_text, iteration).await;
+            let tool_calls = extract_tool_calls(&response_text);
+            let mut executed_results = Vec::new();
+            let mut read_counts = std::collections::HashMap::new();
+            let mut read_windows = std::collections::HashSet::new();
+
+            for (tool_idx, tool_call) in tool_calls.iter().enumerate() {
+                if let Some(skip_reason) = should_skip_redundant_file_read(
+                    tool_call,
+                    workspace_path,
+                    &mut read_counts,
+                    &mut read_windows,
+                ) {
+                    let skip_step = AgentStep {
+                        iteration,
+                        tool: tool_call.tool.clone(),
+                        status: "skipped".to_string(),
+                        summary: format!("Skipped {}: {}", tool_call.tool, skip_reason),
+                        result: Some(skip_reason.clone()),
+                        logs: Some(vec![skip_reason.clone()]),
+                        persona: Some("agent".to_string()),
+                        request_id: Some(format!("tool_{}_{}_skip", iteration, tool_idx)),
+                        data: build_step_data(tool_call),
+                    };
+                    self.emit_step(skip_step).await;
+                    executed_results.push((tool_call.clone(), Ok(skip_reason)));
+                    continue;
+                }
+
+                let result = self.execute_tool_with_recovery(
+                    tool_call,
+                    workspace_path,
+                    iteration,
+                    tool_idx,
+                    recovery.clone(),
+                    app_state_ref.clone(),
+                    messages,
+                    get_model_name(model_config),
+                    vector_system.clone(),
+                    code_intel.clone(),
+                ).await;
+                executed_results.push((tool_call.clone(), result));
+            }
+
+            executed_results.push((
+                ToolCall { tool: "__response__".to_string(), args: serde_json::json!({}) },
+                Ok(response_text),
+            ));
+            return Ok(executed_results);
+        }
+
         let mut tool_queue = Vec::new();
         let mut executed_results = Vec::new();
         let mut json_parser = crate::commands::streaming_agent_flow::IncrementalJsonParser::new();
         let mut tool_counter = 0u32;
         let mut rejected_tools = Vec::new(); // Track rejected tool calls
+        let mut read_counts = std::collections::HashMap::new();
+        let mut read_windows = std::collections::HashSet::new();
         let llm_start = std::time::Instant::now();
         let mut streamed_token_count = 0u32;
         let mut stream_batch = String::new();
@@ -2106,9 +3262,9 @@ impl StreamingAgentOrchestrator {
         included_indices.insert(2);
         included_indices.insert(3);
 
+        let limit = (self.context_length as usize * 4).saturating_sub(4_000).max(8_000);
         for (i, (_role, content)) in iter_messages {
             if i <= 3 || included_indices.contains(&i) { continue; }
-            let limit = (self.context_length as usize * 4).saturating_sub(4_000).max(8_000);
             if char_count + content.len() < limit {
                 included_indices.insert(i);
                 char_count += content.len();
@@ -2124,7 +3280,24 @@ impl StreamingAgentOrchestrator {
             }
         }
 
-        eprintln!("[Phase 4] PHASE 1: Identifying all tools from LLM stream");
+        let omitted_messages = messages.len().saturating_sub(included_indices.len());
+        eprintln!(
+            "[Phase 4] PHASE 1: Identifying all tools from LLM stream with {}/{} messages (~{} chars, limit {}, omitted {})",
+            included_indices.len(),
+            messages.len(),
+            char_count,
+            limit,
+            omitted_messages
+        );
+        emit_prompt_diagnostics(
+            &self.app_handle,
+            "execute_tools_from_stream",
+            included_indices.len(),
+            messages.len(),
+            char_count,
+            limit,
+            omitted_messages,
+        );
         eprintln!("[Phase 1 Debug] Sending {} messages to LLM:", messages_json.len());
         for (i, msg) in messages_json.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("unknown");
@@ -2139,7 +3312,7 @@ impl StreamingAgentOrchestrator {
         }
 
         let payload = serde_json::json!({
-            "model": model_name,
+            "model": get_model_name(model_config),
             "messages": messages_json,
             "stream": true,
             "temperature": 0.1,
@@ -2301,50 +3474,162 @@ impl StreamingAgentOrchestrator {
                 // ─────────────────────────────────────────────────────────
                 eprintln!("[Phase 4] PHASE 2: Executing tools sequentially");
                 
-                let mut current_index = 0;
-                while current_index < tool_queue.len() {
+                let tool_groups = identify_independent_tool_groups(&tool_queue);
+                let model_name = get_model_name(model_config);
+
+                for (group_index, group) in tool_groups.iter().enumerate() {
                     if crate::commands::agent::is_agent_cancelled() { break; }
 
-                    let tool_call = tool_queue[current_index].clone();
-                    
-                    // Skip terminal tools
-                    // 'done' is handled by the caller, but 'ask_user' must be executed to block/interrupt.
-                    if tool_call.tool == "done" {
-                        eprintln!("[Phase 4] LLM signaled completion with 'done'. Stopping queue.");
-                        break; 
-                    }
-                    
-                    if tool_call.tool == "ask_user" {
-                        eprintln!("[Phase 4] LLM needs info via 'ask_user'. Executing and stopping queue.");
-                        let result = self.execute_tool_with_recovery(
-                            &tool_call, workspace_path, iteration, current_index,
-                            recovery.clone(), app_state_ref.clone(), messages, model_name,
-                            vector_system.clone(), code_intel.clone(),
-                        ).await;
-                        executed_results.push((tool_call.clone(), result));
-                        break; // Stop the queue to allow user feedback to become the next input
+                    let group_calls: Vec<ToolCall> = group.iter().map(|idx| tool_queue[*idx].clone()).collect();
+                    if group_calls.is_empty() {
+                        continue;
                     }
 
-                    eprintln!("[Phase 4] Executing tool {} of {}: {}", current_index + 1, tool_queue.len(), tool_call.tool);
-                    
-                    let result = self.execute_tool_with_recovery(
-                        &tool_call,
-                        workspace_path,
-                        iteration,
-                        current_index,
-                        recovery.clone(),
-                        app_state_ref.clone(),
-                        messages,
-                        model_name,
-                        vector_system.clone(),
-                        code_intel.clone(),
-                    ).await;
+                    let can_run_parallel = group_calls.len() > 1
+                        && group_calls.iter().all(|call| is_parallel_readonly_tool(call.tool.as_str()));
 
-                    // Tools are executed directly without blocking LLM recovery calls.
-                    // Errors are captured in `result` and fed to the next main loop iteration
-                    // where the model has full context to recover naturally.
-                    executed_results.push((tool_call.clone(), result));
-                    current_index += 1;
+                    if can_run_parallel {
+                        eprintln!(
+                            "[Phase 4] Executing {} read-only tools in parallel: {}",
+                            group_calls.len(),
+                            group_calls.iter().map(|call| call.tool.clone()).collect::<Vec<_>>().join(", ")
+                        );
+
+                        let mut parallel_calls = Vec::new();
+                        for (tool_idx, tool_call) in group_calls.iter().enumerate() {
+                            if let Some(skip_reason) = should_skip_redundant_file_read(
+                                tool_call,
+                                workspace_path,
+                                &mut read_counts,
+                                &mut read_windows,
+                            ) {
+                                let skip_step = AgentStep {
+                                    iteration,
+                                    tool: tool_call.tool.clone(),
+                                    status: "skipped".to_string(),
+                                    summary: format!("Skipped {}: {}", tool_call.tool, skip_reason),
+                                    result: Some(skip_reason.clone()),
+                                    logs: Some(vec![skip_reason.clone()]),
+                                    persona: Some("agent".to_string()),
+                                    request_id: Some(format!("tool_{}_parallel_{}_{}_skip", iteration, group_index, tool_idx)),
+                                    data: build_step_data(tool_call),
+                                };
+                                self.emit_step(skip_step).await;
+                                executed_results.push((tool_call.clone(), Ok(skip_reason)));
+                                continue;
+                            }
+
+                            let args_json = serde_json::to_string(&tool_call.args)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            let running_step = AgentStep {
+                                iteration,
+                                tool: tool_call.tool.clone(),
+                                status: "running".to_string(),
+                                summary: format!("Executing {} with args: {}", tool_call.tool, args_json),
+                                result: None,
+                                logs: None,
+                                persona: Some("agent".to_string()),
+                                request_id: Some(format!("tool_{}_parallel_{}_{}", iteration, group_index, tool_idx)),
+                                data: None,
+                            };
+                            self.emit_step(running_step).await;
+                            parallel_calls.push((tool_idx, tool_call.clone()));
+                        }
+
+                        let workspace_for_group = workspace_path.clone();
+                        let futures = parallel_calls.iter().map(|(_, tool_call)| {
+                            execute_tool_standalone(
+                                tool_call,
+                                &workspace_for_group,
+                                &vector_system,
+                                &code_intel,
+                                self.app_handle.as_ref(),
+                            )
+                        });
+
+                        let parallel_results = join_all(futures).await;
+                        for ((tool_idx, tool_call), result) in parallel_calls.into_iter().zip(parallel_results.into_iter()) {
+                            let status = if result.is_ok() { "completed" } else { "failed" };
+                            let result_text = result.as_ref().ok().cloned();
+                            let completed_step = AgentStep {
+                                iteration,
+                                tool: tool_call.tool.clone(),
+                                status: status.to_string(),
+                                summary: format!("Executed {} with args: {}", tool_call.tool, serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string())),
+                                result: result_text.clone(),
+                                logs: extract_completion_logs(&tool_call.tool, result_text.as_ref()),
+                                persona: Some("agent".to_string()),
+                                request_id: Some(format!("tool_{}_parallel_{}_{}", iteration, group_index, tool_idx)),
+                                data: None,
+                            };
+                            self.emit_step(completed_step).await;
+                            executed_results.push((tool_call.clone(), result));
+                        }
+                    } else {
+                        for (tool_idx, tool_call) in group_calls.iter().enumerate() {
+                            if crate::commands::agent::is_agent_cancelled() { break; }
+
+                            if tool_call.tool == "done" {
+                                eprintln!("[Phase 4] LLM signaled completion with 'done'. Stopping queue.");
+                                break;
+                            }
+
+                            if tool_call.tool == "ask_user" {
+                                eprintln!("[Phase 4] LLM needs info via 'ask_user'. Executing and stopping queue.");
+                                let result = self.execute_tool_with_recovery(
+                                    tool_call,
+                                    workspace_path,
+                                    iteration,
+                                    tool_idx,
+                                    recovery.clone(),
+                                    app_state_ref.clone(),
+                                    messages,
+                                    &model_name,
+                                    vector_system.clone(),
+                                    code_intel.clone(),
+                                ).await;
+                                executed_results.push((tool_call.clone(), result));
+                                break;
+                            }
+
+                            if let Some(skip_reason) = should_skip_redundant_file_read(
+                                tool_call,
+                                workspace_path,
+                                &mut read_counts,
+                                &mut read_windows,
+                            ) {
+                                let skip_step = AgentStep {
+                                    iteration,
+                                    tool: tool_call.tool.clone(),
+                                    status: "skipped".to_string(),
+                                    summary: format!("Skipped {}: {}", tool_call.tool, skip_reason),
+                                    result: Some(skip_reason.clone()),
+                                    logs: Some(vec![skip_reason.clone()]),
+                                    persona: Some("agent".to_string()),
+                                    request_id: Some(format!("tool_{}_{}_skip", iteration, tool_idx)),
+                                    data: build_step_data(tool_call),
+                                };
+                                self.emit_step(skip_step).await;
+                                executed_results.push((tool_call.clone(), Ok(skip_reason)));
+                                continue;
+                            }
+
+                            eprintln!("[Phase 4] Executing tool {} of {}: {}", tool_idx + 1, group_calls.len(), tool_call.tool);
+                            let result = self.execute_tool_with_recovery(
+                                tool_call,
+                                workspace_path,
+                                iteration,
+                                tool_idx,
+                                recovery.clone(),
+                                app_state_ref.clone(),
+                                messages,
+                                &model_name,
+                                vector_system.clone(),
+                                code_intel.clone(),
+                            ).await;
+                            executed_results.push((tool_call.clone(), result));
+                        }
+                    }
                 }
 
                 eprintln!("[Phase 4] PHASE 2 COMPLETE: {} tools executed", executed_results.len());
@@ -2514,6 +3799,15 @@ impl StreamingAgentOrchestrator {
             .map(|r| r.contains("error:") || r.contains("Error") || r.contains("failed") || r.contains("Failed") || r.contains("SyntaxError") || r.contains("TypeError") || r.contains("does not provide") || r.contains("does not export") || r.contains("ERR_UNKNOWN_FILE_EXTENSION") || r.contains("ERR_MODULE_NOT_FOUND"))
             .unwrap_or(false);
 
+        if tool_result.is_ok() && !has_errors {
+            refresh_incremental_workspace_indexes(
+                tool_call,
+                workspace_path,
+                &vector_system,
+                &code_intel,
+            );
+        }
+
         let status = if tool_result.is_ok() && !has_errors { 
             "completed" 
         } else { 
@@ -2529,7 +3823,7 @@ impl StreamingAgentOrchestrator {
             logs: extract_completion_logs(&tool_call.tool, result_text.as_ref()),
             persona: Some("agent".to_string()),
             request_id: Some(request_id),
-            data: None,
+            data: build_step_data(tool_call),
         };
         self.emit_step(completed_step).await;
 
@@ -2581,7 +3875,10 @@ impl StreamingAgentOrchestrator {
         eprintln!("[Recovery] Asking LLM for recovery strategy for tool: {}", tool_name);
 
         // Call LLM with recovery prompt
-        let (response, _) = self.call_llm_streaming(&recovery_messages, model_name).await?;
+        let (response, _) = self.call_llm_streaming_with_config(&recovery_messages, &serde_json::json!({
+            "provider": "ollama",
+            "model": model_name,
+        })).await?;
 
         // Parse response
         let lines: Vec<&str> = response.lines().collect();
@@ -2652,7 +3949,10 @@ impl StreamingAgentOrchestrator {
         eprintln!("[Alternative] Asking LLM for alternative tool for failed tool: {}", failed_tool);
 
         // Call LLM with recovery prompt
-        let (response, _) = self.call_llm_streaming(&recovery_messages, model_name).await?;
+        let (response, _) = self.call_llm_streaming_with_config(&recovery_messages, &serde_json::json!({
+            "provider": "ollama",
+            "model": model_name,
+        })).await?;
 
         // Parse response to extract tool call
         for line in response.lines() {
@@ -2685,9 +3985,33 @@ impl StreamingAgentOrchestrator {
         model_name: &str,
     ) -> Result<Vec<(ToolCall, Result<String>)>> {
         let mut results = Vec::new();
+        let mut read_counts = std::collections::HashMap::new();
+        let mut read_windows = std::collections::HashSet::new();
 
         for (tool_idx, tool_call) in tool_calls.iter().enumerate() {
             if crate::commands::agent::is_agent_cancelled() { break; }
+
+            if let Some(skip_reason) = should_skip_redundant_file_read(
+                tool_call,
+                workspace_path,
+                &mut read_counts,
+                &mut read_windows,
+            ) {
+                let skip_step = AgentStep {
+                    iteration,
+                    tool: tool_call.tool.clone(),
+                    status: "skipped".to_string(),
+                    summary: format!("Skipped {}: {}", tool_call.tool, skip_reason),
+                    result: Some(skip_reason.clone()),
+                    logs: Some(vec![skip_reason.clone()]),
+                    persona: Some("agent".to_string()),
+                    request_id: Some(format!("tool_{}_{}_skip", iteration, tool_idx)),
+                    data: build_step_data(tool_call),
+                };
+                self.emit_step(skip_step).await;
+                results.push((tool_call.clone(), Ok(skip_reason)));
+                continue;
+            }
 
             // Emit "running" status
             let args_json = serde_json::to_string(&tool_call.args)
@@ -2957,6 +4281,63 @@ impl StreamingAgentOrchestrator {
                                 }
                             }
                         }
+                }
+                }
+
+                let remaining_objects = json_parser.finish();
+                for obj in remaining_objects {
+                    if let Some(tool_name) = obj.get("tool").and_then(|t| t.as_str()) {
+                        let args = obj.get("args").cloned().unwrap_or(serde_json::json!({}));
+
+                        // Validate required arguments for critical tools
+                        let (is_valid, missing_arg) = match tool_name {
+                            "read_file" | "write_file" | "edit_file" | "multi_edit_file" | "create_file" | "delete_file" | "move_file" | "rename_file" => {
+                                if args.get("path").and_then(|p| p.as_str()).is_some() {
+                                    (true, None)
+                                } else {
+                                    (false, Some("path"))
+                                }
+                            },
+                            "run_command" => {
+                                if args.get("command").and_then(|c| c.as_str()).is_some() {
+                                    (true, None)
+                                } else {
+                                    (false, Some("command"))
+                                }
+                            },
+                            _ => (true, None),
+                        };
+
+                        if !is_valid {
+                            eprintln!("[Parser] ⚠️ Tool '{}' missing required argument: {:?}, skipping", tool_name, missing_arg);
+                            continue;
+                        }
+
+                        let tool_id = format!("tool_{}_{}", iteration, tool_counter);
+                        tool_counter += 1;
+
+                        let tool_call = ToolCall {
+                            tool: tool_name.to_string(),
+                            args: args.clone(),
+                        };
+
+                        let args_json = serde_json::to_string(&args)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let identified_step = AgentStep {
+                            iteration,
+                            tool: tool_name.to_string(),
+                            status: "identified".to_string(),
+                            summary: format!("Tool identified: {} with args: {}", tool_name, args_json),
+                            result: None,
+                            logs: None,
+                            persona: Some("agent".to_string()),
+                            request_id: Some(tool_id),
+                            data: None,
+                        };
+                        self.emit_step(identified_step).await;
+
+                        identified_tools.push(tool_call);
+                        eprintln!("[Parser] Tool identified from flush: {}", tool_name);
                     }
                 }
                 
@@ -2980,6 +4361,7 @@ impl StreamingAgentOrchestrator {
 
     // ── INTELLIGENT PROBLEM IDENTIFICATION ──────────────────────────────────
     /// Analyze the task and generate targeted investigation guidance
+    #[allow(dead_code)]
     fn analyze_problem_intelligently(task: &str) -> String {
         let analysis = ProblemIdentifier::analyze_problem(task);
         
@@ -3031,9 +4413,11 @@ impl StreamingAgentOrchestrator {
         active_file: &Option<serde_json::Value>,
         user_message: &str,
         code_intel: Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
+        analysis: &ProblemAnalysis,
+        task_working_state: &TaskWorkingState,
+        workspace_snapshot: Option<&WorkspaceContextSnapshot>,
     ) -> String {
         let mut ctx = String::new();
-        let analysis = ProblemIdentifier::analyze_problem(user_message);
         let line_regex = Regex::new(r":(\d+)(?::\d+)?").ok();
         let explicit_file_regex = Regex::new(r"([A-Za-z0-9_./\\-]+\.(?:tsx?|jsx?|rs|py|go|json|toml|md))").ok();
 
@@ -3066,6 +4450,7 @@ impl StreamingAgentOrchestrator {
 
         ctx.push_str("<issue_focus>\n");
         ctx.push_str("Use this focused scope before broad exploration.\n");
+        ctx.push_str(&format!("Task kind: {}\n", analysis.task_kind));
 
         if !candidate_files.is_empty() {
             ctx.push_str("Priority files:\n");
@@ -3086,34 +4471,63 @@ impl StreamingAgentOrchestrator {
             }
         }
 
-        if let Some(ws) = workspace_path {
+        let mut related_symbols: Vec<String> = Vec::new();
+
+        if let Some(snapshot) = workspace_snapshot {
+            related_symbols.extend(
+                snapshot
+                    .symbols
+                    .iter()
+                    .filter(|symbol| {
+                        candidate_files.iter().any(|candidate| symbol.file_path.contains(candidate))
+                            || analysis
+                                .keywords
+                                .iter()
+                                .any(|keyword| symbol.name.to_lowercase().contains(&keyword.to_lowercase()))
+                    })
+                    .take(10)
+                    .map(|symbol| format!("{} ({} @ {}:{})", symbol.name, symbol.symbol_type, symbol.file_path, symbol.line_number)),
+            );
+        } else if let Some(ws) = workspace_path {
             if let Ok(intel) = code_intel.lock() {
                 if let Ok(context) = intel.analyze_workspace_if_stale(ws.to_string()) {
-                    let related_symbols: Vec<String> = context.symbols
-                        .iter()
-                        .filter(|symbol| {
-                            candidate_files.iter().any(|candidate| symbol.file_path.contains(candidate))
-                                || analysis.keywords.iter().any(|keyword| symbol.name.to_lowercase().contains(&keyword.to_lowercase()))
-                        })
-                        .take(10)
-                        .map(|symbol| format!("{} ({} @ {}:{})", symbol.name, symbol.symbol_type, symbol.file_path, symbol.line_number))
-                        .collect();
-
-                    if !related_symbols.is_empty() {
-                        ctx.push_str("Related symbols from cached context:\n");
-                        for symbol in related_symbols {
-                            ctx.push_str(&format!("- {}\n", symbol));
-                        }
-                    }
+                    related_symbols.extend(
+                        context
+                            .symbols
+                            .iter()
+                            .filter(|symbol| {
+                                candidate_files.iter().any(|candidate| symbol.file_path.contains(candidate))
+                                    || analysis
+                                        .keywords
+                                        .iter()
+                                        .any(|keyword| symbol.name.to_lowercase().contains(&keyword.to_lowercase()))
+                            })
+                            .take(10)
+                            .map(|symbol| format!("{} ({} @ {}:{})", symbol.name, symbol.symbol_type, symbol.file_path, symbol.line_number)),
+                    );
                 }
             }
         }
 
+        if !related_symbols.is_empty() {
+            ctx.push_str("Related symbols from cached context:\n");
+            for symbol in related_symbols {
+                ctx.push_str(&format!("- {}\n", symbol));
+            }
+        }
+
         ctx.push_str("Investigation policy:\n");
-        ctx.push_str("- Start with semantic_search or find_symbols using the issue keywords.\n");
+        ctx.push_str("- Start with workspace search (`semantic_search`) or find_symbols using the issue keywords.\n");
         ctx.push_str("- If you must read a file, read only the suspected file or referenced line window first.\n");
         ctx.push_str("- Expand to dependent files only after the local cause is identified.\n");
         ctx.push_str("- Reuse cached workspace structure and related symbols before opening additional files.\n");
+        ctx.push_str("- Follow the current task working state instead of replanning from scratch.\n");
+        if !task_working_state.pending_actions.is_empty() {
+            ctx.push_str("Current pending actions:\n");
+            for action in task_working_state.pending_actions.iter().take(4) {
+                ctx.push_str(&format!("- {}\n", action));
+            }
+        }
         ctx.push_str("</issue_focus>\n\n");
         ctx
     }
@@ -3220,8 +4634,12 @@ impl StreamingAgentOrchestrator {
         user_message: &str,
         code_intel: Arc<std::sync::Mutex<crate::commands::code_intelligence::CodeIntelligence>>,
         steering: Arc<RwLock<SteeringSystem>>,
+        analysis: &ProblemAnalysis,
+        task_working_state: &TaskWorkingState,
+        workspace_snapshot: Option<&WorkspaceContextSnapshot>,
     ) -> String {
         let mut ctx = String::new();
+        let routing = get_task_routing_profile(&analysis.task_kind);
 
         // ── STEERING RULES ────────────────────────────────────────────────
         if let Some(ws) = workspace_path {
@@ -3241,6 +4659,9 @@ impl StreamingAgentOrchestrator {
                 active_file,
                 user_message,
                 code_intel.clone(),
+                analysis,
+                task_working_state,
+                workspace_snapshot,
             );
             ctx.push_str(&format!(
                 "<workspace_root>{}\nIMPORTANT: Use this EXACT path in all file operations.</workspace_root>\n\n",
@@ -3248,6 +4669,14 @@ impl StreamingAgentOrchestrator {
             ));
 
             // ── FILE TREE (cached, 5-min TTL, capped at 200 entries) ──────
+            if let Some(snapshot) = workspace_snapshot {
+                let snapshot_block = snapshot.to_prompt_block();
+                if !snapshot_block.trim().is_empty() && prompt_has_budget(ctx.len(), snapshot_block.len()) {
+                    ctx.push_str(&snapshot_block);
+                    ctx.push('\n');
+                }
+            }
+
             let file_tree = {
                 let cache = self.file_tree_cache.read();
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -3296,52 +4725,62 @@ impl StreamingAgentOrchestrator {
             };
             let prompt_manager = crate::commands::prompt_manager::PromptManager::new();
             let dynamic_suffix = prompt_manager.get_relevant_fragments(user_message, &extensions, &[ws.clone()]);
-            if !dynamic_suffix.is_empty() {
+            if routing.include_dynamic_suffix && !dynamic_suffix.is_empty() && prompt_has_budget(ctx.len(), dynamic_suffix.len()) {
                 ctx.push_str(&dynamic_suffix);
                 ctx.push('\n');
             }
 
             // ── KNOWLEDGE ITEMS ───────────────────────────────────────────
-            if let Ok(lore) = crate::commands::distillation::load_relevant_knowledge(std::path::Path::new(ws)) {
-                if !lore.is_empty() {
-                    ctx.push_str(&lore);
-                    ctx.push('\n');
+            if routing.include_knowledge && prompt_has_budget(ctx.len(), 2_000) {
+                if let Ok(lore) = crate::commands::distillation::load_relevant_knowledge(std::path::Path::new(ws)) {
+                    if !lore.is_empty() && prompt_has_budget(ctx.len(), lore.len()) {
+                        ctx.push_str(&lore);
+                        ctx.push('\n');
+                    }
                 }
             }
 
             // ── WORKFLOWS & SKILLS ────────────────────────────────────────
-            let workflows_context = crate::commands::workflows::get_workflows_context(std::path::Path::new(ws));
-            if !workflows_context.is_empty() {
-                ctx.push_str(&workflows_context);
-                ctx.push('\n');
+            if routing.include_workflows {
+                let workflows_context = crate::commands::workflows::get_workflows_context(std::path::Path::new(ws));
+                if !workflows_context.is_empty() && prompt_has_budget(ctx.len(), workflows_context.len()) {
+                    ctx.push_str(&workflows_context);
+                    ctx.push('\n');
+                }
             }
 
             // ── GIT STATUS & DIFF (run once, not per iteration) ───────────
-            if let Ok(repo_path) = std::path::Path::new(ws).canonicalize() {
+            if routing.include_git_context && prompt_has_budget(ctx.len(), 2_500) {
+                if let Ok(repo_path) = std::path::Path::new(ws).canonicalize() {
                 if let Ok(output) = std::process::Command::new("git")
                     .args(["status", "--short"])
                     .current_dir(&repo_path)
                     .output()
                 {
                     let status_str = String::from_utf8_lossy(&output.stdout);
-                    if !status_str.trim().is_empty() {
+                    if !status_str.trim().is_empty() && prompt_has_budget(ctx.len(), status_str.len()) {
                         ctx.push_str(&format!("<git_status>\n{}\n</git_status>\n\n", status_str));
                     }
                 }
-                if let Ok(output) = std::process::Command::new("git")
-                    .args(["diff", "HEAD"])
-                    .current_dir(&repo_path)
-                    .output()
-                {
-                    let diff_str = String::from_utf8_lossy(&output.stdout);
-                    if !diff_str.trim().is_empty() {
-                        const MAX_DIFF_CHARS: usize = 3_000;
-                        let capped = if diff_str.len() > MAX_DIFF_CHARS {
-                            format!("{}\n... (diff truncated)", &diff_str[..MAX_DIFF_CHARS])
-                        } else {
-                            diff_str.to_string()
-                        };
-                        ctx.push_str(&format!("<git_diff>\n{}\n</git_diff>\n\n", capped));
+                    if prompt_has_budget(ctx.len(), 3_500) {
+                        if let Ok(output) = std::process::Command::new("git")
+                            .args(["diff", "HEAD"])
+                            .current_dir(&repo_path)
+                            .output()
+                        {
+                            let diff_str = String::from_utf8_lossy(&output.stdout);
+                            if !diff_str.trim().is_empty() {
+                                const MAX_DIFF_CHARS: usize = 2_000;
+                                let capped = if diff_str.len() > MAX_DIFF_CHARS {
+                                    format!("{}\n... (diff truncated)", &diff_str[..MAX_DIFF_CHARS])
+                                } else {
+                                    diff_str.to_string()
+                                };
+                                if prompt_has_budget(ctx.len(), capped.len()) {
+                                    ctx.push_str(&format!("<git_diff>\n{}\n</git_diff>\n\n", capped));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3349,10 +4788,48 @@ impl StreamingAgentOrchestrator {
             // ── CODE INTELLIGENCE METRICS ─────────────────────────────────
             if let Ok(intel) = code_intel.lock() {
                 if let Some(metrics) = intel.get_code_metrics(ws) {
-                    ctx.push_str(&format!(
+                    let metrics_block = format!(
                         "<code_intelligence>\nMetrics: Complexity={:.1}, Maintainability={:.1}, TechnicalDebt={:.2}\n</code_intelligence>\n\n",
                         metrics.average_complexity, metrics.maintainability_index, metrics.technical_debt
-                    ));
+                    );
+                    if prompt_has_budget(ctx.len(), metrics_block.len()) {
+                        ctx.push_str(&metrics_block);
+                    }
+                }
+            }
+
+            if let Ok(intel) = code_intel.lock() {
+                if let Ok(context) = intel.analyze_workspace_if_stale(ws.clone()) {
+                    let mut key_files: Vec<String> = task_working_state
+                        .suspected_files
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect();
+
+                    if let Some(file) = active_file {
+                        if let Some(path) = file.get("path").and_then(|p| p.as_str()) {
+                            let path_string = path.to_string();
+                            if !key_files.contains(&path_string) {
+                                key_files.push(path_string);
+                            }
+                        }
+                    }
+
+                    if key_files.is_empty() {
+                        if let Some(snapshot) = workspace_snapshot {
+                            key_files = snapshot.key_files.clone();
+                        }
+                    }
+
+                    let fresh_snapshot = build_workspace_context_snapshot(
+                        ws,
+                        key_files,
+                        context.symbols,
+                        context.relationships,
+                        Some(task_working_state),
+                    );
+                    let _ = save_workspace_context_snapshot(ws, &fresh_snapshot);
                 }
             }
         }
@@ -3944,7 +5421,7 @@ async fn execute_tool_standalone(
                 limit: Some(5),
             };
             let results = {
-                let system = vector_system.lock().unwrap();
+                let mut system = vector_system.lock().unwrap();
                 let stats = system.get_index_stats().unwrap();
                 if stats.total_chunks == 0 { let _ = system.index_workspace(ws_root); }
                 system.semantic_search(&search_query).map_err(|e| format!("Search failed: {}", e))?
@@ -4260,6 +5737,21 @@ fn tools_have_conflict(a: &ToolCall, b: &ToolCall) -> bool {
     }
 }
 
+fn is_parallel_readonly_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "list_directory"
+            | "search_files"
+            | "grep_search"
+            | "semantic_search"
+            | "find_symbols"
+            | "analyze_workspace"
+            | "get_code_intelligence"
+            | "view_structure"
+    )
+}
+
 #[allow(dead_code)]
 fn looks_like_natural_language(response: &str) -> bool {
     let trimmed = response.trim();
@@ -4289,6 +5781,14 @@ fn extract_tool_calls(response: &str) -> Vec<ToolCall> {
         // Terminal
         "done",
     ];
+
+    let trimmed = response.trim();
+    if let Ok(call) = serde_json::from_str::<ToolCall>(trimmed) {
+        if supported.contains(&call.tool.as_str()) {
+            eprintln!("[EXTRACT] Direct tool call: {}", call.tool);
+            tool_calls.push(call);
+        }
+    }
 
     let mut start_indices = Vec::new();
     for (i, c) in response.char_indices() {

@@ -118,6 +118,11 @@ impl IncrementalJsonParser {
         extracted
     }
 
+    /// Flush any remaining buffered content at end of stream.
+    pub fn finish(&mut self) -> Vec<Value> {
+        self.feed("")
+    }
+
     /// Extract the next complete JSON object from the buffer
     fn extract_next_object(&mut self) -> Option<Value> {
         let trimmed = self.buffer.trim_start().to_string();

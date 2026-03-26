@@ -4,9 +4,11 @@ interface ActivityBarProps {
     setActiveView: (view: 'explorer' | 'search' | 'source-control' | 'preview' | null) => void
     isChatOpen: boolean
     setIsChatOpen: (open: boolean) => void
+    isTerminalOpen: boolean
+    setIsTerminalOpen: (open: boolean) => void
 }
 
-export const ActivityBar = ({ activeView, setActiveView, isChatOpen, setIsChatOpen }: ActivityBarProps) => {
+export const ActivityBar = ({ activeView, setActiveView, isChatOpen, setIsChatOpen, isTerminalOpen, setIsTerminalOpen }: ActivityBarProps) => {
     return (
         <div className="activity-bar">
             <div
@@ -55,6 +57,17 @@ export const ActivityBar = ({ activeView, setActiveView, isChatOpen, setIsChatOp
             >
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+            </div>
+            <div
+                className={`activity-item ${isTerminalOpen ? 'active' : ''}`}
+                onClick={() => setIsTerminalOpen(!isTerminalOpen)}
+                title="Terminal (Ctrl+`)"
+            >
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <path d="M4 6h16v12H4z" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="m8 10 3 2-3 2" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M13 14h4" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
             </div>
         </div>

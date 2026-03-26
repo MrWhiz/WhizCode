@@ -1,43 +1,181 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { TerminalPane } from './TerminalPane'
 import type { TerminalType } from '../../types'
 import { terminal as terminalApi } from '../../lib/tauri-api'
 
-interface Terminal {
+interface TerminalRecord {
   id: string
   type: TerminalType
   name: string
+  cwd: string
   createdAt: number
+  clearToken: number
+  status?: 'starting' | 'ready' | 'error'
+  error?: string
 }
 
 interface MultiTerminalPaneProps {
   isOpen: boolean
   height: number
   onHeightChange: (height: number) => void
+  workspacePath: string | null
+  createRequest: number
 }
 
-export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTerminalPaneProps) => {
-  const [terminals, setTerminals] = useState<Terminal[]>([])
+const DEFAULT_SHELL_ICON: Record<TerminalType, string> = {
+  bash: '⌁',
+  cmd: '⌘',
+  powershell: '⚡',
+  zsh: '⌁',
+  sh: '⌁',
+}
+
+export const MultiTerminalPane = ({
+  isOpen,
+  height,
+  onHeightChange,
+  workspacePath,
+  createRequest,
+}: MultiTerminalPaneProps) => {
+  const [terminals, setTerminals] = useState<TerminalRecord[]>([])
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null)
+  const [availableShells, setAvailableShells] = useState<string[]>([])
   const [showShellMenu, setShowShellMenu] = useState(false)
   const [hoverResizeHandle, setHoverResizeHandle] = useState(false)
   const [menuPosition, setMenuPosition] = useState({ top: 0, right: 0 })
   const resizeHandleRef = useRef<HTMLDivElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
+  const lastCreateRequestRef = useRef(0)
+  const defaultShellRef = useRef<TerminalType>('powershell')
 
-  // Initialize with default terminal
   useEffect(() => {
-    if (isOpen && terminals.length === 0) {
-      terminalApi.getDefaultShell().then((defaultShell) => {
-        createNewTerminal(defaultShell as TerminalType);
-      }).catch(() => {
-        createNewTerminal('bash');
-      });
-    }
-  }, [isOpen])
+    terminalApi.getDefaultShell()
+      .then((defaultShell) => {
+        defaultShellRef.current = defaultShell as TerminalType
+      })
+      .catch(() => {
+        defaultShellRef.current = 'bash'
+      })
 
-  // Close menu when clicking outside
+      terminalApi.getAvailableShells()
+      .then((shells) => setAvailableShells(shells))
+      .catch(() => {
+        setAvailableShells(['powershell', 'cmd'])
+      })
+  }, [])
+
+  const shellOptions = useMemo(() => {
+    const shells = availableShells.length > 0 ? availableShells : [defaultShellRef.current]
+    return Array.from(new Set(shells)) as TerminalType[]
+  }, [availableShells])
+
+  const createTerminal = async (type: TerminalType) => {
+    const cwd = workspacePath || undefined
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const pendingName = `${type} - starting...`
+
+    setTerminals(prev => [...prev, {
+      id: pendingId,
+      type,
+      name: pendingName,
+      cwd: cwd || '',
+      createdAt: Date.now(),
+      clearToken: 0,
+      status: 'starting',
+    }])
+    setActiveTerminalId(pendingId)
+    setShowShellMenu(false)
+
+    try {
+      const id = await terminalApi.createTerminal(type, cwd)
+      setTerminals(prev => {
+        const next = prev.filter(terminal => terminal.id !== pendingId)
+        const nextName = `${type} - ${next.filter(terminal => terminal.type === type).length + 1}`
+        return [
+          ...next,
+          {
+            id,
+            type,
+            name: nextName,
+            cwd: cwd || '',
+            createdAt: Date.now(),
+            clearToken: 0,
+            status: 'ready',
+          },
+        ]
+      })
+      setActiveTerminalId(id)
+    } catch (error) {
+      console.error('Failed to create terminal:', error)
+      setTerminals(prev => prev.map(terminal => (
+        terminal.id === pendingId
+          ? {
+              ...terminal,
+              status: 'error',
+              error: error instanceof Error ? error.message : String(error),
+              name: `${type} - failed`,
+            }
+          : terminal
+      )))
+      setActiveTerminalId(prev => {
+        if (prev !== pendingId) return prev
+        return terminals.find(terminal => terminal.id !== pendingId)?.id || null
+      })
+    }
+  }
+
+  const closeTerminal = async (id: string, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    try {
+      await terminalApi.closeTerminal(id)
+    } catch (error) {
+      console.error('Failed to close terminal:', error)
+    }
+
+    setTerminals(prev => {
+      const next = prev.filter(t => t.id !== id)
+      if (activeTerminalId === id) {
+        setActiveTerminalId(next[0]?.id || null)
+      }
+      return next
+    })
+  }
+
+  const clearTerminal = (id: string) => {
+    setTerminals(prev => prev.map(terminal => (
+      terminal.id === id
+        ? { ...terminal, clearToken: terminal.clearToken + 1 }
+        : terminal
+    )))
+  }
+
+  const splitTerminal = async () => {
+    const active = terminals.find(terminal => terminal.id === activeTerminalId)
+    if (!active) {
+      await createTerminal(defaultShellRef.current)
+      return
+    }
+    await createTerminal(active.type)
+  }
+
+  useEffect(() => {
+    if (isOpen && workspacePath && terminals.length === 0) {
+      createTerminal(defaultShellRef.current)
+    }
+  }, [isOpen, workspacePath, terminals.length])
+
+  useEffect(() => {
+    if (createRequest <= lastCreateRequestRef.current) {
+      return
+    }
+    lastCreateRequestRef.current = createRequest
+    if (!isOpen || !workspacePath) {
+      return
+    }
+    createTerminal(defaultShellRef.current)
+  }, [createRequest, isOpen, workspacePath])
+
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
@@ -51,50 +189,15 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
     }
   }, [showShellMenu])
 
-  // Calculate menu position when it opens
   useEffect(() => {
     if (showShellMenu && buttonRef.current) {
       const rect = buttonRef.current.getBoundingClientRect()
       setMenuPosition({
-        top: rect.bottom + 4,
-        right: window.innerWidth - rect.right
+        top: rect.bottom + 6,
+        right: Math.max(8, window.innerWidth - rect.right),
       })
     }
   }, [showShellMenu])
-
-  const createNewTerminal = (type: TerminalType) => {
-    const id = `terminal_${Date.now()}`
-    const newTerminal: Terminal = {
-      id,
-      type,
-      name: `${type} - ${terminals.length + 1}`,
-      createdAt: Date.now()
-    }
-
-    setTerminals(prev => [...prev, newTerminal])
-    setActiveTerminalId(id)
-    setShowShellMenu(false)
-
-    // Notify backend
-    terminalApi.createTerminal(type, undefined).catch((err: unknown) => {
-        console.error('Failed to create terminal:', err);
-    });
-  }
-
-  const closeTerminal = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation()
-
-    terminalApi.closeTerminal(id).catch((err: unknown) => {
-        console.error('Failed to close terminal:', err);
-    });
-
-    setTerminals(prev => prev.filter(t => t.id !== id))
-
-    if (activeTerminalId === id) {
-      const remaining = terminals.filter(t => t.id !== id)
-      setActiveTerminalId(remaining.length > 0 ? remaining[0].id : null)
-    }
-  }
 
   const handleResize = (e: React.MouseEvent) => {
     e.preventDefault()
@@ -102,8 +205,8 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
     const startHeight = height
 
     const onMouseMove = (moveEvent: MouseEvent) => {
-      const newHeight = Math.max(100, startHeight - (moveEvent.clientY - startY))
-      onHeightChange(Math.min(newHeight, window.innerHeight - 100))
+      const newHeight = Math.max(120, startHeight - (moveEvent.clientY - startY))
+      onHeightChange(Math.min(newHeight, window.innerHeight - 140))
     }
 
     const onMouseUp = () => {
@@ -115,21 +218,26 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
     document.addEventListener('mouseup', onMouseUp)
   }
 
-  if (!isOpen) return null
+  const activeTerminal = terminals.find(terminal => terminal.id === activeTerminalId) || terminals[0] || null
+
+  const headerShellLabel = activeTerminal
+    ? `${DEFAULT_SHELL_ICON[activeTerminal.type] || '⌁'} ${activeTerminal.name}`
+    : 'Terminal'
 
   return (
-    <>
+    <div style={{ display: isOpen ? 'flex' : 'none', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
       <div
         ref={resizeHandleRef}
         className="terminal-resize-handle"
         onMouseDown={handleResize}
         onMouseEnter={() => setHoverResizeHandle(true)}
         onMouseLeave={() => setHoverResizeHandle(false)}
+        title="Drag to resize terminal"
         style={{
           height: '4px',
           background: hoverResizeHandle ? 'var(--accent-primary)' : 'var(--border-color)',
           cursor: 'ns-resize',
-          transition: 'background 0.2s'
+          transition: 'background 0.2s',
         }}
       />
 
@@ -141,79 +249,120 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
           flexDirection: 'column',
           background: 'var(--vscode-bg)',
           borderTop: '1px solid var(--border-color)',
-          overflow: 'hidden'
+          overflow: 'hidden',
+          minHeight: 0,
+          minWidth: 0,
         }}
       >
-        {/* Terminal Tabs */}
         <div
           className="terminal-tabs"
           style={{
             display: 'flex',
             alignItems: 'center',
-            height: '32px',
-            background: 'var(--vscode-bg)',
+            minHeight: '34px',
+            background: 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.08))',
             borderBottom: '1px solid var(--border-color)',
             padding: '0 8px',
             gap: '4px',
             overflowX: 'auto',
             overflowY: 'hidden',
-            position: 'relative'
+            position: 'relative',
           }}
         >
-          {terminals.map(terminal => (
-            <div
-              key={terminal.id}
-              onClick={() => setActiveTerminalId(terminal.id)}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                padding: '4px 12px',
-                background: activeTerminalId === terminal.id ? 'rgba(0,0,0,0.3)' : 'transparent',
-                border: activeTerminalId === terminal.id ? '1px solid var(--accent-primary)' : '1px solid transparent',
-                borderRadius: '4px 4px 0 0',
-                cursor: 'pointer',
-                fontSize: '12px',
-                color: 'var(--text-primary)',
-                whiteSpace: 'nowrap',
-                transition: 'all 0.2s',
-                flexShrink: 0
-              }}
-            >
-              <span style={{ fontSize: '10px' }}>
-                {terminal.type === 'bash' && '🐚'}
-                {terminal.type === 'cmd' && '⌘'}
-                {terminal.type === 'powershell' && '⚡'}
-                {terminal.type === 'zsh' && '🐚'}
-                {terminal.type === 'sh' && '🐚'}
-              </span>
-              <span>{terminal.name}</span>
-              <button
-                onClick={(e) => closeTerminal(terminal.id, e)}
-                onMouseEnter={(e) => {
-                  (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'
-                }}
-                onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLElement).style.color = 'var(--text-secondary)'
-                }}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            minWidth: 0,
+            color: 'var(--text-secondary)',
+            fontSize: 12,
+            fontWeight: 600,
+            paddingRight: 8,
+          }}>
+            <span style={{
+              display: 'inline-flex',
+              width: 18,
+              height: 18,
+              borderRadius: 4,
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: 'rgba(0,0,0,0.2)',
+              color: 'var(--accent-primary)',
+              fontSize: 11,
+            }}>$_</span>
+            <span style={{ whiteSpace: 'nowrap' }}>{headerShellLabel}</span>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, overflowX: 'auto', flex: 1 }}>
+            {terminals.map(terminal => (
+              <div
+                key={terminal.id}
+                onClick={() => setActiveTerminalId(terminal.id)}
                 style={{
-                  background: 'none',
-                  border: 'none',
-                  color: 'var(--text-secondary)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '4px 10px',
+                  background: activeTerminalId === terminal.id ? 'rgba(0,0,0,0.28)' : 'transparent',
+                  border: activeTerminalId === terminal.id ? '1px solid var(--accent-primary)' : '1px solid transparent',
+                  borderRadius: '4px 4px 0 0',
                   cursor: 'pointer',
                   fontSize: '12px',
-                  padding: '0 4px',
-                  display: 'flex',
-                  alignItems: 'center'
+                  color: 'var(--text-primary)',
+                  whiteSpace: 'nowrap',
+                  transition: 'all 0.2s',
+                  flexShrink: 0,
                 }}
               >
-                ×
-              </button>
-            </div>
-          ))}
+                <span style={{ fontSize: '10px' }}>{DEFAULT_SHELL_ICON[terminal.type] || '⌁'}</span>
+                <span>{terminal.name}</span>
+                <button
+                  onClick={(e) => closeTerminal(terminal.id, e)}
+                  title="Close Terminal"
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    color: 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    lineHeight: 1,
+                    padding: '0 2px',
+                    display: 'flex',
+                    alignItems: 'center',
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
 
-          {/* Add Terminal Button */}
-          <div style={{ position: 'relative', marginLeft: 'auto', flexShrink: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto', position: 'relative' }}>
+            <button
+              onClick={() => clearTerminal(activeTerminalId || '')}
+              disabled={!activeTerminalId}
+              className="terminal-action-btn"
+              title="Clear Terminal"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => activeTerminalId && closeTerminal(activeTerminalId)}
+              disabled={!activeTerminalId}
+              className="terminal-action-btn"
+              title="Kill Terminal"
+            >
+              Kill
+            </button>
+            <button
+              onClick={() => splitTerminal()}
+              className="terminal-action-btn"
+              title="New Terminal"
+              style={{ fontWeight: 600 }}
+            >
+              +
+            </button>
+
             <button
               ref={buttonRef}
               onClick={() => setShowShellMenu(!showShellMenu)}
@@ -222,21 +371,20 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
                 border: '1px solid var(--border-color)',
                 color: 'var(--text-secondary)',
                 cursor: 'pointer',
-                padding: '4px 8px',
+                padding: '4px 10px',
                 borderRadius: '4px',
                 fontSize: '12px',
                 display: 'flex',
                 alignItems: 'center',
                 gap: '4px',
-                transition: 'all 0.2s'
+                transition: 'all 0.2s',
               }}
-              title="New Terminal"
+              title="Choose Shell"
             >
-              <span>+</span>
+              <span>{activeTerminal ? DEFAULT_SHELL_ICON[activeTerminal.type] || '⌁' : '⌁'}</span>
               <span style={{ fontSize: '10px' }}>▼</span>
             </button>
 
-            {/* Shell Type Menu */}
             {showShellMenu && (
               <div
                 ref={menuRef}
@@ -244,42 +392,46 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
                   position: 'fixed',
                   background: 'var(--vscode-bg)',
                   border: '1px solid var(--border-color)',
-                  borderRadius: '4px',
+                  borderRadius: '6px',
                   zIndex: 10000,
-                  minWidth: '150px',
-                  boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+                  minWidth: '180px',
+                  boxShadow: '0 12px 30px rgba(0,0,0,0.45)',
                   top: `${menuPosition.top}px`,
-                  right: `${menuPosition.right}px`
+                  right: `${menuPosition.right}px`,
+                  overflow: 'hidden',
                 }}
               >
-                {(['bash', 'cmd', 'powershell', 'zsh', 'sh'] as TerminalType[]).map(type => (
+                {shellOptions.map(type => (
                   <button
                     key={type}
-                    onClick={() => createNewTerminal(type)}
-                    onMouseEnter={(e) => {
-                      (e.currentTarget as HTMLElement).style.background = 'rgba(0,0,0,0.2)'
-                    }}
-                    onMouseLeave={(e) => {
-                      (e.currentTarget as HTMLElement).style.background = 'transparent'
+                    type="button"
+                    onMouseDown={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      createTerminal(type)
                     }}
                     style={{
-                      display: 'block',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '10px',
                       width: '100%',
-                      padding: '8px 12px',
+                      padding: '10px 12px',
                       background: 'transparent',
                       border: 'none',
                       color: 'var(--text-primary)',
                       cursor: 'pointer',
                       textAlign: 'left',
                       fontSize: '12px',
-                      transition: 'background 0.2s'
+                    }}
+                    onMouseEnter={(e) => {
+                      (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)'
+                    }}
+                    onMouseLeave={(e) => {
+                      (e.currentTarget as HTMLElement).style.background = 'transparent'
                     }}
                   >
-                    {type === 'bash' && '🐚 Bash'}
-                    {type === 'cmd' && '⌘ Command Prompt'}
-                    {type === 'powershell' && '⚡ PowerShell'}
-                    {type === 'zsh' && '🐚 Zsh'}
-                    {type === 'sh' && '🐚 Shell'}
+                    <span style={{ color: 'var(--accent-primary)', fontWeight: 700 }}>{DEFAULT_SHELL_ICON[type] || '⌁'}</span>
+                    <span style={{ textTransform: 'capitalize' }}>{type}</span>
                   </button>
                 ))}
               </div>
@@ -287,19 +439,28 @@ export const MultiTerminalPane = ({ isOpen, height, onHeightChange }: MultiTermi
           </div>
         </div>
 
-        {/* Terminal Content */}
-        <div
-          style={{
-            flex: 1,
-            overflow: 'hidden',
-            background: '#1e1e1e'
-          }}
-        >
-          {activeTerminalId && (
-            <TerminalPane key={activeTerminalId} terminalId={activeTerminalId} />
+        <div style={{ flex: 1, overflow: 'hidden', background: '#1e1e1e', minHeight: 0, minWidth: 0 }}>
+          {activeTerminal ? (
+            <TerminalPane
+              key={activeTerminal.id}
+              terminalId={activeTerminal.id}
+              clearToken={activeTerminal.clearToken}
+              isVisible={isOpen}
+            />
+          ) : (
+            <div style={{
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'var(--text-secondary)',
+              fontSize: 13,
+            }}>
+              No terminal sessions yet
+            </div>
           )}
         </div>
       </div>
-    </>
+    </div>
   )
 }

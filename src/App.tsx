@@ -9,6 +9,7 @@ import { SourceControlPanel } from './components/Explorer/SourceControlPanel'
 import { EditorArea } from './components/Editor/EditorArea'
 import { ChatPanel } from './components/Chat/ChatPanel'
 import { WebPreview } from './components/Preview/WebPreview'
+import { MultiTerminalPane } from './components/Terminal/MultiTerminalPane'
 import SystemPerformance from './components/Explorer/SystemPerformance'
 
 // Hooks
@@ -58,6 +59,8 @@ function App() {
     sidebarWidth, setSidebarWidth,
     isChatOpen, setIsChatOpen,
     chatWidth, setChatWidth,
+    terminalHeight, setTerminalHeight,
+    isTerminalOpen, setIsTerminalOpen,
     refreshKey, setRefreshKey,
     collapseAll, setCollapseAll,
     showFileFilter, setShowFileFilter,
@@ -80,10 +83,11 @@ function App() {
     isSettingsOpen, setIsSettingsOpen,
     isAboutOpen, setIsAboutOpen,
     azureLoginUrl, setAzureLoginUrl,
-    azureEmbeddingUrl, setAzureEmbeddingUrl,
     azureCompletionUrl, setAzureCompletionUrl,
     azureUsername, setAzureUsername,
     azurePassword, setAzurePassword,
+    azureSessionToken, setAzureSessionToken,
+    azureTokenExpiresAt, setAzureTokenExpiresAt,
     azureTokenStatus, setAzureTokenStatus,
     isAutopilotMode, setIsAutopilotMode,
     contextLength, setContextLength,
@@ -94,6 +98,7 @@ function App() {
 
   // Menu state
   const [activeMenu, setActiveMenu] = React.useState<string | null>(null)
+  const [terminalCreateRequest, setTerminalCreateRequest] = React.useState(0)
 
   const menus = [
     {
@@ -116,7 +121,8 @@ function App() {
       items: [
         { label: 'Explorer', action: 'toggle-explorer', shortcut: 'Ctrl+Shift+E' },
         { label: 'Search', action: 'toggle-search', shortcut: 'Ctrl+Shift+F' },
-        { label: 'Source Control', action: 'toggle-source-control', shortcut: 'Ctrl+Shift+G' }
+        { label: 'Source Control', action: 'toggle-source-control', shortcut: 'Ctrl+Shift+G' },
+        { label: 'Terminal', action: 'toggle-terminal', shortcut: 'Ctrl+`' }
       ]
     }
   ]
@@ -163,8 +169,15 @@ function App() {
       case 'toggle-source-control':
         setActiveView(activeView === 'source-control' ? null : 'source-control')
         break
+      case 'toggle-terminal':
+        setIsTerminalOpen(prev => !prev)
+        break
+      case 'new-terminal':
+        setIsTerminalOpen(true)
+        setTerminalCreateRequest(prev => prev + 1)
+        break
     }
-  }, [activeView, setActiveView, setWorkspacePath, setRefreshKey])
+  }, [activeView, setActiveView, setWorkspacePath, setRefreshKey, setIsTerminalOpen])
 
   // File operations hook
   const {
@@ -201,20 +214,22 @@ function App() {
     setNewFileDialog,
     setNewFolderDialog,
     setRefreshKey,
-    setShowFileFilter
+    setShowFileFilter,
+    setIsTerminalOpen,
+    setTerminalCreateRequest
   )
 
   // Persist settings
   useSettingsPersistence(
     modelProvider, model, openaiKey, geminiKey, bedrockRegion, bedrockAccessKey, bedrockSecretKey,
-    azureLoginUrl, azureEmbeddingUrl, azureCompletionUrl, azureUsername, azurePassword,
+    azureLoginUrl, azureCompletionUrl, azureUsername, azurePassword, azureSessionToken, azureTokenExpiresAt,
     isAutopilotMode, contextLength, sidebarWidth, isChatOpen, chatWidth
   )
 
   // Initialize workspace
   useWorkspaceInit(
     savedState, setWorkspacePath, setRefreshKey,
-    sidebarWidth, chatWidth, isChatOpen, activeView,
+    sidebarWidth, chatWidth, terminalHeight, isTerminalOpen, isChatOpen, activeView,
     workspacePath, activeFileId
   )
 
@@ -226,6 +241,8 @@ function App() {
     ollamaChecking, setOllamaChecking,
     isSettingsOpen,
     azureLoginUrl, azureUsername, azurePassword,
+    azureSessionToken, azureTokenExpiresAt,
+    setAzureSessionToken, setAzureTokenExpiresAt,
     setAzureTokenStatus
   )
 
@@ -256,7 +273,9 @@ function App() {
       isHydratingHistoryRef.current = true
       try {
         const thread = await history.get(getWorkspaceThreadId(workspacePath))
-        const savedMessages = Array.isArray(thread.messages) ? thread.messages as Message[] : []
+        const savedMessages = Array.isArray(thread.messages)
+          ? restoreMessagesFromHistory(thread.messages as Message[])
+          : []
         if (savedMessages.length > 0) {
           setMessages(savedMessages)
         }
@@ -276,20 +295,25 @@ function App() {
       return
     }
 
+    const persistedMessages = buildPersistedMessages(messages, isLoading, agentSteps, liveStreamingContent)
     const persistMessages = async () => {
       try {
         await history.save(
           getWorkspaceThreadId(workspacePath),
           getWorkspaceThreadTitle(workspacePath),
-          messages
+          persistedMessages
         )
       } catch (error) {
         console.error('Failed to persist workspace history:', error)
       }
     }
 
-    persistMessages()
-  }, [workspacePath, messages])
+    const timeout = window.setTimeout(() => {
+      persistMessages()
+    }, isLoading ? 250 : 50)
+
+    return () => window.clearTimeout(timeout)
+  }, [workspacePath, messages, isLoading, agentSteps, liveStreamingContent])
 
   // Resize handlers
   const handleSidebarResize = (e: React.MouseEvent) => {
@@ -338,6 +362,33 @@ function App() {
     })
   }, [normalizePath, setFileErrors])
 
+  const buildAgentModelConfig = useCallback(() => ({
+    provider: modelProvider,
+    model,
+    openaiKey,
+    geminiKey,
+    bedrockRegion,
+    bedrockAccessKey,
+    bedrockSecretKey,
+    azureLoginUrl,
+    azureCompletionUrl,
+    azureUsername,
+    azureSessionToken: azureSessionToken.trim() && azureTokenExpiresAt > Date.now() ? azureSessionToken : '',
+  }), [
+    modelProvider,
+    model,
+    openaiKey,
+    geminiKey,
+    bedrockRegion,
+    bedrockAccessKey,
+    bedrockSecretKey,
+    azureLoginUrl,
+    azureCompletionUrl,
+    azureUsername,
+    azureSessionToken,
+    azureTokenExpiresAt,
+  ])
+
   const handleSend = async (overrideInput?: string) => {
     const textToSend = overrideInput || input
     if (!textToSend.trim() && selectedImages.length === 0 || isLoading) return
@@ -370,17 +421,14 @@ function App() {
 
       const result = await agent.executeLoopStreaming({
         task: userMsg.content,
-        model: {
-          provider: modelProvider,
-          model: model,
-        },
+        model: buildAgentModelConfig(),
         workspacePath: workspacePath,
         activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
         conversationHistory,
         context_length: contextLength,
       })
-      const response = result?.response || 'No response'
       const finalSteps = collectResultSteps(result, latestAgentStepsRef.current)
+      const response = resolveAgentResponse(result, finalSteps)
       let verificationSteps = workspacePath
         ? await buildVerificationSteps(workspacePath, finalSteps)
         : []
@@ -399,8 +447,7 @@ function App() {
               { role: 'user', content: userMsg.content },
               { role: 'assistant', content: finalResponse },
             ],
-            modelProvider,
-            model,
+            modelConfig: buildAgentModelConfig(),
             activeFile: activeFile ? { path: activeFile.path, content: activeFile.content } : null,
             contextLength,
             latestAgentStepsRef,
@@ -476,6 +523,8 @@ function App() {
           setActiveView={setActiveView}
           isChatOpen={isChatOpen}
           setIsChatOpen={setIsChatOpen}
+          isTerminalOpen={isTerminalOpen}
+          setIsTerminalOpen={setIsTerminalOpen}
         />
 
         {/* Sidebar */}
@@ -582,7 +631,7 @@ function App() {
         />
 
         {/* Main content area */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
           {activeView === 'preview' ? (
             <WebPreview />
           ) : (
@@ -599,6 +648,14 @@ function App() {
               onValidation={handleValidation}
             />
           )}
+
+          <MultiTerminalPane
+            isOpen={isTerminalOpen}
+            height={terminalHeight}
+            onHeightChange={setTerminalHeight}
+            workspacePath={workspacePath}
+            createRequest={terminalCreateRequest}
+          />
         </div>
 
         {/* Chat resize handle */}
@@ -663,7 +720,7 @@ function App() {
               ollamaModels, ollamaChecking, ollamaError, refreshOllamaModels,
               openaiKey, setOpenaiKey, geminiKey, setGeminiKey,
               bedrockRegion, setBedrockRegion, bedrockAccessKey, setBedrockAccessKey, bedrockSecretKey, setBedrockSecretKey,
-              azureLoginUrl, setAzureLoginUrl, azureEmbeddingUrl, setAzureEmbeddingUrl, azureCompletionUrl, setAzureCompletionUrl,
+              azureLoginUrl, setAzureLoginUrl, azureCompletionUrl, setAzureCompletionUrl,
               azureUsername, setAzureUsername, azurePassword, setAzurePassword,
               azureTokenStatus, onGenerateAzureToken: handleGenerateAzureToken,
               isAutopilotMode, setIsAutopilotMode,
@@ -886,6 +943,51 @@ function getWorkspaceThreadTitle(workspacePath: string): string {
   return parts[parts.length - 1] || 'Workspace Chat'
 }
 
+function buildPersistedMessages(
+  messages: Message[],
+  isLoading: boolean,
+  agentSteps: AgentStep[],
+  liveStreamingContent: string
+): Message[] {
+  const baseMessages = messages.filter(message => !(message as any).__whizcodeDraft)
+
+  if (!isLoading) {
+    return baseMessages
+  }
+
+  const hasLiveTaskState = agentSteps.length > 0 || liveStreamingContent.trim().length > 0
+  if (!hasLiveTaskState) {
+    return baseMessages
+  }
+
+  const draftMessage: Message & { __whizcodeDraft: true; interruptedAt: number } = {
+    role: 'assistant',
+    content: liveStreamingContent.trim() || 'Task was in progress when the app closed. The latest live logs are preserved below.',
+    steps: agentSteps.length > 0 ? [...agentSteps] : undefined,
+    __whizcodeDraft: true,
+    interruptedAt: Date.now(),
+  }
+
+  return [...baseMessages, draftMessage]
+}
+
+function restoreMessagesFromHistory(messages: Message[]): Message[] {
+  return messages.map(message => {
+    if (!(message as any).__whizcodeDraft) {
+      return message
+    }
+
+    const restoredContent = (message.content || '').trim()
+    return {
+      role: 'assistant',
+      content: restoredContent
+        ? `Recovered interrupted task:\n\n${restoredContent}`
+        : 'Recovered interrupted task. The latest available logs are preserved below.',
+      steps: Array.isArray(message.steps) ? message.steps : undefined,
+    }
+  })
+}
+
 function collectResultSteps(result: any, liveSteps: AgentStep[]): AgentStep[] {
   const steps = result?.steps || []
   const toolCalls = result?.tool_calls || []
@@ -900,6 +1002,27 @@ function collectResultSteps(result: any, liveSteps: AgentStep[]): AgentStep[] {
   return liveSteps.length > 0
     ? [...liveSteps]
     : [...toolSteps, ...steps]
+}
+
+function resolveAgentResponse(result: any, steps: AgentStep[]): string {
+  const rawResponse = typeof result?.response === 'string' ? result.response.trim() : ''
+  if (rawResponse.length > 0 && rawResponse !== 'No response') {
+    return rawResponse
+  }
+
+  const failedStep = [...steps].reverse().find(step =>
+    step.status === 'failed' || step.status === 'error'
+  )
+
+  if (failedStep?.result?.trim()) {
+    return `Task failed: ${failedStep.result.trim()}`
+  }
+
+  if (failedStep?.summary?.trim()) {
+    return failedStep.summary.trim()
+  }
+
+  return 'No response'
 }
 
 function shouldRunVerification(steps: AgentStep[]): boolean {
@@ -1009,8 +1132,7 @@ async function runAutomaticRepairPass(params: {
   initialSteps: AgentStep[]
   initialVerificationSteps: AgentStep[]
   conversationHistory: Array<{ role: string; content: string }>
-  modelProvider: string
-  model: string
+  modelConfig: Record<string, unknown>
   activeFile: { path: string; content: string } | null
   contextLength: number
   latestAgentStepsRef: React.MutableRefObject<AgentStep[]>
@@ -1044,10 +1166,7 @@ async function runAutomaticRepairPass(params: {
   try {
     const repairResult = await agent.executeLoopStreaming({
       task: repairRequest,
-      model: {
-        provider: params.modelProvider,
-        model: params.model,
-      },
+      model: params.modelConfig,
       workspacePath: params.workspacePath,
       activeFile: params.activeFile,
       conversationHistory: params.conversationHistory,

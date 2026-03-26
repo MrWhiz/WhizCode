@@ -16,7 +16,7 @@ EVERY response MUST be a single JSON object with this structure:
 - NO exceptions. NO XML tags. NO prose. ONLY JSON.
 
 Example:
-{"thought": "Identifying User interface in src/types.", "tool": "grep_search", "args": {"query": "interface User", "path": "src/types"}}
+{"thought": "Narrowing likely files with workspace search before opening code.", "tool": "semantic_search", "args": {"query": "User interface type definition", "limit": 5}}
 
 2. THINK-ACT-OBSERVE
 - THINK: Include your reasoning in the "thought" key
@@ -24,7 +24,7 @@ Example:
 - OBSERVE: Wait for tool output. Analyze success/failure carefully.
 
 3. CORE RULES
-- Precision: Never guess paths or symbols. Use `list_directory` or `search_files` to verify.
+- Precision: Never guess paths or symbols. For repo exploration, start with workspace search (`semantic_search`) or `find_symbols`, then confirm with `search_files` or narrow `read_file`.
 - Code Editing: Use `multi_edit_file` for precise code modification and `write_file` for new files.
 - Verification: Always run build/test commands (e.g., `npm run build`) via `run_command` after making changes.
 - NO DEV SERVERS: Do NOT run `npm run dev`, `npm start`, `yarn start`, or any development server. These run indefinitely and will hang the agent. Use `npm run build` to verify the build works instead.
@@ -32,8 +32,9 @@ Example:
 - User Input: Use `ask_user` ONLY when you need information FROM the user. Your message MUST be a question ending with "?". Example: {"thought": "Need clarification", "tool": "ask_user", "args": {"question": "Which file should I modify?"}}
 - Stall/Ambiguity: If stuck in a loop or context is unclear, use `ask_user` to ask for guidance.
 - Context Pruning: If a file is too large, use `read_file` with `start_line` / `end_line`.
+- Exploration Order: Prefer workspace search (`semantic_search`) for vague repository questions, `find_symbols` for known names, and only then `read_file` for targeted inspection.
 - Structural Vision: If chasing parse/syntax errors, use `view_structure` to see the file skeleton.
-- Local Knowledge Graph: Use `semantic_search` to find concepts, and `get_file_relationships` to analyze dependencies.
+- Local Knowledge Graph: Use workspace search (`semantic_search`) to find concepts, and `get_file_relationships` to analyze dependencies.
 - UI Design: Use `generate_image` to mockup UI interfaces or create assets.
 - External Research: Use `read_url_content` to fetch URLs or `search_web` to look up external APIs.
 
@@ -41,7 +42,8 @@ Example:
 - EVERY tool call MUST include ALL required arguments:
   * read_file, write_file, edit_file, multi_edit_file, create_file, delete_file, move_file, rename_file: MUST have "path"
   * run_command: MUST have "command"
-  * grep_search, search_files: MUST have "query"
+  * grep_search: MUST have "query"
+  * search_files: MUST have "pattern"
 - If a tool call is missing required arguments, it will be REJECTED and you will be forced to retry.
 - ALWAYS double-check your JSON before submitting.
 
@@ -222,7 +224,7 @@ pub const CONTEXT_GATHERER_PROMPT: &str = r#"You are a specialized Context Gathe
 
 <approach>
 1. Start by understanding the problem/issue
-2. Start from cached workspace context, semantic_search, find_symbols, and suspected files before opening files
+2. Start from cached workspace context, workspace search (`semantic_search`), find_symbols, and suspected files before opening files
 3. Use search_files and grepSearch to find relevant code
 4. Only use read_file after you have narrowed to likely files
 5. When an error line or file is mentioned, read only a narrow line window first
@@ -242,7 +244,7 @@ Provide a clear summary including:
 - Focus on exploration and analysis, not implementation
 - Be thorough but efficient - don't read every file
 - Prioritize files most likely to be relevant
-- Never begin by reading broad sets of files when semantic_search, find_symbols, or explicit file references can narrow the scope first
+- Never begin by reading broad sets of files when workspace search (`semantic_search`), find_symbols, or explicit file references can narrow the scope first
 - Prefer read_file with start_line/end_line for targeted debugging
 - Explain your reasoning for file selections
 </rules>"#;
@@ -271,7 +273,7 @@ pub const GENERAL_TASK_EXECUTION_PROMPT: &str = r#"You are a general-purpose tas
 - Complete the delegated task fully
 - Use tools efficiently
 - Do not begin by reading the whole repository or many full files
-- Prefer semantic_search, find_symbols, and narrow read_file line ranges before broad file reads
+- Prefer workspace search (`semantic_search`), find_symbols, and narrow read_file line ranges before broad file reads
 - Verify your changes work correctly
 - Provide clear status updates
 - If you encounter issues, explain them clearly

@@ -10,10 +10,11 @@ export function useSettingsPersistence(
   bedrockAccessKey: string,
   bedrockSecretKey: string,
   azureLoginUrl: string,
-  azureEmbeddingUrl: string,
   azureCompletionUrl: string,
   azureUsername: string,
   azurePassword: string,
+  azureSessionToken: string,
+  azureTokenExpiresAt: number,
   isAutopilotMode: boolean,
   contextLength: number,
   sidebarWidth: number,
@@ -29,10 +30,11 @@ export function useSettingsPersistence(
     localStorage.setItem('bedrockAccessKey', bedrockAccessKey)
     localStorage.setItem('bedrockSecretKey', bedrockSecretKey)
     localStorage.setItem('azureLoginUrl', azureLoginUrl)
-    localStorage.setItem('azureEmbeddingUrl', azureEmbeddingUrl)
     localStorage.setItem('azureCompletionUrl', azureCompletionUrl)
     localStorage.setItem('azureUsername', azureUsername)
     localStorage.setItem('azurePassword', azurePassword)
+    localStorage.setItem('azureSessionToken', azureSessionToken)
+    localStorage.setItem('azureTokenExpiresAt', String(azureTokenExpiresAt))
     localStorage.setItem('isAutopilotMode', String(isAutopilotMode))
     localStorage.setItem('contextLength', String(contextLength))
     localStorage.setItem('sidebarWidth', String(sidebarWidth))
@@ -40,7 +42,8 @@ export function useSettingsPersistence(
     localStorage.setItem('chatWidth', String(chatWidth))
   }, [
     modelProvider, model, openaiKey, geminiKey, bedrockRegion, bedrockAccessKey, bedrockSecretKey,
-    isAutopilotMode, contextLength, azureLoginUrl, azureEmbeddingUrl, azureCompletionUrl, azureUsername, azurePassword,
+    isAutopilotMode, contextLength, azureLoginUrl, azureCompletionUrl, azureUsername, azurePassword,
+    azureSessionToken, azureTokenExpiresAt,
     sidebarWidth, isChatOpen, chatWidth
   ])
 }

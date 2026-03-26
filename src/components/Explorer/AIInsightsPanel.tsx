@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ai, vector, cache, errorRecovery, mcp, system } from '../../lib/tauri-api';
+import { ai, vector as workspaceSearch, cache, errorRecovery, mcp, system } from '../../lib/tauri-api';
 
 interface LearningInsight {
   type: 'pattern' | 'preference' | 'strategy' | 'error';
@@ -39,7 +39,7 @@ interface ContextMemoryStats {
   sessionHistory: number;
 }
 
-interface VectorIndexStats {
+interface WorkspaceSearchStats {
   totalChunks: number;
   totalFiles: number;
   totalSymbols: number;
@@ -84,12 +84,12 @@ export const AIInsightsPanel: React.FC = () => {
   const [metrics, setMetrics] = useState<LearningMetrics | null>(null);
   const [codeMetrics, setCodeMetrics] = useState<CodeMetrics | null>(null);
   const [memoryStats, setMemoryStats] = useState<ContextMemoryStats | null>(null);
-  const [vectorStats, setVectorStats] = useState<VectorIndexStats | null>(null);
+  const [workspaceSearchStats, setWorkspaceSearchStats] = useState<WorkspaceSearchStats | null>(null);
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
   const [errorStats, setErrorStats] = useState<ErrorRecoveryStats | null>(null);
   const [mcpMarketplace, setMcpMarketplace] = useState<MCPMarketplace | null>(null);
   const [loading, setLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<'insights' | 'metrics' | 'code' | 'memory' | 'vector' | 'cache' | 'errors' | 'mcp'>('insights');
+  const [activeTab, setActiveTab] = useState<'insights' | 'metrics' | 'code' | 'memory' | 'search' | 'cache' | 'errors' | 'mcp'>('insights');
 
   const loadData = async () => {
     setLoading(true);
@@ -98,7 +98,7 @@ export const AIInsightsPanel: React.FC = () => {
         insightsData, 
         metricsData, 
         memoryData,
-        vectorData,
+        workspaceSearchData,
         cacheData,
         errorData,
         mcpData
@@ -106,7 +106,7 @@ export const AIInsightsPanel: React.FC = () => {
         ai.getLearningInsights(),
         ai.getLearningMetrics(),
         ai.getContextMemoryStats(),
-        vector.getIndexStats(),
+        workspaceSearch.getIndexStats(),
         cache.getStats(),
         errorRecovery.getStatistics(),
         mcp.getMarketplace()
@@ -115,7 +115,7 @@ export const AIInsightsPanel: React.FC = () => {
       setInsights(insightsData || []);
       setMetrics(metricsData);
       setMemoryStats(memoryData);
-      setVectorStats(vectorData);
+      setWorkspaceSearchStats(workspaceSearchData);
       setCacheStats(cacheStats as any);
       setErrorStats(errorData);
       setMcpMarketplace(mcpData);
@@ -191,10 +191,10 @@ export const AIInsightsPanel: React.FC = () => {
           Memory
         </button>
         <button 
-          className={`tab ${activeTab === 'vector' ? 'active' : ''}`}
-          onClick={() => setActiveTab('vector')}
+          className={`tab ${activeTab === 'search' ? 'active' : ''}`}
+          onClick={() => setActiveTab('search')}
         >
-          Vector Search
+          Workspace Search
         </button>
         <button 
           className={`tab ${activeTab === 'cache' ? 'active' : ''}`}
@@ -422,41 +422,41 @@ export const AIInsightsPanel: React.FC = () => {
           </div>
         )}
 
-        {activeTab === 'vector' && (
+        {activeTab === 'search' && (
           <div className="vector-tab">
-            {vectorStats ? (
+            {workspaceSearchStats ? (
               <div className="metrics-grid">
                 <div className="metric-card">
                   <h4>Total Chunks</h4>
-                  <div className="metric-value">{vectorStats.totalChunks.toLocaleString()}</div>
+                  <div className="metric-value">{workspaceSearchStats.totalChunks.toLocaleString()}</div>
                 </div>
                 <div className="metric-card">
-                  <h4>Indexed Files</h4>
-                  <div className="metric-value">{vectorStats.totalFiles.toLocaleString()}</div>
+                  <h4>Scanned Files</h4>
+                  <div className="metric-value">{workspaceSearchStats.totalFiles.toLocaleString()}</div>
                 </div>
                 <div className="metric-card">
                   <h4>Symbols</h4>
-                  <div className="metric-value">{vectorStats.totalSymbols.toLocaleString()}</div>
+                  <div className="metric-value">{workspaceSearchStats.totalSymbols.toLocaleString()}</div>
                 </div>
                 <div className="metric-card">
-                  <h4>Last Indexed</h4>
+                  <h4>Last Scan</h4>
                   <div className="metric-value" style={{ fontSize: '12px' }}>
-                    {vectorStats.lastIndexTime ? new Date(vectorStats.lastIndexTime).toLocaleString() : 'Never'}
+                    {workspaceSearchStats.lastIndexTime ? new Date(workspaceSearchStats.lastIndexTime).toLocaleString() : 'Never'}
                   </div>
                 </div>
                 <div className="metric-card">
                   <h4>Status</h4>
                   <div className="metric-value" style={{ 
-                    color: vectorStats.isIndexing ? '#fbbf24' : '#4ade80',
+                    color: workspaceSearchStats.isIndexing ? '#fbbf24' : '#4ade80',
                     fontSize: '14px'
                   }}>
-                    {vectorStats.isIndexing ? 'Indexing...' : 'Ready'}
+                    {workspaceSearchStats.isIndexing ? 'Scanning...' : 'Ready'}
                   </div>
                 </div>
               </div>
             ) : (
               <div className="empty-state">
-                <p>No vector search statistics available.</p>
+                <p>No workspace search statistics available.</p>
               </div>
             )}
           </div>

@@ -15,6 +15,10 @@ export function useModelManagement(
   azureLoginUrl: string,
   azureUsername: string,
   azurePassword: string,
+  azureSessionToken: string,
+  azureTokenExpiresAt: number,
+  setAzureSessionToken: (token: string) => void,
+  setAzureTokenExpiresAt: (expiresAt: number) => void,
   setAzureTokenStatus: (status: any) => void
 ) {
   const refreshOllamaModels = useCallback(async () => {
@@ -62,21 +66,45 @@ export function useModelManagement(
     }
   }, [isSettingsOpen, modelProvider, refreshOllamaModels])
 
-  // Check Azure token
-  const checkAzureToken = useCallback(async () => {
-    try {
-      const status = await azure.getTokenStatus()
-      setAzureTokenStatus(status)
-    } catch (error) {
-      console.error('Error checking Azure token status:', error)
+  const computeAzureTokenStatus = useCallback(() => {
+    const expiresAt = Number(azureTokenExpiresAt) || 0
+    const token = azureSessionToken.trim()
+    const now = Date.now()
+    const hasToken = Boolean(token) && expiresAt > now
+
+    if (!hasToken && (token || expiresAt)) {
+      setAzureSessionToken('')
+      setAzureTokenExpiresAt(0)
     }
-  }, [setAzureTokenStatus])
+
+    setAzureTokenStatus({
+      hasToken,
+      expires: hasToken ? expiresAt : undefined,
+      timeLeft: hasToken ? Math.max(0, Math.ceil((expiresAt - now) / 3_600_000)) : undefined,
+    })
+  }, [azureSessionToken, azureTokenExpiresAt, setAzureTokenStatus])
 
   useEffect(() => {
     if (modelProvider === 'azure-gateway') {
-      checkAzureToken()
+      computeAzureTokenStatus()
     }
-  }, [modelProvider, checkAzureToken])
+  }, [modelProvider, computeAzureTokenStatus])
+
+  useEffect(() => {
+    computeAzureTokenStatus()
+  }, [computeAzureTokenStatus])
+
+  useEffect(() => {
+    if (modelProvider !== 'azure-gateway') {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      computeAzureTokenStatus()
+    }, 60_000)
+
+    return () => window.clearInterval(timer)
+  }, [modelProvider, computeAzureTokenStatus])
 
   const handleGenerateAzureToken = useCallback(async () => {
     try {
@@ -86,18 +114,28 @@ export function useModelManagement(
         password: azurePassword
       })
       if (result.success) {
-        checkAzureToken()
+        const expiresAt = result.expiresAt || (Date.now() + 24 * 60 * 60 * 1000)
+        setAzureSessionToken(result.token || '')
+        setAzureTokenExpiresAt(result.token ? expiresAt : 0)
+        setAzureTokenStatus({
+          hasToken: Boolean(result.token),
+          expires: result.token ? expiresAt : undefined,
+          timeLeft: result.token ? Math.max(0, Math.ceil((expiresAt - Date.now()) / 3_600_000)) : undefined,
+        })
+        if (!result.token) {
+          alert('Token generation succeeded, but no session token was returned by the login endpoint.')
+        }
       } else {
         alert(`Failed to generate token: ${result.error}`)
       }
     } catch (e: any) {
       alert(`Error: ${e.message}`)
     }
-  }, [azureLoginUrl, azureUsername, azurePassword, checkAzureToken])
+  }, [azureLoginUrl, azureUsername, azurePassword, setAzureSessionToken, setAzureTokenExpiresAt, setAzureTokenStatus])
 
   return {
     refreshOllamaModels,
     handleGenerateAzureToken,
-    checkAzureToken,
+    computeAzureTokenStatus,
   }
 }

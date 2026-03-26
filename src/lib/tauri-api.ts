@@ -220,17 +220,16 @@ export const fs = {
   },
 }
 
-// Vector search
+// Workspace search
 export const vectorSearch = {
-  async indexWorkspaceFull(workspacePath: string, embeddingModel?: string): Promise<void> {
+  async indexWorkspaceFull(workspacePath: string): Promise<void> {
     try {
       return await invoke('vector_index_workspace_full', {
         workspacePath: workspacePath,
-        embeddingModel: embeddingModel ?? 'nomic-embed-text',
       })
     } catch (error) {
-      // Non-fatal - indexing failure shouldn't block the user
-      console.warn('[VectorSearch] Indexing failed:', error)
+      // Non-fatal - scan failure shouldn't block the user
+      console.warn('[WorkspaceSearch] Scan failed:', error)
     }
   },
 
@@ -267,7 +266,7 @@ export const vectorSearch = {
     try {
       return await invoke('vector_update_file', { path })
     } catch (error) {
-      console.warn('[VectorSearch] updateFile failed:', error)
+      console.warn('[WorkspaceSearch] updateFile failed:', error)
     }
   },
 
@@ -275,7 +274,7 @@ export const vectorSearch = {
     try {
       return await invoke('vector_clear_index')
     } catch (error) {
-      console.warn('[VectorSearch] clearIndex failed:', error)
+      console.warn('[WorkspaceSearch] clearIndex failed:', error)
     }
   },
 }
@@ -311,7 +310,7 @@ export const terminal = {
     try {
       return await invoke('terminal_create', { 
         config: {
-          shellType,
+          shell_type: shellType,
           cwd: cwd || null
         }
       })
@@ -348,7 +347,7 @@ export const terminal = {
     }
   },
 
-  async getAvailableShells(): Promise<ShellInfo[]> {
+  async getAvailableShells(): Promise<string[]> {
     try {
       return await invoke('terminal_get_available_shells')
     } catch (error) {
@@ -689,13 +688,28 @@ export const agent = {
 
     // FIX #9: mid-task ask_user clarification requests
     async onAgentAskUser(callback: (data: { question: string; requestId: string }) => void): Promise<() => void> {
-      const unlisten = await listen('agent:step', (event) => {
+      const listeners: Array<() => void> = []
+
+      const directUnlisten = await listen('agent:ask_user', (event) => {
+        const payload = event.payload as any
+        if (typeof payload?.question === 'string' && payload.question.trim()) {
+          callback({ question: payload.question, requestId: payload.requestId || '' })
+        }
+      })
+      listeners.push(directUnlisten)
+
+      // Backward-compatible fallback for older agent step emissions.
+      const stepUnlisten = await listen('agent:step', (event) => {
         const step = event.payload as any
         if (step?.tool === 'ask_user' && step?.status === 'awaiting_permission') {
           callback({ question: step.summary, requestId: step.requestId || '' })
         }
       })
-      return unlisten
+      listeners.push(stepUnlisten)
+
+      return () => {
+        listeners.forEach(unlisten => unlisten())
+      }
     },
   }, // end events
 } // end agent
@@ -728,22 +742,43 @@ export const ollama = {
 }
 
 // Azure Commands
+const AZURE_SESSION_TOKEN_KEY = 'azureSessionToken'
+const AZURE_TOKEN_EXPIRES_AT_KEY = 'azureTokenExpiresAt'
+
+function readAzureTokenStatus(): { hasToken: boolean; timeLeft?: number; expires?: number } {
+  const token = localStorage.getItem(AZURE_SESSION_TOKEN_KEY)?.trim() || ''
+  const expires = Number(localStorage.getItem(AZURE_TOKEN_EXPIRES_AT_KEY)) || 0
+  const now = Date.now()
+  const hasToken = Boolean(token) && expires > now
+
+  return {
+    hasToken,
+    expires: hasToken ? expires : undefined,
+    timeLeft: hasToken ? Math.max(0, Math.ceil((expires - now) / 3_600_000)) : undefined,
+  }
+}
+
 export const azure = {
-  async getTokenStatus(): Promise<{ hasToken: boolean; expiresIn?: number }> {
-    try {
-      return await invoke('azure_get_token_status')
-    } catch (error) {
-      throw handleError(error)
-    }
+  async getTokenStatus(): Promise<{ hasToken: boolean; timeLeft?: number; expires?: number }> {
+    return readAzureTokenStatus()
   },
 
-  async generateToken(options: { loginUrl: string; username: string; password: string }): Promise<{ success: boolean; error?: string }> {
+  async generateToken(options: { loginUrl: string; username: string; password: string }): Promise<{ success: boolean; token?: string; expiresAt?: number; error?: string }> {
     try {
-      return await invoke('azure_generate_token', { 
+      const result = await invoke<{ success: boolean; token?: string; expiresAt?: number; error?: string }>('azure_generate_token', { 
         loginUrl: options.loginUrl, 
         username: options.username, 
         password: options.password 
       })
+
+      if (result.success && result.token) {
+        localStorage.setItem(AZURE_SESSION_TOKEN_KEY, result.token)
+        if (result.expiresAt) {
+          localStorage.setItem(AZURE_TOKEN_EXPIRES_AT_KEY, String(result.expiresAt))
+        }
+      }
+
+      return result
     } catch (error) {
       throw handleError(error)
     }
@@ -785,7 +820,7 @@ export const ai = {
   },
 }
 
-// Vector/Index Commands
+// Workspace search commands
 export const vector = {
   async getIndexStats(): Promise<any> {
     try {
@@ -904,6 +939,8 @@ export const subAgents = {
     }
   },
 }
+
+export const workspaceSearch = vector
 
 export const learning = {
   async analyzePatterns(): Promise<any[]> {
@@ -1301,6 +1338,7 @@ export default {
   azure,
   ai,
   vector,
+  workspaceSearch: vector,
   cache,
   errorRecovery,
   mcp,

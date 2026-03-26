@@ -7,7 +7,9 @@ export function useKeyboardShortcuts(
   setNewFileDialog: (dialog: { parentPath: string } | null) => void,
   setNewFolderDialog: (dialog: { parentPath: string } | null) => void,
   setRefreshKey: (key: number | ((prev: number) => number)) => void,
-  setShowFileFilter: (show: boolean) => void
+  setShowFileFilter: (show: boolean) => void,
+  setIsTerminalOpen: (open: boolean | ((prev: boolean) => boolean)) => void,
+  setTerminalCreateRequest: (updater: number | ((prev: number) => number)) => void
 ) {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -36,8 +38,19 @@ export function useKeyboardShortcuts(
         e.preventDefault()
         setShowFileFilter(true)
       }
+      // Ctrl+` toggles the integrated terminal
+      if (e.ctrlKey && e.key === '`') {
+        e.preventDefault()
+        setIsTerminalOpen(prev => !prev)
+      }
+      // Ctrl+Shift+` opens a new terminal tab
+      if (e.ctrlKey && e.shiftKey && e.key === '`') {
+        e.preventDefault()
+        setIsTerminalOpen(true)
+        setTerminalCreateRequest(prev => prev + 1)
+      }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [handleFileSave, activeView, workspacePath, setNewFileDialog, setNewFolderDialog, setRefreshKey, setShowFileFilter])
+  }, [handleFileSave, activeView, workspacePath, setNewFileDialog, setNewFolderDialog, setRefreshKey, setShowFileFilter, setIsTerminalOpen, setTerminalCreateRequest])
 }

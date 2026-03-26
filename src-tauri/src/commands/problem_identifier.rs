@@ -7,8 +7,134 @@
 /// 4. Provides focused context for problem-solving
 
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TaskWorkingState {
+    pub task_fingerprint: String,
+    pub task_kind: String,
+    pub current_goal: String,
+    pub suspected_files: Vec<String>,
+    pub completed_checks: Vec<String>,
+    pub pending_actions: Vec<String>,
+    pub blockers: Vec<String>,
+    pub research_summary: Option<String>,
+    pub last_iteration: u32,
+    pub last_tool: Option<String>,
+    pub update_count: u32,
+}
+
+impl TaskWorkingState {
+    pub fn to_prompt_block(&self) -> String {
+        let mut block = String::new();
+        block.push_str("\n<task_working_state>\n");
+        block.push_str(&format!("fingerprint: {}\n", self.task_fingerprint));
+        block.push_str(&format!("kind: {}\n", self.task_kind));
+        block.push_str(&format!("current_goal: {}\n", self.current_goal));
+
+        if !self.suspected_files.is_empty() {
+            block.push_str("suspected_files:\n");
+            for file in self.suspected_files.iter().take(5) {
+                block.push_str(&format!("- {}\n", file));
+            }
+        }
+
+        if !self.completed_checks.is_empty() {
+            block.push_str("completed_checks:\n");
+            for check in self.completed_checks.iter().rev().take(5).rev() {
+                block.push_str(&format!("- {}\n", check));
+            }
+        }
+
+        if !self.pending_actions.is_empty() {
+            block.push_str("pending_actions:\n");
+            for action in self.pending_actions.iter().take(5) {
+                block.push_str(&format!("- {}\n", action));
+            }
+        }
+
+        if !self.blockers.is_empty() {
+            block.push_str("blockers:\n");
+            for blocker in self.blockers.iter().take(5) {
+                block.push_str(&format!("- {}\n", blocker));
+            }
+        }
+
+        if let Some(summary) = &self.research_summary {
+            if !summary.trim().is_empty() {
+                let compact = summary.trim().chars().take(800).collect::<String>();
+                block.push_str("recent_research:\n");
+                block.push_str(&compact);
+                if compact.len() < summary.trim().len() {
+                    block.push_str("\n... (truncated)");
+                }
+                block.push('\n');
+            }
+        }
+
+        block.push_str(&format!("last_iteration: {}\n", self.last_iteration));
+        if let Some(tool) = &self.last_tool {
+            block.push_str(&format!("last_tool: {}\n", tool));
+        }
+        block.push_str("</task_working_state>\n");
+        block
+    }
+
+    pub fn note_iteration(&mut self, iteration: u32, tool: Option<&str>) {
+        self.last_iteration = iteration;
+        if let Some(tool) = tool {
+            self.last_tool = Some(tool.to_string());
+        }
+        self.update_count = self.update_count.saturating_add(1);
+    }
+
+    pub fn record_tool_success(&mut self, tool_name: &str, result: &str) {
+        self.note_iteration(self.last_iteration, Some(tool_name));
+
+        let summary = if result.trim().is_empty() {
+            format!("{} completed", tool_name)
+        } else {
+            format!("{} completed: {}", tool_name, result.trim().chars().take(120).collect::<String>())
+        };
+        self.completed_checks.push(summary);
+        self.pending_actions
+            .retain(|action| !action.to_lowercase().contains(&tool_name.to_lowercase()));
+
+        if matches!(
+            tool_name,
+            "write_file" | "edit_file" | "multi_edit_file" | "create_file" | "delete_file" | "move_file" | "rename_file"
+        ) {
+            if !self.pending_actions.iter().any(|action| action == "verify_changes") {
+                self.pending_actions.push("verify_changes".to_string());
+            }
+            self.current_goal = "Verify the changes and make sure the task is fully resolved.".to_string();
+        }
+    }
+
+    pub fn record_tool_failure(&mut self, tool_name: &str, error: &str) {
+        self.note_iteration(self.last_iteration, Some(tool_name));
+        let blocker = format!(
+            "{} failed: {}",
+            tool_name,
+            error.trim().chars().take(160).collect::<String>()
+        );
+        self.blockers.push(blocker);
+        if !self.pending_actions.iter().any(|action| action == "recover_from_failure") {
+            self.pending_actions.push("recover_from_failure".to_string());
+        }
+        self.current_goal = "Resolve the blocker with the smallest safe change, then retry verification.".to_string();
+    }
+
+    pub fn record_research(&mut self, summary: String) {
+        self.research_summary = Some(summary.trim().chars().take(2000).collect::<String>());
+        if !self.pending_actions.iter().any(|action| action == "use_research_findings") {
+            self.pending_actions.push("use_research_findings".to_string());
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProblemAnalysis {
@@ -16,6 +142,8 @@ pub struct ProblemAnalysis {
     pub file_patterns: Vec<String>,
     pub search_queries: Vec<SearchQuery>,
     pub suspected_files: Vec<SuspectedFile>,
+    pub task_kind: String,
+    pub focus_summary: String,
     pub investigation_strategy: String,
 }
 
@@ -44,6 +172,8 @@ impl ProblemIdentifier {
         let file_patterns = Self::infer_file_patterns(&keywords);
         let search_queries = Self::generate_search_queries(&keywords, &file_patterns);
         let suspected_files = Self::infer_suspected_files(&keywords);
+        let task_kind = Self::classify_task_kind(problem_statement, &keywords);
+        let focus_summary = Self::build_focus_summary(&task_kind, &keywords, &suspected_files);
         let investigation_strategy = Self::generate_strategy(&keywords);
 
         ProblemAnalysis {
@@ -51,8 +181,130 @@ impl ProblemIdentifier {
             file_patterns,
             search_queries,
             suspected_files,
+            task_kind,
+            focus_summary,
             investigation_strategy,
         }
+    }
+
+    pub fn build_working_state(
+        task_statement: &str,
+        workspace_path: Option<&str>,
+        active_file: Option<&str>,
+        analysis: &ProblemAnalysis,
+    ) -> TaskWorkingState {
+        let mut suspected_files: Vec<String> = analysis
+            .suspected_files
+            .iter()
+            .take(5)
+            .map(|file| file.path.clone())
+            .collect();
+
+        if let Some(active_file) = active_file {
+            if !suspected_files.iter().any(|file| file == active_file) {
+                suspected_files.insert(0, active_file.to_string());
+            }
+        }
+
+        let fingerprint = Self::analysis_fingerprint(task_statement, workspace_path, active_file, analysis);
+        let mut pending_actions = vec![
+            "use_semantic_search_first".to_string(),
+            "inspect_suspected_files".to_string(),
+            "verify_the_result".to_string(),
+        ];
+
+        if analysis.task_kind == "bug-fix" {
+            pending_actions.insert(1, "confirm_repro_or_error_path".to_string());
+        }
+
+        TaskWorkingState {
+            task_fingerprint: fingerprint,
+            task_kind: analysis.task_kind.clone(),
+            current_goal: analysis.focus_summary.clone(),
+            suspected_files,
+            completed_checks: Vec::new(),
+            pending_actions,
+            blockers: Vec::new(),
+            research_summary: None,
+            last_iteration: 0,
+            last_tool: None,
+            update_count: 0,
+        }
+    }
+
+    pub fn analysis_fingerprint(
+        task_statement: &str,
+        workspace_path: Option<&str>,
+        active_file: Option<&str>,
+        analysis: &ProblemAnalysis,
+    ) -> String {
+        let mut hasher = DefaultHasher::new();
+        Self::normalize_task_text(task_statement).hash(&mut hasher);
+        workspace_path.unwrap_or("").hash(&mut hasher);
+        active_file.unwrap_or("").hash(&mut hasher);
+        analysis.task_kind.hash(&mut hasher);
+        analysis.keywords.hash(&mut hasher);
+        analysis
+            .suspected_files
+            .iter()
+            .map(|file| &file.path)
+            .collect::<Vec<_>>()
+            .hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    fn normalize_task_text(task_statement: &str) -> String {
+        task_statement
+            .split_whitespace()
+            .map(|part| part.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn classify_task_kind(task_statement: &str, keywords: &[String]) -> String {
+        let lower = task_statement.to_lowercase();
+        let keyword_match = |needle: &str| keywords.iter().any(|k| k == needle);
+
+        if lower.contains("fix") || lower.contains("bug") || lower.contains("error") || keyword_match("error") {
+            "bug-fix".to_string()
+        } else if lower.contains("optimize") || lower.contains("performance") || lower.contains("faster") {
+            "performance-improvement".to_string()
+        } else if lower.contains("refactor") || lower.contains("improve") {
+            "refactoring".to_string()
+        } else if lower.contains("add") || lower.contains("implement") || lower.contains("create") {
+            "feature-implementation".to_string()
+        } else if lower.contains("analyze") || lower.contains("review") || lower.contains("inspect") {
+            "analysis".to_string()
+        } else if keyword_match("agent") || keyword_match("streaming") {
+            "agent-flow".to_string()
+        } else {
+            "general".to_string()
+        }
+    }
+
+    fn build_focus_summary(task_kind: &str, keywords: &[String], suspected_files: &[SuspectedFile]) -> String {
+        let top_files = suspected_files
+            .iter()
+            .take(3)
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+
+        let keyword_hint = if keywords.is_empty() {
+            "no strong keyword matches".to_string()
+        } else {
+            keywords.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        };
+
+        let file_hint = if top_files.is_empty() {
+            "no direct file candidate".to_string()
+        } else {
+            top_files.join(", ")
+        };
+
+        format!(
+            "{} task: focus on {}, then verify with the narrowest safe check.",
+            task_kind, if top_files.is_empty() { keyword_hint } else { file_hint }
+        )
     }
 
     /// Extract keywords from problem statement
@@ -308,12 +560,15 @@ impl ProblemIdentifier {
 
         // Phase 1: Targeted Search
         strategy.push_str("### Phase 1: Targeted Search\n");
-        strategy.push_str("1. Use grepSearch with high-priority patterns\n");
-        strategy.push_str("2. Focus on explicitly mentioned files first\n");
-        strategy.push_str("3. Identify exact locations of issues\n\n");
+        strategy.push_str("1. Start with workspace search (`semantic_search`) using the issue keywords to narrow likely files and code blocks\n");
+        strategy.push_str("2. Use find_symbols when a function, class, or identifier is known\n");
+        strategy.push_str("3. Use grepSearch/search_files only to confirm exact locations after the search space is narrowed\n");
+        strategy.push_str("4. Focus on explicitly mentioned files first\n\n");
 
         // Phase 2: Context Analysis
         strategy.push_str("### Phase 2: Context Analysis\n");
+        strategy.push_str("- Read only the most likely file or a narrow line window first\n");
+        strategy.push_str("- Avoid rereading the same file repeatedly; reuse what you already saw and inspect related files or narrower ranges instead\n");
         if lower_keywords.iter().any(|k| k.contains("xml") || k.contains("tag")) {
             strategy.push_str("- Check for XML tag patterns and their usage\n");
         }
@@ -369,5 +624,6 @@ mod tests {
         assert!(!analysis.keywords.is_empty());
         assert!(!analysis.search_queries.is_empty());
         assert!(!analysis.suspected_files.is_empty());
+        assert!(!analysis.task_kind.is_empty());
     }
 }

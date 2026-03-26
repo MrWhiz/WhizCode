@@ -35,16 +35,48 @@ interface ChatPanelProps {
 }
 
 const LogContainer = ({ logs }: { logs: string[] }) => {
+    const [expanded, setExpanded] = React.useState(false);
     const logsEndRef = React.useRef<HTMLDivElement>(null);
+    const maxCollapsedLogs = 120;
+
     React.useEffect(() => {
         logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }, [logs]);
 
+    const visibleLogs = expanded || logs.length <= maxCollapsedLogs
+        ? logs
+        : [...logs.slice(0, 80), `... ${logs.length - 120} more log lines hidden ...`, ...logs.slice(-39)];
+
     return (
         <div className="agent-step-logs">
-            {logs.map((log, li) => (
-                <span key={li} className="log-line">{log}</span>
+            {visibleLogs.map((log, li) => (
+                <span
+                    key={`${li}-${log.slice(0, 24)}`}
+                    className="log-line"
+                    style={log.startsWith('... ') ? { opacity: 0.7, fontStyle: 'italic' } : undefined}
+                >
+                    {log}
+                </span>
             ))}
+            {logs.length > maxCollapsedLogs && (
+                <button
+                    type="button"
+                    onClick={() => setExpanded(prev => !prev)}
+                    style={{
+                        marginTop: '6px',
+                        background: 'transparent',
+                        border: '1px solid var(--border-color)',
+                        borderRadius: '4px',
+                        color: 'var(--text-secondary)',
+                        padding: '4px 8px',
+                        fontSize: '10px',
+                        cursor: 'pointer',
+                        alignSelf: 'flex-start'
+                    }}
+                >
+                    {expanded ? 'Show less' : `Show all ${logs.length} lines`}
+                </button>
+            )}
             <div ref={logsEndRef} />
         </div>
     );
@@ -67,6 +99,16 @@ const isHighRiskPermissionSummary = (summary: string): boolean => {
 
 // Smart summary formatter — turns raw "Executed X with args: {...}" into readable text
 const formatStepSummary = (tool: string, summary: string): string => {
+    const normalized = summary.toLowerCase();
+    if (normalized.includes('already read')) {
+        if (tool === 'read_file' || tool === 'view_structure') {
+            const fileMatch = summary.match(/([A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?)(?:\s*\]|$)/);
+            if (fileMatch?.[1]) {
+                return `Already read ${fileMatch[1]}`;
+            }
+        }
+        return 'Already read this file';
+    }
     // Try to extract args JSON from the summary
     const match = summary.match(/args:\s*(\{.*\})/s);
     if (!match) return summary;
@@ -138,10 +180,32 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
         }
     };
 
+    const statusAccent =
+        step.status === 'failed' ? '#f38ba8' :
+        step.status === 'completed' || step.status === 'done' ? '#a6e3a1' :
+        step.status === 'started' ? '#89b4fa' :
+        step.status === 'identified' ? '#6c7086' :
+        'var(--accent-primary)';
+
     const displaySummary = formatStepSummary(step.tool, step.summary);
+    const liveProgressText = isLive && (step.status === 'running' || step.status === 'started')
+        ? (
+            step.tool === 'run_command' ? 'Streaming command output…' :
+            step.tool === 'read_file' ? 'Reading file…' :
+            step.tool === 'semantic_search' ? 'Searching workspace…' :
+            step.tool === 'search_files' ? 'Scanning filenames…' :
+            'Working…'
+        )
+        : null;
 
     return (
-        <div className={`agent-step ${step.status}`}>
+        <div className={`agent-step ${step.status}`} style={{
+            border: '1px solid rgba(255,255,255,0.08)',
+            borderRadius: '12px',
+            background: 'rgba(255,255,255,0.03)',
+            overflow: 'hidden',
+            boxShadow: '0 8px 20px rgba(0,0,0,0.12)'
+        }}>
             <div
                 className="agent-step-header"
                 onClick={handleClick}
@@ -149,19 +213,22 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
                     cursor: canOpenLogs ? 'pointer' : 'default',
                     userSelect: 'none',
                     display: 'flex',
-                    alignItems: 'center'
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '10px 12px',
+                    minHeight: '44px',
+                    background: `linear-gradient(90deg, ${statusAccent}15, rgba(255,255,255,0.02))`
                 }}
             >
                 {step.persona && (
                     <span style={{ 
-                        fontSize: '9px', 
-                        background: `${personaColor}15`, 
+                        fontSize: '9px',
+                        background: `${personaColor}15`,
                         color: personaColor, 
-                        padding: '1px 5px', 
-                        borderRadius: '3px',
+                        padding: '2px 6px', 
+                        borderRadius: '999px',
                         border: `1px solid ${personaColor}33`,
-                        marginRight: '8px',
-                        fontWeight: 'bold',
+                        fontWeight: 700,
                         display: 'flex',
                         alignItems: 'center',
                         gap: '3px'
@@ -174,37 +241,66 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
                 ) : (
                     <span className="agent-step-icon">{getToolIcon(step.tool)}</span>
                 )}
-                <span className="agent-step-summary">{displaySummary}</span>
+                <span className="agent-step-summary" style={{
+                    fontSize: '12px',
+                    lineHeight: '1.45',
+                    color: 'var(--text-primary)',
+                    flex: 1,
+                    minWidth: 0,
+                    wordBreak: 'break-word'
+                }}>{displaySummary}</span>
                 {/* Status badge */}
                 <span style={{
-                    marginLeft: '8px',
+                    marginLeft: 'auto',
                     fontSize: '9px',
-                    padding: '2px 6px',
-                    borderRadius: '3px',
-                    fontWeight: 'bold',
+                    padding: '3px 8px',
+                    borderRadius: '999px',
+                    fontWeight: 800,
                     backgroundColor: 
                         step.status === 'identified' ? '#6c7086' :
                         step.status === 'started' ? '#89b4fa' :
                         step.status === 'completed' || step.status === 'done' ? '#a6e3a1' :
-                        step.status === 'failed' ? '#f38ba8' :
-                        '#9399b2',
+                    step.status === 'failed' ? '#f38ba8' :
+                    step.status === 'skipped' ? '#f9e2af' :
+                    '#9399b2',
                     color: '#1e1e2e'
                 }}>
                     {step.status === 'identified' ? 'IDENTIFIED' :
                      step.status === 'started' ? 'RUNNING' :
                      step.status === 'completed' ? 'DONE' :
                      step.status === 'done' ? 'DONE' :
-                     step.status === 'failed' ? 'FAILED' :
-                     step.status.toUpperCase()}
+                      step.status === 'failed' ? 'FAILED' :
+                      step.status === 'skipped' ? 'SKIPPED' :
+                      step.status.toUpperCase()}
                 </span>
                 {(step.status === 'done' || step.status === 'completed') && <span className="agent-step-check">✓</span>}
                 {step.status === 'failed' && <span style={{ color: 'var(--error-color)', fontSize: 12 }}>✗</span>}
                 {canOpenLogs && (
-                    <span style={{ marginLeft: 'auto', fontSize: '10px', opacity: 0.5, paddingLeft: 6 }}>
+                    <span style={{ fontSize: '10px', opacity: 0.5, paddingLeft: 2 }}>
                         {logsOpen ? '▲' : '▼'}
                     </span>
                 )}
             </div>
+            {liveProgressText && (
+                <div style={{
+                    padding: '0 12px 8px 12px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    fontSize: '11px',
+                    color: 'var(--text-secondary)',
+                }}>
+                    <span className="spinner" style={{ width: 8, height: 8, flexShrink: 0 }} />
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                        <span>{liveProgressText}</span>
+                        <span style={{ display: 'inline-flex', gap: '2px', transform: 'translateY(-1px)' }}>
+                            <span style={{ animation: 'blink 1s infinite', animationDelay: '0ms' }}>•</span>
+                            <span style={{ animation: 'blink 1s infinite', animationDelay: '180ms' }}>•</span>
+                            <span style={{ animation: 'blink 1s infinite', animationDelay: '360ms' }}>•</span>
+                        </span>
+                    </span>
+                </div>
+            )}
             {step.data && <EditDetails data={step.data} />}
             {step.result && step.result.includes('file:///') && (
                 <div style={{ padding: '8px 12px' }}>
@@ -214,6 +310,22 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
                       style={{ maxWidth: '100%', borderRadius: '4px', border: '1px solid #313244', cursor: 'pointer' }}
                       onClick={() => window.open(step.result?.split('URL: ')[1])}
                     />
+                </div>
+            )}
+            {step.result && !step.result.includes('file:///') && (step.status === 'failed' || step.status === 'skipped') && (
+                <div style={{
+                    margin: step.status === 'skipped' ? '0 12px 10px' : '0 12px 12px',
+                    padding: step.status === 'skipped' ? '6px 10px' : '8px 12px',
+                    fontSize: step.status === 'skipped' ? '11px' : '12px',
+                    lineHeight: 1.45,
+                    color: step.status === 'skipped' ? '#f9e2af' : 'var(--error-color)',
+                    background: step.status === 'skipped' ? 'rgba(249, 226, 175, 0.08)' : 'transparent',
+                    border: step.status === 'skipped' ? '1px solid rgba(249, 226, 175, 0.18)' : 'none',
+                    borderRadius: step.status === 'skipped' ? '8px' : 0,
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word'
+                }}>
+                    {step.result}
                 </div>
             )}
             {canOpenLogs && logsOpen && (
@@ -232,10 +344,64 @@ const StepBlock = ({ step, getToolIcon, isLive = false }: { step: AgentStep, get
     );
 };
 
+const FileActionSummary = ({ files }: { files: any[] }) => {
+    if (!Array.isArray(files) || files.length === 0) return null;
+
+    const actionLabel = (file: any) => {
+        switch (file.action) {
+            case 'created': return 'Created';
+            case 'created_dir': return 'Created folder';
+            case 'deleted': return 'Deleted';
+            case 'moved': return 'Moved';
+            case 'read': return 'Read';
+            default: return 'Edited';
+        }
+    };
+
+    return (
+        <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {files.map((file, index) => {
+                const fileName = (file.path || '').split(/[/\\]/).pop() || file.path || 'file';
+                const hasDelta = typeof file.added === 'number' || typeof file.removed === 'number';
+                return (
+                    <div key={`${file.path || 'file'}-${index}`} style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        fontSize: '12px',
+                        paddingLeft: '18px',
+                        flexWrap: 'wrap'
+                    }}>
+                        <span style={{ color: 'var(--text-secondary)' }}>{actionLabel(file)}</span>
+                        <span style={{ color: 'var(--accent-primary)', textDecoration: 'underline' }}>{fileName}</span>
+                        {file.startLine && (
+                            <span style={{ color: 'var(--text-tertiary)' }}>
+                                lines {file.startLine}-{file.endLine || file.startLine}
+                            </span>
+                        )}
+                        {file.from && file.to && (
+                            <span style={{ color: 'var(--text-tertiary)' }}>
+                                {file.from.split(/[/\\]/).pop()} → {file.to.split(/[/\\]/).pop()}
+                            </span>
+                        )}
+                        {hasDelta && (
+                            <>
+                                <span style={{ color: '#22c55e' }}>+{file.added || 0}</span>
+                                <span style={{ color: '#ef4444' }}>-{file.removed || 0}</span>
+                            </>
+                        )}
+                    </div>
+                );
+            })}
+        </div>
+    );
+};
+
 const EditDetails = ({ data }: { data: any }) => {
     const [isOpen, setIsOpen] = React.useState(false);
 
     if (!data) return null;
+    const hasExpandableChanges = Boolean(data.edits || data.changes);
 
     // Handle plan data
     if (data.plan) {
@@ -324,7 +490,8 @@ const EditDetails = ({ data }: { data: any }) => {
 
     return (
         <div className="agent-step-details" style={{ marginTop: '8px' }}>
-            <div
+            {data.files && <FileActionSummary files={data.files} />}
+            {hasExpandableChanges && <div
                 className="details-toggle"
                 onClick={() => setIsOpen(!isOpen)}
                 style={{
@@ -339,8 +506,8 @@ const EditDetails = ({ data }: { data: any }) => {
                 }}
             >
                 {isOpen ? '⊖ Hide Changes' : '⊕ View Changes'}
-            </div>
-            {isOpen && (
+            </div>}
+            {hasExpandableChanges && isOpen && (
                 <div className="details-content" style={{
                     marginTop: '8px',
                     background: 'rgba(0,0,0,0.2)',
@@ -532,6 +699,270 @@ const MessageContent = ({ content, role }: { content: string, role: string }) =>
     );
 };
 
+const ArchivedMessagesList = React.memo(({
+    messages,
+    getToolIcon,
+}: {
+    messages: Message[];
+    getToolIcon: (tool: string) => string;
+}) => {
+    return (
+        <>
+            {messages.map((msg, idx) => (
+                <div key={idx} className={`chat-msg ${msg.role}`}>
+                    <div className="chat-msg-sender">
+                        {msg.role === 'user' ? 'YOU' : 'WhizCode'}
+                    </div>
+                    {msg.steps && msg.steps.length > 0 && (
+                        <div className="agent-steps">
+                            {msg.steps.map((step, si) => (
+                                <StepBlock key={si} step={step} getToolIcon={getToolIcon} />
+                            ))}
+                        </div>
+                    )}
+                    <div className="chat-msg-content">
+                        {msg.images && msg.images.length > 0 && (
+                            <div className="msg-images" style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '8px' }}>
+                                {msg.images.map((img, i) => (
+                                    <img key={i} src={img} style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.1)' }} />
+                                ))}
+                            </div>
+                        )}
+                        <MessageContent content={msg.content} role={msg.role} />
+                    </div>
+                </div>
+            ))}
+        </>
+    );
+}, (prev, next) => prev.messages === next.messages && prev.getToolIcon === next.getToolIcon);
+
+const LiveAgentActivity = React.memo(({
+    liveStreamingContent,
+    agentSteps,
+    getToolIcon,
+}: {
+    liveStreamingContent: string;
+    agentSteps: AgentStep[];
+    getToolIcon: (tool: string) => string;
+}) => {
+    if (!liveStreamingContent && agentSteps.length === 0) {
+        return (
+            <div className="thinking-indicator">
+                <div className="thinking-dot"></div>
+                <div className="thinking-dot"></div>
+                <div className="thinking-dot"></div>
+            </div>
+        );
+    }
+
+    return (
+        <>
+            {liveStreamingContent && (
+                <StreamingDisplay content={liveStreamingContent} isStreaming={true} />
+            )}
+            {agentSteps.length > 0 && (
+                <div className="agent-steps live" style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '8px',
+                    marginTop: '10px',
+                    paddingTop: '6px'
+                }}>
+                    {agentSteps.map((step, si) => (
+                        <StepBlock key={step.requestId || `step_${si}`} step={step} getToolIcon={getToolIcon} isLive={true} />
+                    ))}
+                </div>
+            )}
+        </>
+    );
+}, (prev, next) =>
+    prev.liveStreamingContent === next.liveStreamingContent &&
+    prev.agentSteps === next.agentSteps &&
+    prev.getToolIcon === next.getToolIcon
+);
+
+const LiveThoughtPanel = React.memo(({
+    currentPhase,
+    elapsedSeconds,
+    liveStreamingContent,
+    activeThought,
+    agentSteps,
+    tokensPerSecond,
+    estimatedTimeRemaining,
+    totalTokens,
+    promptDiagnostics,
+}: {
+    currentPhase: string;
+    elapsedSeconds: number;
+    liveStreamingContent: string;
+    activeThought: string | null;
+    agentSteps: AgentStep[];
+    tokensPerSecond?: number;
+    estimatedTimeRemaining?: number;
+    totalTokens?: number;
+    promptDiagnostics: any | null;
+}) => {
+    const statusText = liveStreamingContent
+        ? 'Streaming reasoning and tool calls...'
+        : (activeThought || (agentSteps.length > 0 ? (
+            agentSteps.find((s: any) => s.status === 'running')?.summary ||
+            [...agentSteps].reverse().find((s: any) => s.status === 'done')?.summary ||
+            'Initiating plan...'
+        ) : 'Analyzing context...'));
+
+    return (
+        <div className="thought-stream-container glass" style={{
+            marginBottom: '12px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '10px',
+            padding: '14px',
+            borderRadius: '14px',
+            border: '1px solid rgba(59, 130, 246, 0.16)',
+            background: 'linear-gradient(180deg, rgba(15, 23, 42, 0.78), rgba(15, 23, 42, 0.58))',
+            boxShadow: '0 12px 30px rgba(0, 0, 0, 0.16)'
+        }}>
+            <div className="dynamic-thought-bar" style={{
+                border: '1px solid rgba(59, 130, 246, 0.14)',
+                borderRadius: '12px',
+                padding: '10px 12px',
+                fontSize: '12px',
+                color: 'var(--text-primary)',
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '10px',
+                minHeight: '44px',
+                overflow: 'hidden',
+                background: 'rgba(255, 255, 255, 0.03)'
+            }}>
+                <div className="thought-pulse" style={{
+                    width: '9px',
+                    height: '9px',
+                    marginTop: '4px',
+                    borderRadius: '50%',
+                    background: 'var(--accent-primary)',
+                    boxShadow: '0 0 10px var(--accent-primary)',
+                    flexShrink: 0
+                }}></div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{
+                            fontSize: '10px',
+                            fontWeight: 700,
+                            letterSpacing: '0.08em',
+                            textTransform: 'uppercase',
+                            color: 'var(--accent-primary)',
+                            marginBottom: '4px'
+                        }}>
+                            {currentPhase.toUpperCase()}
+                        </div>
+                        <div className="live-thought-text" style={{ fontSize: '12px', color: 'var(--text-primary)', lineHeight: '1.55', wordBreak: 'break-word' }}>
+                            {statusText}
+                            <span style={{ animation: 'blink 1s infinite', marginLeft: '2px' }}>▌</span>
+                        </div>
+                    </div>
+            </div>
+
+            {liveStreamingContent.trim() && (
+                <div style={{
+                    maxHeight: '220px',
+                    overflowY: 'auto',
+                    borderRadius: '12px',
+                }}>
+                    <StreamingDisplay content={liveStreamingContent} isStreaming={true} />
+                </div>
+            )}
+
+            {(tokensPerSecond !== undefined || estimatedTimeRemaining !== undefined || totalTokens !== undefined) && (
+                <div style={{
+                    display: 'flex',
+                    gap: '8px',
+                    flexWrap: 'wrap'
+                }}>
+                    {totalTokens !== undefined && (
+                        <div style={{
+                            display: 'inline-flex',
+                            gap: '6px',
+                            alignItems: 'center',
+                            padding: '6px 10px',
+                            borderRadius: '999px',
+                            fontSize: '10px',
+                            color: 'var(--text-secondary)',
+                            background: 'rgba(59, 130, 246, 0.08)',
+                            border: '1px solid rgba(59, 130, 246, 0.12)'
+                        }}>
+                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>📊</span>
+                            <span>{totalTokens} tokens</span>
+                        </div>
+                    )}
+                    {tokensPerSecond !== undefined && (
+                        <div style={{
+                            display: 'inline-flex',
+                            gap: '6px',
+                            alignItems: 'center',
+                            padding: '6px 10px',
+                            borderRadius: '999px',
+                            fontSize: '10px',
+                            color: 'var(--text-secondary)',
+                            background: 'rgba(59, 130, 246, 0.08)',
+                            border: '1px solid rgba(59, 130, 246, 0.12)'
+                        }}>
+                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>⚡</span>
+                            <span>{tokensPerSecond.toFixed(1)} tok/s</span>
+                        </div>
+                    )}
+                    {estimatedTimeRemaining !== undefined && (
+                        <div style={{
+                            display: 'inline-flex',
+                            gap: '6px',
+                            alignItems: 'center',
+                            padding: '6px 10px',
+                            borderRadius: '999px',
+                            fontSize: '10px',
+                            color: 'var(--text-secondary)',
+                            background: 'rgba(59, 130, 246, 0.08)',
+                            border: '1px solid rgba(59, 130, 246, 0.12)'
+                        }}>
+                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>⏱</span>
+                            <span>~{estimatedTimeRemaining < 60 ? `${estimatedTimeRemaining}s` : `${Math.floor(estimatedTimeRemaining / 60)}m`}</span>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {promptDiagnostics && (
+                <div style={{
+                    display: 'flex',
+                    gap: '8px',
+                    flexWrap: 'wrap',
+                    padding: '8px 10px',
+                    borderRadius: '10px',
+                    background: 'rgba(245, 158, 11, 0.08)',
+                    border: '1px solid rgba(245, 158, 11, 0.18)',
+                    fontSize: '10px',
+                    color: 'var(--text-secondary)'
+                }}>
+                    <div style={{ fontWeight: 700, color: 'var(--accent-warning)' }}>
+                        Prompt trimming
+                    </div>
+                    <div>{promptDiagnostics.phase}</div>
+                    <div>{promptDiagnostics.included_messages}/{promptDiagnostics.total_messages} kept</div>
+                    <div>{promptDiagnostics.omitted_messages} omitted</div>
+                </div>
+            )}
+        </div>
+    );
+}, (prev, next) =>
+    prev.currentPhase === next.currentPhase &&
+    prev.elapsedSeconds === next.elapsedSeconds &&
+    prev.liveStreamingContent === next.liveStreamingContent &&
+    prev.activeThought === next.activeThought &&
+    prev.agentSteps === next.agentSteps &&
+    prev.tokensPerSecond === next.tokensPerSecond &&
+    prev.estimatedTimeRemaining === next.estimatedTimeRemaining &&
+    prev.totalTokens === next.totalTokens &&
+    prev.promptDiagnostics === next.promptDiagnostics
+);
+
 export const ChatPanel = ({
     chatWidth,
     handleChatResize,
@@ -567,6 +998,7 @@ export const ChatPanel = ({
     const [estimatedTimeRemaining, setEstimatedTimeRemaining] = React.useState<number | undefined>();
     const [totalTokens, setTotalTokens] = React.useState<number | undefined>();
     const [phaseHistory, setPhaseHistory] = React.useState<string[]>([]);
+    const [promptDiagnostics, setPromptDiagnostics] = React.useState<any | null>(null);
 
     React.useEffect(() => {
         const unlistenPhase = (window as any).__TAURI_INVOKE__?.('listen', {
@@ -613,6 +1045,22 @@ export const ChatPanel = ({
     }, []);
 
     React.useEffect(() => {
+        const unlistenDiagnostics = (window as any).__TAURI_INVOKE__?.('listen', {
+            event: 'agent:diagnostics',
+            handler: (event: any) => {
+                const diagnostics = event.payload;
+                if (diagnostics?.type === 'prompt_truncation') {
+                    setPromptDiagnostics(diagnostics);
+                }
+            }
+        }).catch(() => {});
+
+        return () => {
+            unlistenDiagnostics?.then((unlisten: any) => unlisten?.());
+        };
+    }, []);
+
+    React.useEffect(() => {
         if (!isLoading) {
             setRespondedSteps({});
             setCountdown(null);
@@ -621,6 +1069,7 @@ export const ChatPanel = ({
             setEstimatedTimeRemaining(undefined);
             setTotalTokens(undefined);
             setPhaseHistory([]);
+            setPromptDiagnostics(null);
             // Reset alwaysRun on task completion? Or keep it? Usually better to reset for safety.
             // setAlwaysRun(false); 
         } else {
@@ -757,54 +1206,17 @@ export const ChatPanel = ({
                 <ChatSettings {...settingsProps} />
 
                 <div className="chat-messages">
-                    {messages.map((msg, idx) => (
-                        <div key={idx} className={`chat-msg ${msg.role}`}>
-                            <div className="chat-msg-sender">
-                                {msg.role === 'user' ? 'YOU' : 'WhizCode'}
-                            </div>
-                            {msg.steps && msg.steps.length > 0 && (
-                                <div className="agent-steps">
-                                    {msg.steps.map((step, si) => (
-                                        <StepBlock key={si} step={step} getToolIcon={getToolIcon} />
-                                    ))}
-                                </div>
-                            )}
-                            <div className="chat-msg-content">
-                                {msg.images && msg.images.length > 0 && (
-                                    <div className="msg-images" style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '8px' }}>
-                                        {msg.images.map((img, i) => (
-                                            <img key={i} src={img} style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.1)' }} />
-                                        ))}
-                                    </div>
-                                )}
-                                <MessageContent content={msg.content} role={msg.role} />
-                            </div>
-                        </div>
-                    ))}
+                    <ArchivedMessagesList messages={messages} getToolIcon={getToolIcon} />
 
                     {isLoading && (
                         <div className="chat-msg assistant">
                             <div className="chat-msg-sender">WHIZCODE</div>
                             <div className="chat-msg-content">
-                                {liveStreamingContent && (
-                                    <StreamingDisplay content={liveStreamingContent} isStreaming={true} />
-                                )}
-                                
-                                {agentSteps.length > 0 && (
-                                    <div className="agent-steps live">
-                                        {agentSteps.map((step, si) => (
-                                            <StepBlock key={step.requestId || `step_${si}`} step={step} getToolIcon={getToolIcon} isLive={true} />
-                                        ))}
-                                    </div>
-                                )}
-
-                                {!liveStreamingContent && agentSteps.length === 0 && (
-                                    <div className="thinking-indicator">
-                                        <div className="thinking-dot"></div>
-                                        <div className="thinking-dot"></div>
-                                        <div className="thinking-dot"></div>
-                                    </div>
-                                )}
+                                <LiveAgentActivity
+                                    liveStreamingContent={liveStreamingContent}
+                                    agentSteps={agentSteps}
+                                    getToolIcon={getToolIcon}
+                                />
                             </div>
                         </div>
                     )}
@@ -813,82 +1225,17 @@ export const ChatPanel = ({
 
                 <div className="chat-input-area">
                     {isLoading && (
-                        <div className="thought-stream-container" style={{
-                            marginBottom: '10px',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '4px'
-                        }}>
-                            <div className="dynamic-thought-bar glass" style={{
-                                border: '1px solid rgba(0, 122, 204, 0.2)',
-                                borderRadius: '4px',
-                                padding: '6px 12px',
-                                fontSize: '11px',
-                                color: 'var(--text-secondary)',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '8px',
-                                minHeight: '28px',
-                                overflow: 'hidden'
-                            }}>
-                                <div className="thought-pulse" style={{
-                                    width: '8px',
-                                    height: '8px',
-                                    borderRadius: '50%',
-                                    background: 'var(--accent-primary)',
-                                    boxShadow: '0 0 8px var(--accent-primary)',
-                                    flexShrink: 0
-                                }}></div>
-                                    <div style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                        <span style={{ fontWeight: 600, color: 'var(--accent-primary)', marginRight: '6px' }}>
-                                            {currentPhase.toUpperCase()}:
-                                        </span>
-                                        <span className="live-thought-text" style={{ fontStyle: 'italic', opacity: 1, maxWidth: 'none' }}>
-                                            {activeThought || (agentSteps.length > 0 ? (
-                                                agentSteps.find((s: any) => s.status === 'running')?.summary || 
-                                                [...agentSteps].reverse().find((s: any) => s.status === 'done')?.summary || 
-                                                'Initiating plan...'
-                                            ) : 'Analyzing context...')}
-                                        </span>
-                                    </div>
-                                    <span style={{ fontSize: '10px', color: 'var(--text-secondary)', marginLeft: '8px', whiteSpace: 'nowrap' }}>
-                                        {elapsedSeconds}s
-                                    </span>
-                            </div>
-                            
-                            {/* WhizCode Metrics Display */}
-                            {(tokensPerSecond !== undefined || estimatedTimeRemaining !== undefined || totalTokens !== undefined) && (
-                                <div style={{
-                                    display: 'flex',
-                                    gap: '12px',
-                                    fontSize: '10px',
-                                    color: 'var(--text-secondary)',
-                                    padding: '6px 12px',
-                                    backgroundColor: 'rgba(59, 130, 246, 0.05)',
-                                    borderRadius: '4px',
-                                    border: '1px solid rgba(59, 130, 246, 0.1)',
-                                }}>
-                                    {totalTokens !== undefined && (
-                                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-                                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>📊</span>
-                                            <span>{totalTokens} tokens</span>
-                                        </div>
-                                    )}
-                                    {tokensPerSecond !== undefined && (
-                                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-                                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>⚡</span>
-                                            <span>{tokensPerSecond.toFixed(1)} tok/s</span>
-                                        </div>
-                                    )}
-                                    {estimatedTimeRemaining !== undefined && (
-                                        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-                                            <span style={{ color: 'var(--accent-primary)', fontWeight: 'bold' }}>⏱️</span>
-                                            <span>~{estimatedTimeRemaining < 60 ? `${estimatedTimeRemaining}s` : `${Math.floor(estimatedTimeRemaining / 60)}m`}</span>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-                        </div>
+                        <LiveThoughtPanel
+                            currentPhase={currentPhase}
+                            elapsedSeconds={elapsedSeconds}
+                            liveStreamingContent={liveStreamingContent}
+                            activeThought={activeThought}
+                            agentSteps={agentSteps}
+                            tokensPerSecond={tokensPerSecond}
+                            estimatedTimeRemaining={estimatedTimeRemaining}
+                            totalTokens={totalTokens}
+                            promptDiagnostics={promptDiagnostics}
+                        />
                     )}
                     {pendingPermissionStepIdx >= 0 && (
                         <div className="permission-controls-enhanced" style={{

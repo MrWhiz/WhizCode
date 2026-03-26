@@ -4,7 +4,6 @@ import { ollama } from '../../lib/tauri-api'
 import type { AIProvider } from '../../types'
 
 const RECOMMENDED_TASK_MODEL = 'qwen3:latest'
-const RECOMMENDED_EMBED_MODEL = 'nomic-embed-text'
 
 interface ChatSettingsProps {
     isSettingsOpen: boolean;
@@ -31,8 +30,6 @@ interface ChatSettingsProps {
     setIsAutopilotMode: (mode: boolean) => void;
     azureLoginUrl: string;
     setAzureLoginUrl: (url: string) => void;
-    azureEmbeddingUrl: string;
-    setAzureEmbeddingUrl: (url: string) => void;
     azureCompletionUrl: string;
     setAzureCompletionUrl: (url: string) => void;
     azureUsername: string;
@@ -70,8 +67,6 @@ export const ChatSettings = ({
     setIsAutopilotMode,
     azureLoginUrl,
     setAzureLoginUrl,
-    azureEmbeddingUrl,
-    setAzureEmbeddingUrl,
     azureCompletionUrl,
     setAzureCompletionUrl,
     azureUsername,
@@ -380,7 +375,6 @@ export const ChatSettings = ({
                                     <div style={{ fontSize: '11px', opacity: 0.6, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Recommended Models</div>
                                     {[
                                         { name: RECOMMENDED_TASK_MODEL, label: 'Task Model', desc: 'Reasoning & coding' },
-                                        { name: RECOMMENDED_EMBED_MODEL, label: 'Embedding Model', desc: 'Vector search & indexing' },
                                     ].map(({ name, label, desc }) => {
                                         const isInstalled = ollamaModels.some(m => m === name || m.startsWith(name.split(':')[0]))
                                         const pulling = pullingModels[name]
@@ -624,16 +618,6 @@ export const ChatSettings = ({
                                     className="settings-input"
                                     value={azureLoginUrl}
                                     onChange={e => setAzureLoginUrl(e.target.value)}
-                                    placeholder="https://..."
-                                />
-                            </div>
-                            <div className="settings-field">
-                                <label className="settings-field-label">Embedding URL</label>
-                                <input
-                                    type="text"
-                                    className="settings-input"
-                                    value={azureEmbeddingUrl}
-                                    onChange={e => setAzureEmbeddingUrl(e.target.value)}
                                     placeholder="https://..."
                                 />
                             </div>

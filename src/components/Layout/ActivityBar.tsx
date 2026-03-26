@@ -3,11 +3,14 @@ interface ActivityBarProps {
     setIsChatOpen: (open: boolean) => void;
     isSidebarOpen: boolean;
     setIsSidebarOpen: (open: boolean) => void;
+    isTerminalOpen: boolean;
+    setIsTerminalOpen: (open: boolean) => void;
 }
 
 export const ActivityBar = ({
     isChatOpen, setIsChatOpen,
-    isSidebarOpen, setIsSidebarOpen
+    isSidebarOpen, setIsSidebarOpen,
+    isTerminalOpen, setIsTerminalOpen
 }: ActivityBarProps) => {
     return (
         <div className="activity-bar">
@@ -31,6 +34,15 @@ export const ActivityBar = ({
                 aria-label="Toggle Chat Panel"
             >
                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <svg
+                className={`activity-icon ${isTerminalOpen ? 'active' : ''}`}
+                viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"
+                onClick={() => setIsTerminalOpen(!isTerminalOpen)}
+                aria-label="Toggle Terminal Panel"
+            >
+                <path d="M4 17h16V7H4v10zm2-7 3 3-3 3"></path>
+                <path d="M11 16h5"></path>
             </svg>
         </div>
     )

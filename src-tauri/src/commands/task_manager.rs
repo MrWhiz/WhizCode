@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use chrono::Utc;
+use crate::commands::problem_identifier::TaskWorkingState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TaskStatus {
@@ -58,6 +59,14 @@ pub struct TaskFile {
     pub status: String, // "in_progress", "completed"
     pub phases: Vec<Phase>,
     pub completed_tasks: Vec<CompletedTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStateRecord {
+    pub workspace_path: String,
+    pub original_query: String,
+    pub updated_at: String,
+    pub state: TaskWorkingState,
 }
 
 impl TaskFile {
@@ -179,6 +188,11 @@ impl TaskManager {
         path.to_string_lossy().to_string()
     }
 
+    pub fn get_task_state_path(workspace_path: &str) -> String {
+        let path = Path::new(workspace_path).join(".whizcode").join("task_state.json");
+        path.to_string_lossy().to_string()
+    }
+
     pub fn load_tasks_file(workspace_path: &str) -> Result<TaskFile, String> {
         let json_path = Self::get_tasks_json_path(workspace_path);
         
@@ -191,6 +205,20 @@ impl TaskManager {
 
         serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse tasks file: {}", e))
+    }
+
+    pub fn load_task_state(workspace_path: &str) -> Result<Option<TaskStateRecord>, String> {
+        let state_path = Self::get_task_state_path(workspace_path);
+        if !Path::new(&state_path).exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&state_path)
+            .map_err(|e| format!("Failed to read task state: {}", e))?;
+
+        serde_json::from_str(&content)
+            .map(Some)
+            .map_err(|e| format!("Failed to parse task state: {}", e))
     }
 
     #[allow(dead_code)]
@@ -227,6 +255,21 @@ impl TaskManager {
             .map_err(|e| format!("Failed to write tasks markdown: {}", e))?;
 
         eprintln!("[TaskManager] Saved tasks to {} and {}", json_path, md_path);
+        Ok(())
+    }
+
+    pub fn save_task_state(workspace_path: &str, record: &TaskStateRecord) -> Result<(), String> {
+        let whizcode_dir = Path::new(workspace_path).join(".whizcode");
+        fs::create_dir_all(&whizcode_dir)
+            .map_err(|e| format!("Failed to create .whizcode directory: {}", e))?;
+
+        let state_path = Self::get_task_state_path(workspace_path);
+        let content = serde_json::to_string_pretty(record)
+            .map_err(|e| format!("Failed to serialize task state: {}", e))?;
+        fs::write(&state_path, content)
+            .map_err(|e| format!("Failed to write task state: {}", e))?;
+
+        eprintln!("[TaskManager] Saved task state to {}", state_path);
         Ok(())
     }
 

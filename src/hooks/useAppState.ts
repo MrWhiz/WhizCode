@@ -25,6 +25,8 @@ export function useAppState() {
   const [sidebarWidth, setSidebarWidth] = useState(savedState.sidebarWidth)
   const [isChatOpen, setIsChatOpen] = useState(savedState.isChatOpen)
   const [chatWidth, setChatWidth] = useState(savedState.chatWidth)
+  const [isTerminalOpen, setIsTerminalOpen] = useState(savedState.isTerminalOpen)
+  const [terminalHeight, setTerminalHeight] = useState(savedState.terminalHeight)
 
   // Explorer state
   const [refreshKey, setRefreshKey] = useState(0)
@@ -64,10 +66,11 @@ export function useAppState() {
 
   // Azure Gateway settings
   const [azureLoginUrl, setAzureLoginUrl] = useState(() => localStorage.getItem('azureLoginUrl') || '')
-  const [azureEmbeddingUrl, setAzureEmbeddingUrl] = useState(() => localStorage.getItem('azureEmbeddingUrl') || '')
   const [azureCompletionUrl, setAzureCompletionUrl] = useState(() => localStorage.getItem('azureCompletionUrl') || '')
   const [azureUsername, setAzureUsername] = useState(() => localStorage.getItem('azureUsername') || '')
   const [azurePassword, setAzurePassword] = useState(() => localStorage.getItem('azurePassword') || '')
+  const [azureSessionToken, setAzureSessionToken] = useState(() => localStorage.getItem('azureSessionToken') || '')
+  const [azureTokenExpiresAt, setAzureTokenExpiresAt] = useState(() => Number(localStorage.getItem('azureTokenExpiresAt')) || 0)
   const [azureTokenStatus, setAzureTokenStatus] = useState<{ hasToken: boolean; timeLeft?: number; expires?: number }>({ hasToken: false })
 
   // Autopilot mode
@@ -101,6 +104,8 @@ export function useAppState() {
     sidebarWidth, setSidebarWidth,
     isChatOpen, setIsChatOpen,
     chatWidth, setChatWidth,
+    isTerminalOpen, setIsTerminalOpen,
+    terminalHeight, setTerminalHeight,
     // Explorer
     refreshKey, setRefreshKey,
     collapseAll, setCollapseAll,
@@ -127,10 +132,11 @@ export function useAppState() {
     contextLength, setContextLength,
     // Azure
     azureLoginUrl, setAzureLoginUrl,
-    azureEmbeddingUrl, setAzureEmbeddingUrl,
     azureCompletionUrl, setAzureCompletionUrl,
     azureUsername, setAzureUsername,
     azurePassword, setAzurePassword,
+    azureSessionToken, setAzureSessionToken,
+    azureTokenExpiresAt, setAzureTokenExpiresAt,
     azureTokenStatus, setAzureTokenStatus,
     // Autopilot
     isAutopilotMode, setIsAutopilotMode,

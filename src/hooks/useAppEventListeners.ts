@@ -40,6 +40,27 @@ function mergeAgentStep(previous: AgentStep, incoming: AgentStep): AgentStep {
   return merged
 }
 
+function appendStreamChunk(current: string, chunk: string): string {
+  if (!chunk) return current
+
+  const normalizedChunk = chunk.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  if (!current) return normalizedChunk
+
+  const searchWindow = Math.min(current.length, normalizedChunk.length)
+  for (let overlap = searchWindow; overlap > 0; overlap--) {
+    if (current.endsWith(normalizedChunk.slice(0, overlap))) {
+      const candidate = normalizedChunk.slice(overlap)
+      return candidate ? current + candidate : current
+    }
+  }
+
+  if (current.endsWith(normalizedChunk)) {
+    return current
+  }
+
+  return current + normalizedChunk
+}
+
 export function useAppEventListeners(
   setAgentSteps: (steps: AgentStep[] | ((prev: AgentStep[]) => AgentStep[])) => void,
   setMessages: (msg: any[] | ((prev: any[]) => any[])) => void,
@@ -56,6 +77,7 @@ export function useAppEventListeners(
     let unlistenStep: (() => void) | null = null
     let unlistenStream: (() => void) | null = null
     let unlistenError: (() => void) | null = null
+    const streamFlushTimerRef: { current: ReturnType<typeof setTimeout> | null } = { current: null }
 
     const setupListeners = async () => {
       try {
@@ -89,9 +111,20 @@ export function useAppEventListeners(
         })
 
         unlistenStream = await agent.events.onAgentStream(({ token }: { token: string }) => {
-          streamingContentRef.current += token
-          const currentContent = streamingContentRef.current
-          setLiveStreamingContent(currentContent)
+          streamingContentRef.current = appendStreamChunk(streamingContentRef.current, token)
+
+          // Render the first token immediately so the UI feels responsive,
+          // then keep coalescing subsequent tokens to avoid excess rerenders.
+          if (!streamFlushTimerRef.current) {
+            setLiveStreamingContent(streamingContentRef.current)
+          }
+
+          if (!streamFlushTimerRef.current) {
+            streamFlushTimerRef.current = setTimeout(() => {
+              streamFlushTimerRef.current = null
+              setLiveStreamingContent(streamingContentRef.current)
+            }, 100)
+          }
         })
 
         unlistenError = await (window as any).__TAURI_INVOKE__?.('listen', {
@@ -117,6 +150,11 @@ export function useAppEventListeners(
     }).then(fn => { unlistenAskUser = fn }).catch(() => {})
 
     return () => {
+      if (streamFlushTimerRef.current) {
+        clearTimeout(streamFlushTimerRef.current)
+        streamFlushTimerRef.current = null
+        setLiveStreamingContent(streamingContentRef.current)
+      }
       if (unlistenStep) unlistenStep()
       if (unlistenStream) unlistenStream()
       if (unlistenError) unlistenError()

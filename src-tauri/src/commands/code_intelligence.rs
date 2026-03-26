@@ -189,6 +189,125 @@ impl CodeIntelligence {
         Ok(context)
     }
 
+    pub fn update_file(&self, workspace_path: &str, file_path: &str) -> Result<()> {
+        let full_path = std::path::Path::new(file_path);
+        let resolved_path = if full_path.is_absolute() {
+            full_path.to_path_buf()
+        } else {
+            std::path::Path::new(workspace_path).join(full_path)
+        };
+
+        if !resolved_path.exists() {
+            return self.remove_file(workspace_path, file_path);
+        }
+
+        let content = match fs::read_to_string(&resolved_path) {
+            Ok(content) => content,
+            Err(_) => {
+                return self.remove_file(workspace_path, file_path);
+            }
+        };
+
+        let file_path = resolved_path.to_string_lossy().replace('\\', "/");
+
+        let mut contexts = self.contexts.lock().unwrap();
+        let context = if let Some(existing) = contexts.get_mut(workspace_path) {
+            existing
+        } else {
+            drop(contexts);
+            return self.analyze_workspace(workspace_path.to_string()).map(|_| ());
+        };
+
+        let old_symbols: Vec<String> = context
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.file_path == file_path)
+            .map(|symbol| symbol.name.clone())
+            .collect();
+
+        context.symbols.retain(|symbol| symbol.file_path != file_path);
+
+        let mut refreshed_symbols = self.extract_symbols(&file_path, &content);
+        let complexity = self.estimate_complexity(&content);
+        for symbol in &mut refreshed_symbols {
+            symbol.complexity = complexity;
+        }
+        context.symbols.extend(refreshed_symbols.clone());
+        context.patterns = self.extract_patterns(&context.symbols);
+
+        context.relationships.retain(|relationship| {
+            let references_removed_file = relationship.from_symbol == file_path
+                || relationship.to_symbol.starts_with(&format!("{}:", file_path));
+            let references_removed_symbol = old_symbols.iter().any(|symbol_name| {
+                relationship.to_symbol.ends_with(&format!(":{}", symbol_name))
+                    || relationship.from_symbol.contains(symbol_name)
+            });
+            !(references_removed_file || references_removed_symbol)
+        });
+
+        let current_symbols = context.symbols.clone();
+        for symbol in &current_symbols {
+            if symbol.file_path == file_path {
+                continue;
+            }
+            if content.contains(&symbol.name) {
+                context.relationships.push(CodeRelationship {
+                    from_symbol: file_path.clone(),
+                    to_symbol: format!("{}:{}", symbol.file_path, symbol.name),
+                    relationship_type: "references".to_string(),
+                    strength: 1.0,
+                });
+            }
+        }
+
+        context.metrics = Self::calculate_metrics(&context.symbols);
+        context.last_analyzed = Self::current_timestamp();
+        context.scan_signature = Self::workspace_scan_signature(workspace_path);
+
+        eprintln!("[INTEL] Incrementally refreshed symbols for {}", file_path);
+        Ok(())
+    }
+
+    pub fn remove_file(&self, workspace_path: &str, file_path: &str) -> Result<()> {
+        let path = std::path::Path::new(file_path);
+        let resolved_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::path::Path::new(workspace_path).join(path)
+        };
+        let file_key = resolved_path.to_string_lossy().replace('\\', "/");
+
+        let mut contexts = self.contexts.lock().unwrap();
+        let Some(context) = contexts.get_mut(workspace_path) else {
+            return Ok(());
+        };
+
+        let removed_symbols: Vec<String> = context
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.file_path == file_key)
+            .map(|symbol| symbol.name.clone())
+            .collect();
+
+        context.symbols.retain(|symbol| symbol.file_path != file_key);
+        context.relationships.retain(|relationship| {
+            let references_removed_file = relationship.from_symbol == file_key
+                || relationship.to_symbol.starts_with(&format!("{}:", file_key));
+            let references_removed_symbol = removed_symbols.iter().any(|symbol_name| {
+                relationship.to_symbol.ends_with(&format!(":{}", symbol_name))
+                    || relationship.from_symbol.contains(symbol_name)
+            });
+            !(references_removed_file || references_removed_symbol)
+        });
+        context.patterns = self.extract_patterns(&context.symbols);
+        context.metrics = Self::calculate_metrics(&context.symbols);
+        context.last_analyzed = Self::current_timestamp();
+        context.scan_signature = Self::workspace_scan_signature(workspace_path);
+
+        eprintln!("[INTEL] Removed cached symbols for {}", file_key);
+        Ok(())
+    }
+
     fn analyze_relationships(&self, context: &SemanticContext) -> Vec<CodeRelationship> {
         let mut relationships = Vec::new();
         let mut symbol_to_file: HashMap<String, String> = HashMap::new();
@@ -228,6 +347,30 @@ impl CodeIntelligence {
         }
 
         relationships
+    }
+
+    fn calculate_metrics(symbols: &[CodeSymbol]) -> CodeMetrics {
+        let total_files = symbols
+            .iter()
+            .map(|symbol| symbol.file_path.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u32;
+        let total_symbols = symbols.len() as u32;
+        let average_complexity = if total_symbols > 0 {
+            symbols.iter().map(|symbol| symbol.complexity).sum::<f32>() / total_symbols as f32
+        } else {
+            0.0
+        };
+
+        CodeMetrics {
+            total_files,
+            total_symbols,
+            average_complexity,
+            cohesion_score: 0.85,
+            technical_debt: 15.0,
+            maintainability_index: 85.0,
+            cyclomatic_complexity: average_complexity * 1.5,
+        }
     }
 
     fn extract_patterns(&self, symbols: &[CodeSymbol]) -> Vec<CodePattern> {

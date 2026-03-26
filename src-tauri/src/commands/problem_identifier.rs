@@ -34,6 +34,8 @@ impl TaskWorkingState {
         block.push_str(&format!("fingerprint: {}\n", self.task_fingerprint));
         block.push_str(&format!("kind: {}\n", self.task_kind));
         block.push_str(&format!("current_goal: {}\n", self.current_goal));
+        block.push_str("decision_mode: one_search_pass_one_read_pass_then_edit\n");
+        block.push_str("discovery_budget: stop exploring once a likely implementation file is known\n");
 
         if !self.suspected_files.is_empty() {
             block.push_str("suspected_files:\n");
@@ -209,7 +211,8 @@ impl ProblemIdentifier {
         let fingerprint = Self::analysis_fingerprint(task_statement, workspace_path, active_file, analysis);
         let mut pending_actions = vec![
             "use_semantic_search_first".to_string(),
-            "inspect_suspected_files".to_string(),
+            "inspect_one_candidate_file".to_string(),
+            "make_the_smallest_safe_change".to_string(),
             "verify_the_result".to_string(),
         ];
 
@@ -220,7 +223,10 @@ impl ProblemIdentifier {
         TaskWorkingState {
             task_fingerprint: fingerprint,
             task_kind: analysis.task_kind.clone(),
-            current_goal: analysis.focus_summary.clone(),
+            current_goal: format!(
+                "{} After one focused discovery pass, commit to the smallest safe edit instead of continuing to search.",
+                analysis.focus_summary
+            ),
             suspected_files,
             completed_checks: Vec::new(),
             pending_actions,

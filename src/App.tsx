@@ -27,7 +27,7 @@ import { useAutoScroll } from './hooks/useAutoScroll'
 // Types
 import type { AgentStep, Message } from './types'
 
-import { agent, dialog, workspace, fs, history, git, errorRecovery } from './lib/tauri-api'
+import { agent, dialog, workspace, fs, history, git, errorRecovery, specs, tasks } from './lib/tauri-api'
 import { loadAppState } from './lib/appState'
 
 import { WhizLogo } from './components/Branding/WhizLogo'
@@ -40,6 +40,7 @@ function App() {
   const latestAgentStepsRef = React.useRef<AgentStep[]>([])
   const historyLoadedWorkspaceRef = React.useRef<string | null>(null)
   const isHydratingHistoryRef = React.useRef(false)
+  const [askUserResponse, setAskUserResponse] = React.useState('')
 
   // Use custom hooks for state management
   const appState = useAppState()
@@ -99,6 +100,9 @@ function App() {
   // Menu state
   const [activeMenu, setActiveMenu] = React.useState<string | null>(null)
   const [terminalCreateRequest, setTerminalCreateRequest] = React.useState(0)
+  const [currentPlan, setCurrentPlan] = React.useState<any | null>(null)
+  const [activeSpec, setActiveSpec] = React.useState<any | null>(null)
+  const [taskSnapshot, setTaskSnapshot] = React.useState<any | null>(null)
 
   const menus = [
     {
@@ -260,8 +264,52 @@ function App() {
   }, [agentSteps])
 
   React.useEffect(() => {
+    if (askUserPrompt) {
+      setAskUserResponse('')
+    }
+  }, [askUserPrompt])
+
+  const refreshPlanningArtifacts = useCallback(async (workspacePathArg?: string | null, preferredSpecId?: string | null) => {
+    const targetWorkspace = workspacePathArg ?? workspacePath
+    if (!targetWorkspace) {
+      setActiveSpec(null)
+      setTaskSnapshot(null)
+      return
+    }
+
+    try {
+      const [specList, snapshot] = await Promise.all([
+        specs.list(targetWorkspace),
+        tasks.loadSnapshot(targetWorkspace),
+      ])
+
+      setTaskSnapshot(snapshot)
+
+      if (specList.length === 0) {
+        setActiveSpec(null)
+        return
+      }
+
+      const selectedSpec =
+        specList.find((item: any) => item.id === preferredSpecId) ||
+        (currentPlan ? specList.find((item: any) => item.id === currentPlan.id) : null) ||
+        specList[0]
+
+      if (selectedSpec?.id) {
+        const fullSpec = await specs.get(targetWorkspace, selectedSpec.id)
+        setActiveSpec(fullSpec)
+      }
+    } catch (error) {
+      console.error('Failed to refresh planning artifacts:', error)
+    }
+  }, [workspacePath, currentPlan])
+
+  React.useEffect(() => {
     if (!workspacePath) {
       historyLoadedWorkspaceRef.current = null
+      setCurrentPlan(null)
+      setActiveSpec(null)
+      setTaskSnapshot(null)
       return
     }
 
@@ -289,6 +337,44 @@ function App() {
 
     loadWorkspaceHistory()
   }, [workspacePath, setMessages])
+
+  React.useEffect(() => {
+    if (!workspacePath) {
+      return
+    }
+    refreshPlanningArtifacts(workspacePath)
+  }, [workspacePath, refreshPlanningArtifacts])
+
+  React.useEffect(() => {
+    let unlistenPlan: (() => void) | null = null
+    let unlistenTaskSnapshot: (() => void) | null = null
+    let unlistenPhase: (() => void) | null = null
+
+    const setupPlanningListeners = async () => {
+      unlistenPlan = await agent.events.onAgentPlan((plan) => {
+        setCurrentPlan(plan)
+        refreshPlanningArtifacts(workspacePath, plan.id)
+      })
+
+      unlistenTaskSnapshot = await agent.events.onTaskSnapshotUpdated((snapshot) => {
+        setTaskSnapshot(snapshot)
+      })
+
+      unlistenPhase = await agent.events.onAgentPhase(() => {
+        refreshPlanningArtifacts(workspacePath)
+      })
+    }
+
+    setupPlanningListeners().catch((error) => {
+      console.error('Failed to setup planning listeners:', error)
+    })
+
+    return () => {
+      if (unlistenPlan) unlistenPlan()
+      if (unlistenTaskSnapshot) unlistenTaskSnapshot()
+      if (unlistenPhase) unlistenPhase()
+    }
+  }, [workspacePath, refreshPlanningArtifacts])
 
   React.useEffect(() => {
     if (!workspacePath || isHydratingHistoryRef.current || historyLoadedWorkspaceRef.current !== workspacePath) {
@@ -495,6 +581,29 @@ function App() {
       }
     } catch (error) {
       console.error('Error responding to permission request:', error)
+    }
+  }
+
+  const handleAskUserResponse = async (response: string) => {
+    try {
+      if (!askUserPrompt) {
+        return
+      }
+
+      const trimmedResponse = response.trim()
+      if (trimmedResponse) {
+        setMessages(prev => [...prev, {
+          role: 'user',
+          content: trimmedResponse
+        }])
+      }
+
+      await agent.sendAskUserResponse(trimmedResponse, askUserPrompt.requestId || undefined)
+    } catch (error) {
+      console.error('Error responding to ask_user prompt:', error)
+    } finally {
+      setAskUserPrompt(null)
+      setAskUserResponse('')
     }
   }
 
@@ -729,6 +838,9 @@ function App() {
             liveStreamingContent={liveStreamingContent}
             selectedImages={selectedImages}
             setSelectedImages={setSelectedImages}
+            currentPlan={currentPlan}
+            activeSpec={activeSpec}
+            taskSnapshot={taskSnapshot}
           />
         )}
       </div>
@@ -880,16 +992,35 @@ function App() {
             border: '1px solid var(--border-color)',
             borderRadius: '8px',
             padding: '24px',
-            maxWidth: '400px',
+            width: 'min(560px, calc(100vw - 40px))',
             boxShadow: '0 20px 60px rgba(0, 0, 0, 0.3)'
           }}>
             <h3 style={{ marginTop: 0, marginBottom: '12px', color: 'var(--text-primary)' }}>Agent Question</h3>
-            <p style={{ marginBottom: '20px', color: 'var(--text-secondary)' }}>{askUserPrompt.question}</p>
+            <p style={{ marginBottom: '16px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>{askUserPrompt.question}</p>
+            <textarea
+              value={askUserResponse}
+              onChange={(e) => setAskUserResponse(e.target.value)}
+              placeholder="Type your response here..."
+              rows={5}
+              style={{
+                width: '100%',
+                minHeight: '120px',
+                resize: 'vertical',
+                marginBottom: '18px',
+                padding: '12px',
+                color: 'var(--text-primary)',
+                backgroundColor: 'var(--bg-primary)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '6px',
+                fontSize: '14px',
+                lineHeight: 1.5,
+                outline: 'none'
+              }}
+            />
             <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
               <button 
                 onClick={() => {
-                  handlePermissionResponse(false)
-                  setAskUserPrompt(null)
+                  handleAskUserResponse('')
                 }}
                 style={{
                   padding: '8px 16px',
@@ -901,13 +1032,13 @@ function App() {
                   fontSize: '13px'
                 }}
               >
-                No
+                Cancel
               </button>
               <button 
                 onClick={() => {
-                  handlePermissionResponse(true)
-                  setAskUserPrompt(null)
+                  handleAskUserResponse(askUserResponse)
                 }}
+                disabled={!askUserResponse.trim()}
                 style={{
                   padding: '8px 16px',
                   backgroundColor: 'var(--accent-primary)',
@@ -915,10 +1046,11 @@ function App() {
                   border: 'none',
                   borderRadius: '4px',
                   cursor: 'pointer',
+                  opacity: askUserResponse.trim() ? 1 : 0.5,
                   fontSize: '13px'
                 }}
               >
-                Yes
+                Send response
               </button>
             </div>
           </div>

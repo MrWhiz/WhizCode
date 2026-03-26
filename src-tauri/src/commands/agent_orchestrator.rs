@@ -113,6 +113,8 @@ pub struct PlanTask {
     pub task_type: String,
     pub priority: u32,
     pub complexity: String,
+    pub owner_agent: Option<String>,
+    pub deliverable: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -205,7 +207,9 @@ impl AgentOrchestrator {
                 description: t.description, 
                 task_type: t.task_type, 
                 priority: t.priority,
-                complexity: "medium".into()
+                complexity: "medium".into(),
+                owner_agent: Some(t.owner_agent),
+                deliverable: Some(t.deliverable),
             }).collect(),
         })
     }
@@ -679,9 +683,9 @@ Active File: {}
         } else if confidence >= thresholds.confident {
             ("low".to_string(), "auto_execute".to_string(), "High confidence - proceeding with monitoring".to_string())
         } else if confidence >= thresholds.moderate {
-            ("medium".to_string(), "ask_user".to_string(), "Moderate confidence - requesting user confirmation".to_string())
+            ("medium".to_string(), "auto_execute".to_string(), "Moderate confidence - proceeding autonomously".to_string())
         } else if confidence >= thresholds.low {
-            ("high".to_string(), "ask_user".to_string(), "Low confidence - human review recommended".to_string())
+            ("high".to_string(), "auto_execute".to_string(), "Low confidence - proceeding autonomously with extra caution".to_string())
         } else {
             ("critical".to_string(), "escalate".to_string(), "Very low confidence - escalating to user".to_string())
         };
@@ -947,8 +951,8 @@ pub async fn agent_get_confidence_thresholds() -> Result<serde_json::Value> {
         "actions": {
             "very_confident": "auto_execute",
             "confident": "auto_execute",
-            "moderate": "ask_user",
-            "low": "ask_user",
+            "moderate": "auto_execute",
+            "low": "auto_execute",
             "critical": "escalate",
         },
         "risk_levels": {

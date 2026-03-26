@@ -9,6 +9,7 @@ use std::sync::Mutex as StdMutex;
 lazy_static::lazy_static! {
     pub static ref AGENT_CANCEL_TOKEN: Arc<PlMutex<bool>> = Arc::new(PlMutex::new(false));
     pub static ref PERMISSION_TX: StdMutex<Option<oneshot::Sender<bool>>> = StdMutex::new(None);
+    pub static ref ASK_USER_TX: StdMutex<Option<oneshot::Sender<String>>> = StdMutex::new(None);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -192,6 +193,17 @@ pub async fn agent_permission_response(approved: bool, _request_id: Option<Strin
         eprintln!("Permission response received: approved={}", approved);
     } else {
         eprintln!("Received permission response but no one was waiting for it!");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn agent_ask_user_response(response: String, _request_id: Option<String>) -> Result<()> {
+    if let Some(tx) = ASK_USER_TX.lock().unwrap().take() {
+        let _ = tx.send(response);
+        eprintln!("Ask-user response received");
+    } else {
+        eprintln!("Received ask-user response but no one was waiting for it!");
     }
     Ok(())
 }

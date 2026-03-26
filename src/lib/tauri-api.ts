@@ -97,6 +97,73 @@ export interface ContextMemorySnapshot {
   stats: any
 }
 
+export interface PlanTaskSnapshot {
+  id: string
+  description: string
+  task_type: string
+  priority: number
+  dependencies: string[]
+  estimated_duration: number
+  owner_agent: string
+  deliverable: string
+  acceptance_criteria: string[]
+  requires_write: boolean
+}
+
+export interface ExecutionPlanSnapshot {
+  id: string
+  objective: string
+  spec_summary: string
+  tasks: PlanTaskSnapshot[]
+  parallel_groups: PlanTaskSnapshot[][]
+  estimated_duration: number
+  risk_level: string
+  fallback_strategies: string[]
+  acceptance_criteria: string[]
+  assumptions: string[]
+  definition_of_done: string[]
+  execution_strategy: string
+}
+
+export interface TaskSnapshotSubtask {
+  id: string
+  description: string
+  status: string
+  result?: string | null
+}
+
+export interface TaskSnapshotItem {
+  id: string
+  description: string
+  status: string
+  subtasks: TaskSnapshotSubtask[]
+  created_at: string
+  completed_at?: string | null
+  task_type?: string | null
+  owner_agent?: string | null
+  requires_write: boolean
+}
+
+export interface TaskSnapshotPhase {
+  name: string
+  description: string
+  tasks: TaskSnapshotItem[]
+}
+
+export interface TaskSnapshot {
+  project_name: string
+  original_query: string
+  created_at: string
+  status: string
+  phases: TaskSnapshotPhase[]
+  completed_tasks: Array<{
+    id: string
+    description: string
+    completed_at: string
+    result: string
+  }>
+}
+
 // Error handling
 export class TauriError extends Error {
   code: string
@@ -671,6 +738,14 @@ export const agent = {
     }
   },
 
+  async sendAskUserResponse(response: string, requestId?: string): Promise<void> {
+    try {
+      return await invoke('agent_ask_user_response', { response, requestId })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+
   events: {
     async onAgentStep(callback: (step: any) => void): Promise<() => void> {
       const unlisten = await listen('agent:step', (event) => {
@@ -682,6 +757,27 @@ export const agent = {
     async onAgentStream(callback: (data: { token: string }) => void): Promise<() => void> {
       const unlisten = await listen('agent:stream', (event) => {
         callback(event.payload as { token: string })
+      })
+      return unlisten
+    },
+
+    async onAgentPlan(callback: (plan: ExecutionPlanSnapshot) => void): Promise<() => void> {
+      const unlisten = await listen('agent:plan', (event) => {
+        callback(event.payload as ExecutionPlanSnapshot)
+      })
+      return unlisten
+    },
+
+    async onAgentPhase(callback: (phase: { phase: string; status: string; description?: string }) => void): Promise<() => void> {
+      const unlisten = await listen('agent:phase', (event) => {
+        callback(event.payload as { phase: string; status: string; description?: string })
+      })
+      return unlisten
+    },
+
+    async onTaskSnapshotUpdated(callback: (snapshot: TaskSnapshot) => void): Promise<() => void> {
+      const unlisten = await listen('agent:task_snapshot_updated', (event) => {
+        callback(event.payload as TaskSnapshot)
       })
       return unlisten
     },
@@ -878,17 +974,27 @@ export const mcp = {
 
 // Specs Commands
 export const specs = {
-  async list(): Promise<any[]> {
+  async list(workspacePath?: string | null): Promise<any[]> {
     try {
-      return await invoke('specs_list')
+      return await invoke('specs_list', { workspacePath: workspacePath ?? null })
     } catch (error) {
       throw handleError(error)
     }
   },
 
-  async get(slug: string): Promise<any> {
+  async get(workspacePath: string, slug: string): Promise<any> {
     try {
-      return await invoke('specs_get', { slug })
+      return await invoke('specs_get', { workspacePath, slug })
+    } catch (error) {
+      throw handleError(error)
+    }
+  },
+}
+
+export const tasks = {
+  async loadSnapshot(workspacePath: string): Promise<TaskSnapshot | null> {
+    try {
+      return await invoke('load_tasks_snapshot', { workspacePath })
     } catch (error) {
       throw handleError(error)
     }
@@ -1343,6 +1449,7 @@ export default {
   errorRecovery,
   mcp,
   specs,
+  tasks,
   planner,
   subAgents,
   learning,

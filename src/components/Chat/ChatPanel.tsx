@@ -6,8 +6,10 @@ import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import type { Message, AgentStep } from '../../types'
 import { ChatSettings } from './ChatSettings'
 import { MermaidDiagram } from './MermaidDiagram'
+import { SpecPlanPanel } from './SpecPlanPanel'
 import { StreamingDisplay } from './StreamingDisplay'
 import { TerminalBlock } from './TerminalBlock'
+import type { ExecutionPlanSnapshot, TaskSnapshot } from '../../lib/tauri-api'
 
 interface ChatPanelProps {
     chatWidth: number;
@@ -32,6 +34,9 @@ interface ChatPanelProps {
     liveStreamingContent?: string;
     selectedImages: string[];
     setSelectedImages: React.Dispatch<React.SetStateAction<string[]>>;
+    currentPlan?: ExecutionPlanSnapshot | null;
+    activeSpec?: any | null;
+    taskSnapshot?: TaskSnapshot | null;
 }
 
 const LogContainer = ({ logs }: { logs: string[] }) => {
@@ -864,8 +869,8 @@ const LiveThoughtPanel = React.memo(({
 
             {liveStreamingContent.trim() && (
                 <div style={{
-                    maxHeight: '220px',
-                    overflowY: 'auto',
+                    maxHeight: '64px',
+                    overflow: 'hidden',
                     borderRadius: '12px',
                 }}>
                     <StreamingDisplay content={liveStreamingContent} isStreaming={true} />
@@ -984,7 +989,10 @@ export const ChatPanel = ({
     settingsProps,
     liveStreamingContent = '',
     selectedImages,
-    setSelectedImages
+    setSelectedImages,
+    currentPlan = null,
+    activeSpec = null,
+    taskSnapshot = null
 }: ChatPanelProps) => {
     const [respondedSteps, setRespondedSteps] = React.useState<Record<number, boolean>>({});
     const [alwaysRun, setAlwaysRun] = React.useState(false);
@@ -1204,6 +1212,12 @@ export const ChatPanel = ({
                 )}
 
                 <ChatSettings {...settingsProps} />
+                <SpecPlanPanel
+                    currentPlan={currentPlan}
+                    activeSpec={activeSpec}
+                    taskSnapshot={taskSnapshot}
+                    isLoading={isLoading}
+                />
 
                 <div className="chat-messages">
                     <ArchivedMessagesList messages={messages} getToolIcon={getToolIcon} />

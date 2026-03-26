@@ -34,6 +34,12 @@ pub struct Task {
     pub subtasks: Vec<SubTask>,
     pub created_at: String,
     pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent: Option<String>,
+    #[serde(default)]
+    pub requires_write: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +126,69 @@ impl TaskFile {
                     }
                     return true;
                 }
+            }
+        }
+        false
+    }
+
+    pub fn update_first_task_by_kind(
+        &mut self,
+        task_type: &str,
+        status: TaskStatus,
+        result: Option<String>,
+    ) -> bool {
+        for phase in &mut self.phases {
+            for task in &mut phase.tasks {
+                if task.task_type.as_deref() != Some(task_type) {
+                    continue;
+                }
+                if matches!(task.status, TaskStatus::Completed | TaskStatus::Skipped) {
+                    continue;
+                }
+                task.status = status.clone();
+                if status == TaskStatus::Completed {
+                    task.completed_at = Some(Utc::now().to_rfc3339());
+                    if let Some(r) = result.clone() {
+                        self.completed_tasks.push(CompletedTask {
+                            id: task.id.clone(),
+                            description: task.description.clone(),
+                            completed_at: Utc::now().to_rfc3339(),
+                            result: r,
+                        });
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn update_first_write_task(
+        &mut self,
+        status: TaskStatus,
+        result: Option<String>,
+    ) -> bool {
+        for phase in &mut self.phases {
+            for task in &mut phase.tasks {
+                if !task.requires_write {
+                    continue;
+                }
+                if matches!(task.status, TaskStatus::Completed | TaskStatus::Skipped) {
+                    continue;
+                }
+                task.status = status.clone();
+                if status == TaskStatus::Completed {
+                    task.completed_at = Some(Utc::now().to_rfc3339());
+                    if let Some(r) = result.clone() {
+                        self.completed_tasks.push(CompletedTask {
+                            id: task.id.clone(),
+                            description: task.description.clone(),
+                            completed_at: Utc::now().to_rfc3339(),
+                            result: r,
+                        });
+                    }
+                }
+                return true;
             }
         }
         false

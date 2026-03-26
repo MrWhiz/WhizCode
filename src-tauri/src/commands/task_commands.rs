@@ -90,6 +90,15 @@ pub async fn load_tasks_markdown(workspace_path: String) -> Result<String> {
     }
 }
 
+/// Load the raw tasks snapshot for live UI rendering
+#[tauri::command]
+pub async fn load_tasks_snapshot(workspace_path: String) -> Result<serde_json::Value> {
+    match TaskManager::load_tasks_file(&workspace_path) {
+        Ok(task_file) => Ok(serde_json::to_value(task_file)?),
+        Err(_) => Ok(json!(null)),
+    }
+}
+
 /// Check if tasks exist
 #[tauri::command]
 pub async fn tasks_exist(workspace_path: String) -> Result<bool> {

@@ -27,11 +27,17 @@ impl TaskExecutor {
 
     /// Select appropriate agent for task type
     pub fn select_agent_for_task(&self, task: &PlanTask) -> String {
+        if !task.owner_agent.trim().is_empty() {
+            return task.owner_agent.clone();
+        }
+
         match task.task_type.as_str() {
             "analysis" => "context-gatherer".to_string(),
+            "spec" => "product-manager".to_string(),
             "design" => "architect".to_string(),
-            "implementation" => "general-task-execution".to_string(),
+            "implementation" | "edit" => "general-task-execution".to_string(),
             "testing" => "test-engineer".to_string(),
+            "command" => "test-engineer".to_string(),
             "review" => "code-reviewer".to_string(),
             "security" => "security-expert".to_string(),
             "ux" => "ux-designer".to_string(),
@@ -56,19 +62,29 @@ impl TaskExecutor {
             "{}\n\n\
              TASK: {}\n\
              Type: {}\n\
+             Owner Agent: {}\n\
              Priority: {}\n\
              Estimated Duration: {}s\n\
              Dependencies: {}\n\n\
+             Deliverable: {}\n\
+             Acceptance Criteria: {}\n\n\
              Complete this task and report results.",
             agent_context,
             task.description,
             task.task_type,
+            task.owner_agent,
             task.priority,
             task.estimated_duration,
             if task.dependencies.is_empty() {
                 "None".to_string()
             } else {
                 task.dependencies.join(", ")
+            },
+            task.deliverable,
+            if task.acceptance_criteria.is_empty() {
+                "None".to_string()
+            } else {
+                task.acceptance_criteria.join(" | ")
             }
         )
     }
@@ -181,6 +197,10 @@ mod tests {
             priority: 1,
             dependencies: vec![],
             estimated_duration: 30,
+            owner_agent: "architect".to_string(),
+            deliverable: "Design".to_string(),
+            acceptance_criteria: vec![],
+            requires_write: false,
         };
 
         assert_eq!(executor.select_agent_for_task(&task), "architect");
@@ -195,6 +215,10 @@ mod tests {
             priority: 2,
             dependencies: vec!["1".to_string()],
             estimated_duration: 60,
+            owner_agent: "general-task-execution".to_string(),
+            deliverable: "Implementation".to_string(),
+            acceptance_criteria: vec![],
+            requires_write: true,
         };
 
         let mut completed = HashSet::new();

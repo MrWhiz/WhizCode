@@ -157,6 +157,7 @@ fn main() {
             commands::agent::agent_stop,
             commands::agent::agent_reset,
             commands::agent::agent_permission_response,
+            commands::agent::agent_ask_user_response,
             
             // Git operations
             commands::git::git_status,
@@ -197,9 +198,19 @@ fn main() {
             // Specs operations
             commands::specs::specs_list,
             commands::specs::specs_get,
-            
+
             // Planning operations
             commands::planning::create_execution_plan,
+
+            // Task tracking operations
+            commands::task_commands::get_task_progress,
+            commands::task_commands::get_tasks_by_status,
+            commands::task_commands::update_task_status,
+            commands::task_commands::load_tasks_markdown,
+            commands::task_commands::load_tasks_snapshot,
+            commands::task_commands::tasks_exist,
+            commands::task_commands::get_pending_tasks_count,
+            commands::task_commands::get_completed_tasks_count,
             
             // Sub-agents operations
             commands::sub_agents::list_sub_agents,

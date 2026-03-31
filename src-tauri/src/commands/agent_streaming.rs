@@ -3,6 +3,7 @@ use crate::error::Result;
 use crate::commands::prompts;
 use crate::commands::problem_identifier::{ProblemAnalysis, ProblemIdentifier, TaskWorkingState};
 use crate::commands::task_manager::{TaskManager, TaskStateRecord};
+use crate::commands::task_analyzer::TaskAnalyzer;
 use crate::commands::workspace::{
     build_workspace_context_snapshot,
     load_workspace_context_snapshot,
@@ -1049,8 +1050,13 @@ pub struct RecoveryStrategy {
     pub suggestion: Option<String>,
 }
 
+// ─────────────────────────────────────────────
+// PHASE 2: Smart Loop Recovery (Kiro-Style)
+// ─────────────────────────────────────────────
+// Note: Loop recovery is now handled by the LoopRecoveryEngine in loop_recovery.rs
+// The placeholder functions below have been replaced with the actual implementation
+
 pub struct StreamingAgentOrchestrator {
-    max_iterations: u32,
     app_handle: Option<tauri::AppHandle>,
     suppress_stream: bool,
     file_tree_cache: Arc<RwLock<HashMap<String, (String, u64)>>>,
@@ -1073,7 +1079,6 @@ pub struct StreamingAgentOrchestrator {
 impl StreamingAgentOrchestrator {
     pub fn new(app_handle: Option<tauri::AppHandle>) -> Self {
         Self {
-            max_iterations: 10,
             app_handle,
             suppress_stream: false,
             file_tree_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1263,6 +1268,128 @@ impl StreamingAgentOrchestrator {
         );
         let mut planning_system = crate::commands::planning::PlanningSystem::new();
         let execution_plan = planning_system.create_plan(&task, &workspace_path);
+
+        // ─────────────────────────────────────────────
+        // PHASE 3: Task Understanding & Clarification
+        // ─────────────────────────────────────────────
+        eprintln!("[Agent] === PHASE 3: Task Understanding ===");
+        let task_analysis = TaskAnalyzer::analyze(&task);
+        eprintln!("[Agent] Task Type: {:?}", task_analysis.task_type);
+        eprintln!("[Agent] Complexity: {:?}", task_analysis.complexity);
+        eprintln!("[Agent] Estimated Iterations: {}", task_analysis.estimated_iterations);
+
+        // Emit task analysis to frontend
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("agent:task_analysis", &serde_json::json!({
+                "task_type": task_analysis.task_type.to_string(),
+                "complexity": task_analysis.complexity.to_string(),
+                "acceptance_criteria": task_analysis.acceptance_criteria,
+                "potential_blockers": task_analysis.potential_blockers,
+                "assumptions": task_analysis.assumptions,
+                "estimated_iterations": task_analysis.estimated_iterations,
+                "clarification_questions": task_analysis.clarification_questions,
+            }));
+
+            // Emit task analysis summary
+            let _ = app.emit("agent:message", &serde_json::json!({
+                "type": "task_analysis",
+                "content": task_analysis.summary(),
+            }));
+        }
+
+        // ─────────────────────────────────────────────
+        // PHASE 1: Task Clarification (Kiro-Style)
+        // ─────────────────────────────────────────────
+        eprintln!("[Agent] === PHASE 1: Task Clarification ===");
+        let workspace_context_for_clarification = workspace_path.clone();
+        let _clarification = match crate::commands::task_clarification::clarify_task(
+            task.clone(),
+            workspace_context_for_clarification,
+        ) {
+            Ok(clarif) => {
+                eprintln!("[Agent] Task clarification generated: {} questions, {} blockers", 
+                    clarif.questions.len(), clarif.identified_blockers.len());
+                
+                // Emit clarification event to frontend
+                if let Some(app) = &self.app_handle {
+                    let _ = app.emit("agent:clarification", &serde_json::json!({
+                        "questions": clarif.questions,
+                        "blockers": clarif.identified_blockers,
+                        "acceptance_criteria": clarif.acceptance_criteria,
+                        "assumptions": clarif.assumptions,
+                        "complexity": clarif.estimated_complexity,
+                        "estimated_duration_minutes": clarif.estimated_duration_minutes,
+                    }));
+                }
+                
+                Some(clarif)
+            }
+            Err(e) => {
+                eprintln!("[Agent] Task clarification failed: {}", e);
+                None
+            }
+        };
+
+        // ─────────────────────────────────────────────
+        // PHASE 4: Context Integration (Kiro-Style)
+        // ─────────────────────────────────────────────
+        eprintln!("[Agent] === PHASE 4: Context Integration ===");
+        let mut context_engine = crate::commands::context_integration::ContextIntegrationEngine::new();
+        
+        // Load learned patterns from context memory
+        if let Ok(ctx_mem) = context_memory.lock() {
+            let best_strategies = ctx_mem.get_best_strategies("general");
+            for strategy in best_strategies {
+                let pattern = crate::commands::context_integration::LearnedPattern {
+                    pattern_id: format!("strat_{}", strategy.strategy),
+                    pattern_type: "workflow".to_string(),
+                    description: strategy.strategy.clone(),
+                    context: "general".to_string(),
+                    language: detected_shell.clone(),
+                    success_rate: strategy.effectiveness_score,
+                    times_used: strategy.success_count,
+                    last_used: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    effectiveness_score: strategy.effectiveness_score,
+                };
+                context_engine.add_pattern(pattern);
+            }
+        }
+        
+        // Activate knowledge distillation
+        let distilled_knowledge = context_engine.activate_knowledge_distillation();
+        eprintln!("[Agent] Distilled {} pieces of knowledge", distilled_knowledge.len());
+        
+        // Score context relevance
+        let context_relevance = context_engine.score_context_relevance(
+            &task,
+            &task_problem_analysis.task_kind,
+            Some(&detected_shell),
+        );
+        eprintln!("[Agent] Context relevance: {:.0}%", context_relevance.relevance_score * 100.0);
+        
+        // Emit context integration event
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("agent:context_integration", &serde_json::json!({
+                "relevance_score": context_relevance.relevance_score,
+                "matching_patterns": context_relevance.matching_patterns,
+                "suggested_approaches": context_relevance.suggested_approaches,
+                "confidence": context_relevance.confidence,
+                "distilled_knowledge_count": distilled_knowledge.len(),
+            }));
+        }
+
+        // Update iteration limit based on complexity
+        let base_iterations = 30u32;
+        let complexity_multiplier = match task_analysis.complexity {
+            crate::commands::task_analyzer::Complexity::Simple => 1,
+            crate::commands::task_analyzer::Complexity::Moderate => 1,
+            crate::commands::task_analyzer::Complexity::Complex => 2,
+            crate::commands::task_analyzer::Complexity::VeryComplex => 3,
+        };
+        let adjusted_iteration_limit = base_iterations * complexity_multiplier;
         let execution_plan_block = execution_plan.to_prompt_block();
         let product_manager_note = self
             .run_planning_consultation("product-manager", &task, &execution_plan, &model)
@@ -1507,7 +1634,10 @@ impl StreamingAgentOrchestrator {
 
         // ── 3. CONTEXT BUILDING ─────────────────────────────────────────────
         // Lean system prompt: only static rules + shell info + learned insights
-        let system_prompt = self.get_system_prompt(&detected_shell, learning.clone());
+        let mut system_prompt = self.get_system_prompt(&detected_shell, learning.clone());
+        
+        // Inject steering context into system prompt
+        self.inject_steering_context(&mut system_prompt, &workspace_path);
 
         let mut turn_messages: Vec<(String, String)> = vec![
             ("system".to_string(), system_prompt),
@@ -1606,6 +1736,17 @@ impl StreamingAgentOrchestrator {
         );
         final_task_msg.push_str(&problem_analysis);
 
+        // ── PHASE 4: CONTEXT INTEGRATION ────────────────────────────────────
+        // Inject learned patterns and proactive suggestions
+        let context_injection = context_engine.get_context_injection(
+            &task,
+            &task_problem_analysis.task_kind,
+            Some(&detected_shell),
+        );
+        if !context_injection.is_empty() {
+            final_task_msg.push_str(&context_injection);
+        }
+
         // ── CONTEXT MEMORY: Inject prior patterns into task message ──────────
         // Query for relevant strategies and error patterns from past executions
         let context_memory_hint = if let Ok(ctx_mem) = context_memory.lock() {
@@ -1680,13 +1821,14 @@ impl StreamingAgentOrchestrator {
         let mut no_progress_count = 0u32; // Track consecutive iterations with no tool calls (FIX 3)
         let mut has_meaningful_write = false;
 
-        let iteration_extension = self.max_iterations * 3;
-        let mut iteration_limit = self.max_iterations * 3;
+        let iteration_extension = adjusted_iteration_limit;
+        let mut iteration_limit = adjusted_iteration_limit;
+        #[allow(unused_assignments)]
         while iteration < iteration_limit {
             if crate::commands::agent::is_agent_cancelled() { break; }
 
             iteration += 1;
-            eprintln!("[Agent] === Iteration {}/{} ===", iteration, self.max_iterations * 3);
+            eprintln!("[Agent] === Iteration {}/{} ===", iteration, adjusted_iteration_limit);
 
             // ── Trim turn_messages growth (keep first 4 pinned + last 20 turns) ──
             // Each iteration adds 2 messages; without a cap the Vec grows to 4+(n*2).
@@ -1765,6 +1907,61 @@ impl StreamingAgentOrchestrator {
                 }
                 
                 tool_calls.push(tool_call_or_text.clone());
+                
+                // ─────────────────────────────────────────────
+                // PHASE 3: Confidence Scoring & Reasoning (Kiro-Style)
+                // ─────────────────────────────────────────────
+                // Calculate confidence before tool execution
+                let confidence_engine = crate::commands::confidence_scoring::ConfidenceScoringEngine::new();
+                let decision_context = crate::commands::confidence_scoring::DecisionContext {
+                    tool: tool_call_or_text.tool.clone(),
+                    args: tool_call_or_text.args.clone(),
+                    task_type: task_analysis.task_type.to_string(),
+                    previous_success_rate: 0.75,
+                    similar_tasks_success_rate: 0.75,
+                    context_clarity: 0.8,
+                    is_new_tool: false,
+                    has_error_history: false,
+                };
+                
+                let confidence = confidence_engine.score_decision(&decision_context);
+                eprintln!("[Agent] Confidence: {} ({:.0}%)", confidence.level, confidence.score * 100.0);
+                
+                // Emit confidence event to frontend
+                if let Some(app) = &self.app_handle {
+                    let _ = app.emit("agent:confidence", &serde_json::json!({
+                        "tool": tool_call_or_text.tool,
+                        "score": confidence.score,
+                        "level": confidence.level,
+                        "emoji": confidence.emoji,
+                        "reasons_for": confidence.reasons_for,
+                        "reasons_against": confidence.reasons_against,
+                        "recommendation": confidence.recommendation,
+                    }));
+                }
+                
+                // Generate reasoning explanation
+                let reasoning_engine = crate::commands::reasoning_explainer::ReasoningExplainerEngine::new();
+                let reasoning = reasoning_engine.explain_reasoning(
+                    &tool_call_or_text.tool,
+                    &tool_call_or_text.args,
+                    &task,
+                    &tool_results,
+                );
+                
+                eprintln!("[Agent] Reasoning: {}", reasoning.action);
+                
+                // Emit reasoning event to frontend
+                if let Some(app) = &self.app_handle {
+                    let _ = app.emit("agent:reasoning", &serde_json::json!({
+                        "action": reasoning.action,
+                        "why": reasoning.why,
+                        "expected_outcome": reasoning.expected_outcome,
+                        "alternatives": reasoning.alternatives,
+                        "risks": reasoning.risks,
+                    }));
+                }
+                
                 match &result {
                     Ok(r) => {
                         tool_results.push(format!("[{}] result:\n{}", tool_call_or_text.tool, r));
@@ -1959,13 +2156,6 @@ impl StreamingAgentOrchestrator {
                     if validation_error_count >= MAX_VALIDATION_ERRORS {
                         eprintln!("[Agent] ⚠️ CRITICAL: {} consecutive validation errors. Exiting.", validation_error_count);
                         status = "failed".to_string();
-                        response = format!(
-                            "Task failed: The agent produced {} consecutive validation errors. \
-                             This typically means the agent is trying to use tools that don't exist or \
-                             is unable to format tool calls correctly.\n\nRejected tools:\n{}",
-                            validation_error_count,
-                            rejected_tools.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n")
-                        );
                         break; // Exit the main loop
                     }
                     
@@ -2056,13 +2246,6 @@ impl StreamingAgentOrchestrator {
                     if validation_error_count >= MAX_VALIDATION_ERRORS {
                         eprintln!("[Agent] ⚠️ CRITICAL: {} consecutive validation errors. Exiting.", validation_error_count);
                         status = "failed".to_string();
-                        response = format!(
-                            "Task failed: The agent produced {} consecutive validation errors. \
-                             This typically means the agent is trying to use tools that don't exist or \
-                             is unable to format tool calls correctly.\n\nRejected tools:\n{}",
-                            validation_error_count,
-                            rejected_tools.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n")
-                        );
                         break; // Exit the main loop
                     }
                     
@@ -2325,9 +2508,47 @@ impl StreamingAgentOrchestrator {
                 if sig == previous_tool_sig {
                     repeat_count += 1;
                     if repeat_count >= 3 {
-                        eprintln!("[Agent] ⚠️ Stuck in repetitive loop — prompting collaboration");
-                        tool_results.push("[SYSTEM] LOOP DETECTED: You have attempted the same action three times. You are likely stuck. Do not ask the user by default. Choose a different tool, inspect a different file, or make the smallest safe edit based on the evidence you already have.".to_string());
-                        repeat_count = 0;
+                        // PHASE 2: Smart Loop Recovery (Kiro-Style)
+                        eprintln!("[Agent] ⚠️ Stuck in repetitive loop — analyzing pattern for recovery");
+                        
+                        // Convert tool calls to LoopRecoveryEngine format
+                        let loop_tool_calls: Vec<crate::commands::loop_recovery::ToolCall> = tool_calls.iter()
+                            .map(|tc| crate::commands::loop_recovery::ToolCall {
+                                tool: tc.tool.clone(),
+                                args: tc.args.clone(),
+                            })
+                            .collect();
+                        
+                        // Analyze and generate guidance
+                        let recovery_engine = crate::commands::loop_recovery::LoopRecoveryEngine::new();
+                        let recovery_guidance = recovery_engine.analyze_and_recover(&loop_tool_calls, &tool_results, iteration);
+                        
+                        eprintln!("[Agent] Loop pattern: {}", recovery_guidance.pattern);
+                        eprintln!("[Agent] Confidence: {:.0}%", recovery_guidance.confidence * 100.0);
+                        
+                        // Emit guidance event to frontend
+                        if let Some(app) = &self.app_handle {
+                            let _ = app.emit("agent:loop_recovery", &serde_json::json!({
+                                "pattern": recovery_guidance.pattern,
+                                "analysis": recovery_guidance.analysis,
+                                "suggestions": recovery_guidance.suggestions,
+                                "next_step": recovery_guidance.next_step,
+                                "confidence": recovery_guidance.confidence,
+                            }));
+                        }
+                        
+                        // Format guidance for agent
+                        let formatted_guidance = crate::commands::loop_recovery::format_guidance_for_agent(&recovery_guidance);
+                        tool_results.push(formatted_guidance);
+                        repeat_count = 0;  // Reset counter to allow recovery
+                        
+                        // Continue loop instead of breaking
+                        // Only exit if we've tried many times
+                        if iteration > 10 {
+                            eprintln!("[Agent] ⚠️ Still looping after 10 iterations. Forcing exit.");
+                            status = "failed".to_string();
+                            break;
+                        }
                     } else {
                         tool_results.push("[SYSTEM] REPETITION WARNING: You repeated the exact same tool call. Analyze why it didn't give you the info you needed and change your parameters or try a different tool.".to_string());
                     }
@@ -3886,13 +4107,17 @@ impl StreamingAgentOrchestrator {
                 let mut allow_verification = has_prior_meaningful_write;
 
                 for (tool_idx, tool_call) in tool_calls.iter().enumerate() {
-                    if task_kind_prefers_writes(task_kind)
-                        && !allow_verification
-                        && tool_call.tool == "done"
-                    {
-                        let message = "Cannot mark the task done yet: no meaningful code edit has been executed in this run. Make the smallest safe change first.".to_string();
-                        executed_results.push((tool_call.clone(), Ok(message)));
-                        continue;
+                    if tool_call.tool == "done" {
+                        // Allow done if we've made progress or tried many times
+                        let should_allow_done = !task_kind_prefers_writes(task_kind) 
+                            || allow_verification 
+                            || iteration > 10;  // Force exit after 10 iterations
+                        
+                        if !should_allow_done {
+                            let message = "Cannot mark the task done yet: no meaningful code edit has been executed in this run. Make the smallest safe change first.".to_string();
+                            executed_results.push((tool_call.clone(), Ok(message)));
+                            continue;
+                        }
                     }
 
                     if task_kind_prefers_writes(task_kind)
@@ -4156,7 +4381,7 @@ impl StreamingAgentOrchestrator {
                                                         if valid_tools.contains(&tool_name) {
                                                             (true, None)
                                                         } else {
-                                                            (false, Some(&format!("unknown_tool: {}", tool_name)))
+                                                            (false, Some("unknown_tool"))
                                                         }
                                                     }
                                                 };
@@ -4165,7 +4390,12 @@ impl StreamingAgentOrchestrator {
                                                     eprintln!("[Phase 4] ⚠️ Tool '{}' missing required argument: {:?}, skipping", tool_name, missing_arg);
                                                     let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
                                                     let missing_info = missing_arg.map(|m| format!(" (missing: \"{}\")", m)).unwrap_or_default();
-                                                    rejected_tools.push(format!("Tool '{}'{} with args: {}", tool_name, missing_info, args_str));
+                                                    let tool_error = if missing_arg == Some("unknown_tool") {
+                                                        format!("Tool '{}' is not recognized", tool_name)
+                                                    } else {
+                                                        format!("Tool '{}'{} with args: {}", tool_name, missing_info, args_str)
+                                                    };
+                                                    rejected_tools.push(tool_error);
                                                     continue;
                                                 }
 
@@ -4330,7 +4560,12 @@ impl StreamingAgentOrchestrator {
                                 if crate::commands::agent::is_agent_cancelled() { break; }
 
                                 if tool_call.tool == "done" {
-                                    if task_kind_prefers_writes(task_kind) && !allow_verification {
+                                    // Allow done if we've made progress or tried many times
+                                    let should_allow_done = !task_kind_prefers_writes(task_kind) 
+                                        || allow_verification 
+                                        || iteration > 10;  // Force exit after 10 iterations
+                                    
+                                    if !should_allow_done {
                                         let blocked = "Completion blocked: no meaningful code edit has been executed in this run yet. Make the smallest safe change before finishing.".to_string();
                                         executed_results.push((tool_call.clone(), Ok(blocked)));
                                         continue;
@@ -5480,6 +5715,26 @@ impl StreamingAgentOrchestrator {
         }
 
         prompt
+    }
+
+    /// Inject steering context into system prompt
+    fn inject_steering_context(
+        &self,
+        prompt: &mut String,
+        workspace_path: &Option<String>,
+    ) {
+        if let Some(ws) = workspace_path {
+            match crate::commands::steering_files::SteeringFileManager::load_steering_files(ws) {
+                Ok(steering) => {
+                    let context = crate::commands::steering_files::SteeringFileManager::get_steering_context(&steering);
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&context);
+                }
+                Err(e) => {
+                    eprintln!("[Agent] Failed to load steering files: {}", e);
+                }
+            }
+        }
     }
 
     /// Builds the rich workspace context that is sent ONCE before the agent loop

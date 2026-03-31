@@ -387,6 +387,12 @@ fn main() {
             commands::task_commands::tasks_exist,
             commands::task_commands::get_pending_tasks_count,
             commands::task_commands::get_completed_tasks_count,
+            
+            // Steering files operations
+            commands::steering_commands::load_steering_files,
+            commands::steering_commands::validate_steering_files,
+            commands::steering_commands::create_default_steering_files,
+            commands::steering_commands::get_steering_context,
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();

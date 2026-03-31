@@ -178,9 +178,9 @@ impl IncrementalJsonParser {
             }
         } else {
             // No complete object found - check if buffer is getting too large (likely incomplete)
-            // If buffer > 10KB and still no complete object, it's probably incomplete JSON
-            if self.buffer.len() > 10000 {
-                eprintln!("[JSONParser] ⚠️ Buffer exceeded 10KB without finding complete JSON object - likely incomplete response");
+            // If buffer > 100KB and still no complete object, it's probably incomplete JSON
+            if self.buffer.len() > 100000 {
+                eprintln!("[JSONParser] ⚠️ Buffer exceeded 100KB without finding complete JSON object - likely incomplete response");
                 // Try to extract what we have anyway (best effort)
                 if let Ok(obj) = serde_json::from_str::<Value>(&self.buffer) {
                     self.buffer.clear();

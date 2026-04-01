@@ -10,7 +10,6 @@ import { EditorArea } from './components/Editor/EditorArea'
 import { ChatPanel } from './components/Chat/ChatPanel'
 import { WebPreview } from './components/Preview/WebPreview'
 import { MultiTerminalPane } from './components/Terminal/MultiTerminalPane'
-import SystemPerformance from './components/Explorer/SystemPerformance'
 
 // Hooks
 import { useAppState } from './hooks/useAppState'
@@ -30,8 +29,7 @@ import type { AgentStep, Message } from './types'
 import { agent, dialog, workspace, fs, history, git, errorRecovery, specs, tasks } from './lib/tauri-api'
 import { loadAppState } from './lib/appState'
 
-import { WhizLogo } from './components/Branding/WhizLogo'
-import { FiPlus, FiFolderPlus, FiRotateCw, FiMinimize2, FiFolder } from 'react-icons/fi'
+import { FiPlus, FiFolderPlus, FiRotateCw, FiMinimize2 } from 'react-icons/fi'
 import './App.css'
 
 
@@ -50,7 +48,6 @@ function App() {
     selectedImages, setSelectedImages,
     isLoading, setIsLoading,
     agentSteps, setAgentSteps,
-    agentError, setAgentError,
     liveStreamingContent, setLiveStreamingContent,
     askUserPrompt, setAskUserPrompt,
     workspacePath, setWorkspacePath,
@@ -64,8 +61,8 @@ function App() {
     isTerminalOpen, setIsTerminalOpen,
     refreshKey, setRefreshKey,
     collapseAll, setCollapseAll,
-    showFileFilter, setShowFileFilter,
-    fileFilter, setFileFilter,
+    fileFilter,
+    setShowFileFilter,
     newFileDialog, setNewFileDialog,
     gitStatus, setGitStatus,
     newFolderDialog, setNewFolderDialog,
@@ -82,7 +79,6 @@ function App() {
     ollamaError, setOllamaError,
     ollamaChecking, setOllamaChecking,
     isSettingsOpen, setIsSettingsOpen,
-    isAboutOpen, setIsAboutOpen,
     azureLoginUrl, setAzureLoginUrl,
     azureCompletionUrl, setAzureCompletionUrl,
     azureUsername, setAzureUsername,
@@ -193,7 +189,6 @@ function App() {
     handleContentChange,
     getLanguage,
     normalizePath,
-    checkFileErrors,
   } = useFileOperations(openFiles, setOpenFiles, activeFileId, setActiveFileId, workspacePath)
 
   // Setup event listeners

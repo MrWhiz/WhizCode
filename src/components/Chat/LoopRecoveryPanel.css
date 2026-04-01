@@ -1,0 +1,89 @@
+.loop-recovery-panel {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 12px 0;
+  color: white;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.loop-recovery-panel .panel-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.loop-recovery-panel .icon {
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.loop-recovery-panel h3 {
+  margin: 0;
+  flex: 1;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.loop-recovery-panel .confidence-badge {
+  background: rgba(255, 255, 255, 0.2);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.loop-recovery-panel .panel-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.loop-recovery-panel .analysis-section {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 12px;
+  border-radius: 4px;
+}
+
+.loop-recovery-panel .analysis-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.loop-recovery-panel .suggestions-section h4 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.loop-recovery-panel .suggestions-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.loop-recovery-panel .suggestions-list li {
+  margin: 4px 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.loop-recovery-panel .next-step-section {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 12px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.loop-recovery-panel .next-step-section strong {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.loop-recovery-panel .next-step-section p {
+  margin: 0;
+  line-height: 1.4;
+}

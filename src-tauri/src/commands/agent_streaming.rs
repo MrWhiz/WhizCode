@@ -225,6 +225,71 @@ fn is_meaningful_ask_user_question(args: &serde_json::Value) -> bool {
     question.ends_with('?')
 }
 
+fn validate_tool_call_args(
+    tool_name: &str,
+    args: &serde_json::Value,
+    valid_tools: &[&str],
+) -> (bool, Option<&'static str>) {
+    match tool_name {
+        "read_file" | "write_file" | "edit_file" | "create_file" | "delete_file" | "move_file" | "rename_file" => {
+            if args.get("path").and_then(|p| p.as_str()).is_some() {
+                (true, None)
+            } else {
+                (false, Some("path"))
+            }
+        }
+        "multi_edit_file" => {
+            let has_top_level_path = args.get("path").and_then(|p| p.as_str()).is_some();
+            let has_paths_per_edit = args
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .or_else(|| args.get("changes").and_then(|e| e.as_array()))
+                .map(|edits| !edits.is_empty() && edits.iter().all(|edit| edit.get("path").and_then(|p| p.as_str()).is_some()))
+                .unwrap_or(false);
+            if has_top_level_path || has_paths_per_edit {
+                (true, None)
+            } else {
+                (false, Some("path"))
+            }
+        }
+        "run_command" => {
+            if args.get("command").and_then(|c| c.as_str()).is_some() {
+                (true, None)
+            } else {
+                (false, Some("command"))
+            }
+        }
+        "ask_user" => {
+            if is_meaningful_ask_user_question(args) {
+                (true, None)
+            } else {
+                (false, Some("question"))
+            }
+        }
+        "search_files" => {
+            if args.get("pattern").and_then(|p| p.as_str()).is_some() {
+                (true, None)
+            } else {
+                (false, Some("pattern"))
+            }
+        }
+        "grep_search" => {
+            if args.get("query").and_then(|q| q.as_str()).is_some() {
+                (true, None)
+            } else {
+                (false, Some("query"))
+            }
+        }
+        _ => {
+            if valid_tools.contains(&tool_name) {
+                (true, None)
+            } else {
+                (false, Some("unknown_tool"))
+            }
+        }
+    }
+}
+
 fn glob_like_pattern_matches(path: &std::path::Path, pattern: &str, root: &std::path::Path) -> bool {
     let normalized_pattern = pattern.replace('\\', "/");
     if normalized_pattern.is_empty() {
@@ -296,6 +361,13 @@ fn tool_result_indicates_effective_edit(tool_name: &str, result: &str) -> bool {
         return false;
     }
 
+    if result.contains("WRITE_SKIPPED_NOOP")
+        || result.contains("EDIT_SKIPPED_NOOP")
+        || result.contains("identical content")
+    {
+        return false;
+    }
+
     if tool_name == "multi_edit_file" {
         return !result.contains("applied 0/");
     }
@@ -322,6 +394,49 @@ fn is_verification_command(command: &str) -> bool {
     ];
 
     markers.iter().any(|marker| normalized.contains(marker))
+}
+
+fn is_project_scaffolding_command(command: &str) -> bool {
+    let normalized = command.to_lowercase();
+    let patterns = [
+        "npm create vite",
+        "npx create-vite",
+        "pnpm create vite",
+        "yarn create vite",
+        "create-tauri-app",
+        "npm init vite",
+        "npx degit",
+    ];
+
+    patterns.iter().any(|pattern| normalized.contains(pattern))
+}
+
+fn workspace_has_existing_project(workspace_path: &Option<String>) -> bool {
+    let Some(ws) = workspace_path.as_ref() else {
+        return false;
+    };
+
+    let Ok(entries) = std::fs::read_dir(ws) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".whizcode" || name == ".git" || name == "node_modules" || name == "target" {
+            continue;
+        }
+        return true;
+    }
+
+    false
+}
+
+fn scaffolding_block_message(command: &str) -> String {
+    format!(
+        "Scaffolding command blocked: '{}' would create a brand-new starter project in a workspace that already has files. Work inside the current workspace instead. Read the existing app structure, choose the main implementation files, and build the requested product there. Only scaffold a new app if the user explicitly asks for a brand-new project/repo.",
+        command
+    )
 }
 
 fn build_task_file_from_execution_plan(
@@ -1170,7 +1285,7 @@ impl StreamingAgentOrchestrator {
                 "Approve to continue the current task for another 30 iterations.".to_string(),
             ]),
             persona: Some("agent".to_string()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             data: Some(serde_json::json!({
                 "reason": "iteration_limit",
                 "iteration": iteration,
@@ -1182,7 +1297,7 @@ impl StreamingAgentOrchestrator {
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         {
             let mut permission_tx = crate::commands::agent::PERMISSION_TX.lock().unwrap();
-            *permission_tx = Some(tx);
+            permission_tx.insert(request_id.clone(), tx);
         }
 
         match rx.await {
@@ -2540,6 +2655,9 @@ impl StreamingAgentOrchestrator {
                         // Format guidance for agent
                         let formatted_guidance = crate::commands::loop_recovery::format_guidance_for_agent(&recovery_guidance);
                         tool_results.push(formatted_guidance);
+                        if tool_calls.iter().any(|tc| is_edit_tool_name(tc.tool.as_str())) {
+                            tool_results.push("[SYSTEM] EDIT LOOP RECOVERY: You are repeating the same edit. Do not emit the same write again. Reuse the file contents you already read, target one concrete file, and either: 1) use `write_file` with a complete final file and explicit `path`, or 2) use `edit_file` / `multi_edit_file` with a smaller, more precise payload.".to_string());
+                        }
                         repeat_count = 0;  // Reset counter to allow recovery
                         
                         // Continue loop instead of breaking
@@ -2550,7 +2668,11 @@ impl StreamingAgentOrchestrator {
                             break;
                         }
                     } else {
-                        tool_results.push("[SYSTEM] REPETITION WARNING: You repeated the exact same tool call. Analyze why it didn't give you the info you needed and change your parameters or try a different tool.".to_string());
+                        let mut warning = "[SYSTEM] REPETITION WARNING: You repeated the exact same tool call. Analyze why it didn't give you the info you needed and change your parameters or try a different tool.".to_string();
+                        if tool_calls.iter().any(|tc| is_edit_tool_name(tc.tool.as_str())) {
+                            warning.push_str(" If this is an edit, do not resend the same large payload; shrink the edit or switch to a more precise file operation.");
+                        }
+                        tool_results.push(warning);
                     }
                 } else {
                     repeat_count = 0;
@@ -4130,6 +4252,21 @@ impl StreamingAgentOrchestrator {
                         continue;
                     }
 
+                    if tool_call.tool == "run_command"
+                        && tool_call
+                            .args
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .map(is_project_scaffolding_command)
+                            .unwrap_or(false)
+                        && workspace_has_existing_project(workspace_path)
+                    {
+                        let command = tool_call.args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        let message = scaffolding_block_message(command);
+                        executed_results.push((tool_call.clone(), Ok(message)));
+                        continue;
+                    }
+
                     if let Some(skip_reason) = should_skip_redundant_file_read(
                         tool_call,
                         workspace_path,
@@ -4332,59 +4469,8 @@ impl StreamingAgentOrchestrator {
                                                 let tool_name = canonicalize_tool_name(tool_name);
                                                 let args = obj.get("args").cloned().unwrap_or(serde_json::json!({}));
 
-                                                // Validate required arguments for critical tools
-                                                let (is_valid, missing_arg) = match tool_name {
-                                                    "read_file" | "write_file" | "edit_file" | "create_file" | "delete_file" | "move_file" | "rename_file" => {
-                                                        if args.get("path").and_then(|p| p.as_str()).is_some() {
-                                                            (true, None)
-                                                        } else {
-                                                            (false, Some("path"))
-                                                        }
-                                                    },
-                                                    "multi_edit_file" => {
-                                                        let has_top_level_path = args.get("path").and_then(|p| p.as_str()).is_some();
-                                                        let has_paths_per_edit = args
-                                                            .get("edits")
-                                                            .and_then(|e| e.as_array())
-                                                            .or_else(|| args.get("changes").and_then(|e| e.as_array()))
-                                                            .map(|edits| !edits.is_empty() && edits.iter().all(|edit| edit.get("path").and_then(|p| p.as_str()).is_some()))
-                                                            .unwrap_or(false);
-                                                        if has_top_level_path || has_paths_per_edit {
-                                                            (true, None)
-                                                        } else {
-                                                            (false, Some("path"))
-                                                        }
-                                                    }
-                                                    "run_command" => {
-                                                        if args.get("command").and_then(|c| c.as_str()).is_some() {
-                                                            (true, None)
-                                                        } else {
-                                                            (false, Some("command"))
-                                                        }
-                                                    },
-                                                    "ask_user" => {
-                                                        if is_meaningful_ask_user_question(&args) {
-                                                            (true, None)
-                                                        } else {
-                                                            (false, Some("question"))
-                                                        }
-                                                    }
-                                                    "search_files" | "grep_search" => {
-                                                        if args.get("pattern").and_then(|p| p.as_str()).is_some() {
-                                                            (true, None)
-                                                        } else {
-                                                            (false, Some("pattern"))
-                                                        }
-                                                    }
-                                                    _ => {
-                                                        // Check if tool is in the valid list
-                                                        if valid_tools.contains(&tool_name) {
-                                                            (true, None)
-                                                        } else {
-                                                            (false, Some("unknown_tool"))
-                                                        }
-                                                    }
-                                                };
+                                                let (is_valid, missing_arg) =
+                                                    validate_tool_call_args(tool_name, &args, &valid_tools);
 
                                                 if !is_valid {
                                                     eprintln!("[Phase 4] ⚠️ Tool '{}' missing required argument: {:?}, skipping", tool_name, missing_arg);
@@ -4457,6 +4543,74 @@ impl StreamingAgentOrchestrator {
                     // ─────────────────────────────────────────────────────────
                     // PHASE 2: EXECUTE TOOLS SEQUENTIALLY
                     // ─────────────────────────────────────────────────────────
+                    if tool_queue.is_empty() && raw_llm_text.contains("\"tool\"") {
+                        let mut recovered_calls = extract_tool_calls(&raw_llm_text);
+                        if recovered_calls.is_empty() {
+                            recovered_calls = extract_tool_calls_from_prose(&raw_llm_text);
+                        }
+
+                        if !recovered_calls.is_empty() {
+                            eprintln!(
+                                "[Phase 4] Recovered {} tool call(s) from raw response after stream parsing yielded none",
+                                recovered_calls.len()
+                            );
+
+                            for recovered in recovered_calls {
+                                let canonical_tool = canonicalize_tool_name(&recovered.tool).to_string();
+                                let (is_valid, missing_arg) =
+                                    validate_tool_call_args(&canonical_tool, &recovered.args, &valid_tools);
+
+                                if !is_valid {
+                                    let args_str = serde_json::to_string(&recovered.args)
+                                        .unwrap_or_else(|_| "{}".to_string());
+                                    let missing_info = missing_arg
+                                        .map(|m| format!(" (missing: \"{}\")", m))
+                                        .unwrap_or_default();
+                                    let tool_error = if missing_arg == Some("unknown_tool") {
+                                        format!("Recovered tool '{}' is not recognized", canonical_tool)
+                                    } else {
+                                        format!(
+                                            "Recovered tool '{}'{} with args: {}",
+                                            canonical_tool, missing_info, args_str
+                                        )
+                                    };
+                                    rejected_tools.push(tool_error);
+                                    continue;
+                                }
+
+                                let tool_id = format!("tool_{}_recovered_{}", iteration, tool_counter);
+                                tool_counter += 1;
+
+                                let tool_call = ToolCall {
+                                    tool: canonical_tool.clone(),
+                                    args: recovered.args.clone(),
+                                };
+
+                                if canonical_tool != "done" && canonical_tool != "ask_user" {
+                                    let args_json = serde_json::to_string(&tool_call.args)
+                                        .unwrap_or_else(|_| "{}".to_string());
+                                    let identified_step = AgentStep {
+                                        iteration,
+                                        tool: canonical_tool.clone(),
+                                        status: "identified".to_string(),
+                                        summary: format!(
+                                            "Recovered tool identified: {} with args: {}",
+                                            canonical_tool, args_json
+                                        ),
+                                        result: None,
+                                        logs: None,
+                                        persona: Some("agent".to_string()),
+                                        request_id: Some(tool_id),
+                                        data: None,
+                                    };
+                                    self.emit_step(identified_step).await;
+                                }
+
+                                tool_queue.push(tool_call);
+                            }
+                        }
+                    }
+
                     eprintln!("[Phase 4] PHASE 2: Executing tools sequentially");
 
                     let tool_groups = identify_independent_tool_groups(&tool_queue);
@@ -4614,6 +4768,33 @@ impl StreamingAgentOrchestrator {
                                     continue;
                                 }
 
+                                if tool_call.tool == "run_command"
+                                    && tool_call
+                                        .args
+                                        .get("command")
+                                        .and_then(|value| value.as_str())
+                                        .map(is_project_scaffolding_command)
+                                        .unwrap_or(false)
+                                    && workspace_has_existing_project(workspace_path)
+                                {
+                                    let command = tool_call.args.get("command").and_then(|value| value.as_str()).unwrap_or("");
+                                    let blocked = scaffolding_block_message(command);
+                                    let blocked_step = AgentStep {
+                                        iteration,
+                                        tool: tool_call.tool.clone(),
+                                        status: "skipped".to_string(),
+                                        summary: blocked.clone(),
+                                        result: Some(blocked.clone()),
+                                        logs: Some(vec![blocked.clone()]),
+                                        persona: Some("agent".to_string()),
+                                        request_id: Some(format!("tool_{}_{}_blocked_scaffold", iteration, tool_idx)),
+                                        data: build_step_data(tool_call),
+                                    };
+                                    self.emit_step(blocked_step).await;
+                                    executed_results.push((tool_call.clone(), Ok(blocked)));
+                                    continue;
+                                }
+
                                 if let Some(skip_reason) = should_skip_redundant_file_read(
                                     tool_call,
                                     workspace_path,
@@ -4756,6 +4937,25 @@ impl StreamingAgentOrchestrator {
             }
         }
 
+        if effective_tool_call.tool == "write_file" || effective_tool_call.tool == "create_file" {
+            if let (Some(path), Some(content)) = (
+                effective_tool_call.args.get("path").and_then(|value| value.as_str()),
+                effective_tool_call.args.get("content").and_then(|value| value.as_str()),
+            ) {
+                let resolved_path = normalize_tool_read_path(workspace_path, path);
+                if let Ok(existing_content) = tokio::fs::read_to_string(&resolved_path).await {
+                    if existing_content == content {
+                        let message = format!(
+                            "WRITE_SKIPPED_NOOP: {} already contains identical content. Do not repeat the same full-file write. Strategy shift required: inspect a different related file, make a smaller targeted edit, or run the next meaningful verification step if the implementation is already in place.",
+                            path
+                        );
+                        eprintln!("[Agent] {}", message);
+                        return Ok(message);
+                    }
+                }
+            }
+        }
+
         let args_json = serde_json::to_string(&effective_tool_call.args)
             .unwrap_or_else(|_| "{}".to_string());
         let request_id = format!("tool_{}_{}", iteration, tool_idx);
@@ -4783,7 +4983,7 @@ impl StreamingAgentOrchestrator {
                     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
                     {
                         let mut permission_tx = crate::commands::agent::PERMISSION_TX.lock().unwrap();
-                        *permission_tx = Some(tx);
+                        permission_tx.insert(request_id.clone(), tx);
                     }
 
                     match rx.await {
@@ -5806,6 +6006,16 @@ impl StreamingAgentOrchestrator {
                 "<workspace_root>{}\nIMPORTANT: Use this EXACT path in all file operations.</workspace_root>\n\n",
                 ws
             ));
+            if workspace_has_existing_project(&Some(ws.clone())) {
+                ctx.push_str(
+                    "<workspace_mode>existing_project</workspace_mode>\n\
+<workspace_instruction>\n\
+This workspace already contains project files. Treat this task as modifying and upgrading the existing product unless the user explicitly asks for a brand-new repo/app.\n\
+Do not create a fresh starter app or scaffold a parallel project folder when the current workspace can be used.\n\
+Your default goal is to leave this existing workspace with a production-ready result.\n\
+</workspace_instruction>\n\n"
+                );
+            }
 
             // ── FILE TREE (cached, 5-min TTL, capped at 200 entries) ──────
             if let Some(snapshot) = workspace_snapshot_owned.as_ref() {
@@ -6759,11 +6969,19 @@ async fn execute_tool_standalone(
             }
             
             eprintln!("[ask_user] Question for user: {}", question);
+            let request_id = format!(
+                "ask_user_{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
             
             // Emit special event for the frontend to show a prompt
             if let Some(handle) = _app_handle {
                 let _ = handle.emit("agent:ask_user", serde_json::json!({
-                    "question": question
+                    "question": question,
+                    "requestId": request_id
                 }));
             }
 
@@ -6771,7 +6989,7 @@ async fn execute_tool_standalone(
             let (tx, rx) = tokio::sync::oneshot::channel::<String>();
             {
                 let mut ask_user_tx = crate::commands::agent::ASK_USER_TX.lock().unwrap();
-                *ask_user_tx = Some(tx);
+                ask_user_tx.insert(request_id.clone(), tx);
             }
             
             // Wait for user input. An empty response is treated as a cancellation.

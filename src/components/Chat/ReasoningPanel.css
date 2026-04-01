@@ -1,0 +1,113 @@
+.reasoning-panel {
+  background: linear-gradient(
+    135deg,
+    rgba(59, 130, 246, 0.1) 0%,
+    rgba(37, 99, 235, 0.05) 100%
+  );
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 8px 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.reasoning-panel .panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.reasoning-panel .panel-header .emoji {
+  font-size: 18px;
+}
+
+.reasoning-panel .panel-header h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #3b82f6;
+  flex: 1;
+}
+
+.reasoning-panel .panel-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.reasoning-panel .action-section,
+.reasoning-panel .why-section,
+.reasoning-panel .outcome-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.reasoning-panel strong {
+  color: #3b82f6;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.reasoning-panel .action-text,
+.reasoning-panel .why-text,
+.reasoning-panel .outcome-text {
+  margin: 0;
+  color: var(--text-primary);
+  padding: 6px;
+  background: rgba(59, 130, 246, 0.05);
+  border-left: 2px solid rgba(59, 130, 246, 0.3);
+  border-radius: 4px;
+}
+
+.reasoning-panel .alternatives-section,
+.reasoning-panel .risks-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reasoning-panel h4 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: #3b82f6;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.reasoning-panel .alternatives-list,
+.reasoning-panel .risks-list {
+  margin: 0;
+  padding-left: 16px;
+  list-style: none;
+}
+
+.reasoning-panel .alternatives-list li,
+.reasoning-panel .risks-list li {
+  color: var(--text-primary);
+  margin-bottom: 4px;
+  padding-left: 6px;
+  position: relative;
+}
+
+.reasoning-panel .alternatives-list li:before {
+  content: "→";
+  position: absolute;
+  left: -12px;
+  color: #3b82f6;
+  font-weight: bold;
+}
+
+.reasoning-panel .risks-list li:before {
+  content: "⚠";
+  position: absolute;
+  left: -12px;
+  color: #f59e0b;
+}

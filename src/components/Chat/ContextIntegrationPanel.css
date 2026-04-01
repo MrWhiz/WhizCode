@@ -1,0 +1,122 @@
+.context-integration-panel {
+  background: linear-gradient(
+    135deg,
+    rgba(168, 85, 247, 0.1) 0%,
+    rgba(147, 51, 234, 0.05) 100%
+  );
+  border: 1px solid rgba(168, 85, 247, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 8px 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.context-integration-panel .panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(168, 85, 247, 0.2);
+}
+
+.context-integration-panel .panel-header .icon {
+  font-size: 18px;
+}
+
+.context-integration-panel .panel-header h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #a855f7;
+  flex: 1;
+}
+
+.context-integration-panel .relevance-badge {
+  background: rgba(168, 85, 247, 0.2);
+  color: #a855f7;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.context-integration-panel .panel-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.context-integration-panel .patterns-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.context-integration-panel strong {
+  color: #a855f7;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.context-integration-panel .patterns-count {
+  margin: 0;
+  color: var(--text-primary);
+  padding: 6px;
+  background: rgba(168, 85, 247, 0.05);
+  border-left: 2px solid rgba(168, 85, 247, 0.3);
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.context-integration-panel .suggestions-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.context-integration-panel h4 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: #a855f7;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.context-integration-panel .suggestions-list {
+  margin: 0;
+  padding-left: 16px;
+  list-style: none;
+}
+
+.context-integration-panel .suggestions-list li {
+  color: var(--text-primary);
+  margin-bottom: 4px;
+  padding-left: 6px;
+  position: relative;
+}
+
+.context-integration-panel .suggestions-list li:before {
+  content: "💡";
+  position: absolute;
+  left: -12px;
+}
+
+.context-integration-panel .knowledge-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.context-integration-panel .knowledge-text {
+  margin: 0;
+  color: var(--text-primary);
+  padding: 6px;
+  background: rgba(168, 85, 247, 0.05);
+  border-left: 2px solid rgba(168, 85, 247, 0.3);
+  border-radius: 4px;
+}

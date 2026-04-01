@@ -88,6 +88,27 @@ pub struct PlanningSystem {
     plan_history: Vec<ExecutionPlan>,
 }
 
+fn workspace_has_existing_project(workspace_path: &Option<String>) -> bool {
+    let Some(ws) = workspace_path.as_ref() else {
+        return false;
+    };
+
+    let Ok(entries) = std::fs::read_dir(ws) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".whizcode" || name == ".git" || name == "node_modules" || name == "target" {
+            continue;
+        }
+        return true;
+    }
+
+    false
+}
+
 impl PlanningSystem {
     pub fn new() -> Self {
         Self {
@@ -98,15 +119,16 @@ impl PlanningSystem {
     pub fn create_plan(&mut self, user_request: &str, workspace_path: &Option<String>) -> ExecutionPlan {
         let objective = self.extract_objective(user_request);
         let task_type = self.classify_request(user_request);
+        let has_existing_project = workspace_has_existing_project(workspace_path);
         let acceptance_criteria = self.derive_acceptance_criteria(user_request, &task_type);
-        let assumptions = self.derive_assumptions(user_request, workspace_path);
+        let assumptions = self.derive_assumptions(user_request, workspace_path, has_existing_project);
         let definition_of_done = self.build_definition_of_done(&task_type, &acceptance_criteria);
-        let spec_summary = self.build_spec_summary(user_request, &task_type, &acceptance_criteria);
-        let execution_strategy = self.build_execution_strategy(&task_type);
+        let spec_summary = self.build_spec_summary(user_request, &task_type, &acceptance_criteria, has_existing_project);
+        let execution_strategy = self.build_execution_strategy(&task_type, has_existing_project);
 
         let tasks = match task_type.as_str() {
             "bug-fix" => self.plan_bug_fix(&acceptance_criteria),
-            "feature-implementation" => self.plan_feature_implementation(&acceptance_criteria),
+            "feature-implementation" => self.plan_feature_implementation(&acceptance_criteria, has_existing_project),
             "refactoring" => self.plan_refactoring(&acceptance_criteria),
             "analysis" => self.plan_analysis(&acceptance_criteria),
             _ => self.plan_generic_task(&acceptance_criteria),
@@ -168,18 +190,68 @@ impl PlanningSystem {
         ];
 
         let lower = request.to_lowercase();
+        let implies_build_work = lower.contains("build")
+            || lower.contains("create")
+            || lower.contains("implement")
+            || lower.contains("make")
+            || lower.contains("design")
+            || lower.contains("develop")
+            || lower.contains("ship");
         if task_type == "feature-implementation" {
             criteria.push("A visible or behavioral feature change must exist in the code, not just planning notes.".to_string());
+            criteria.push("The delivered result should feel professional and production-ready for the requested scope, not like starter boilerplate or a placeholder demo.".to_string());
+            criteria.push("User-facing work should include coherent content, states, and styling appropriate to the request.".to_string());
+            criteria.push("The implementation should be suitable for real use in the current project rather than stopping at scaffolding.".to_string());
+            criteria.push("Placeholder copy, stubbed interactions, unfinished flows, or renamed templates are not sufficient for completion.".to_string());
+            criteria.push("The result should include the supporting polish expected in production: sensible validation, loading/error/empty states where relevant, and verification appropriate to the stack.".to_string());
             if lower.contains("dashboard") {
                 criteria.push("The UI should expose a dashboard-style summary instead of only raw transaction entry.".to_string());
             }
             if lower.contains("categor") {
                 criteria.push("Transactions should support categories and the UI should surface category information.".to_string());
             }
+            if lower.contains("website")
+                || lower.contains("landing page")
+                || lower.contains("travel")
+                || lower.contains("vlog")
+                || lower.contains("blog")
+                || lower.contains("portfolio")
+            {
+                criteria.push("The result should be a polished, user-facing website experience rather than starter boilerplate or a renamed scaffold.".to_string());
+                criteria.push("The page should include production-grade sections, tailored content, and responsive styling aligned with the requested theme.".to_string());
+                criteria.push("The implementation should remain inside the current project unless the user explicitly requests a brand-new app.".to_string());
+            }
+            if lower.contains("deploy") || lower.contains("ready to deploy") || lower.contains("production") {
+                criteria.push("The feature should build successfully for production in the current stack.".to_string());
+            }
         }
 
         if task_type == "bug-fix" {
             criteria.push("The specific broken behavior should be reproducibly addressed.".to_string());
+            criteria.push("The fix should be robust enough for production use, including appropriate safeguards against obvious regressions.".to_string());
+        }
+
+        if task_type == "generic" {
+            criteria.push("The result should move beyond setup or scaffolding into a professional, usable implementation.".to_string());
+        }
+
+        if implies_build_work {
+            criteria.push("The implementation should be cohesive enough that a user could reasonably treat it as production-ready within the requested scope.".to_string());
+        }
+
+        if lower.contains("app")
+            || lower.contains("website")
+            || lower.contains("site")
+            || lower.contains("dashboard")
+            || lower.contains("tool")
+            || lower.contains("platform")
+            || lower.contains("product")
+        {
+            criteria.push("The delivered product should feel complete in the current scope, not like a starter skeleton awaiting major follow-up work.".to_string());
+        }
+
+        if implies_build_work || lower.contains("production") || lower.contains("deploy") {
+            criteria.push("If the current stack supports a production build or equivalent release verification, it should pass before completion.".to_string());
         }
 
         if lower.contains("test") {
@@ -189,10 +261,13 @@ impl PlanningSystem {
         criteria
     }
 
-    fn derive_assumptions(&self, request: &str, workspace_path: &Option<String>) -> Vec<String> {
+    fn derive_assumptions(&self, request: &str, workspace_path: &Option<String>, has_existing_project: bool) -> Vec<String> {
         let mut assumptions = Vec::new();
         if workspace_path.is_some() {
             assumptions.push("The best implementation path should be inferred from the current repository structure.".to_string());
+        }
+        if has_existing_project {
+            assumptions.push("The workspace already contains project files, so the task should be solved by modifying the existing product rather than scaffolding a brand-new starter app.".to_string());
         }
         if !request.to_lowercase().contains("spec") {
             assumptions.push("If requirements are underspecified, choose the highest-value, smallest safe implementation that fits the existing app.".to_string());
@@ -206,26 +281,36 @@ impl PlanningSystem {
         done.push("The task must finish with either a meaningful code change plus verification, or a clear failure reason.".to_string());
         if task_type == "feature-implementation" || task_type == "refactoring" {
             done.push("At least one meaningful edit tool must succeed before the task can be considered complete.".to_string());
+            done.push("A starter scaffold, untouched template, or renamed boilerplate is not sufficient for completion.".to_string());
+            done.push("The implementation must be coherent enough that another engineer could review it as a serious production candidate rather than a prototype stub.".to_string());
         }
+        done.push("Compilation alone is not enough; the result must satisfy the user's actual product intent at a professional quality level.".to_string());
         done
     }
 
-    fn build_spec_summary(&self, request: &str, task_type: &str, acceptance_criteria: &[String]) -> String {
+    fn build_spec_summary(&self, request: &str, task_type: &str, acceptance_criteria: &[String], has_existing_project: bool) -> String {
         format!(
-            "Task type: {}. User request: {}. Expected outcome: {}",
+            "Task type: {}. Workspace mode: {}. User request: {}. Expected outcome: {}",
             task_type,
+            if has_existing_project { "modify-existing-project" } else { "greenfield-if-needed" },
             request.trim(),
             acceptance_criteria.first().cloned().unwrap_or_else(|| "Deliver the requested change.".to_string())
         )
     }
 
-    fn build_execution_strategy(&self, task_type: &str) -> String {
+    fn build_execution_strategy(&self, task_type: &str, has_existing_project: bool) -> String {
         match task_type {
-            "feature-implementation" => "Spec-first: define acceptance criteria, confirm target files, implement the smallest valuable feature slice, then verify.".to_string(),
+            "feature-implementation" => {
+                if has_existing_project {
+                    "Spec-first: define acceptance criteria, identify the existing app surfaces that should change, implement a complete valuable slice at professional quality inside the current project, finish the supporting states and polish needed for real use, then verify. Do not scaffold a new app unless explicitly requested.".to_string()
+                } else {
+                    "Spec-first: define acceptance criteria, confirm target files in the current workspace, implement a complete valuable slice at professional quality, finish the supporting states and polish needed for real use, then verify. Do not scaffold a new app unless explicitly requested.".to_string()
+                }
+            }
             "bug-fix" => "Repro-first: confirm the failure shape, isolate the source, patch narrowly, then verify.".to_string(),
-            "refactoring" => "Safety-first: identify the refactor seam, preserve behavior, then validate.".to_string(),
+            "refactoring" => "Safety-first: identify the refactor seam, preserve behavior, improve maintainability, then validate.".to_string(),
             "analysis" => "Investigation-first: gather focused evidence, synthesize findings, and avoid unnecessary edits.".to_string(),
-            _ => "Plan before acting: understand intent, make the smallest safe change, then verify.".to_string(),
+            _ => "Plan before acting: understand intent, deliver a professional-quality result instead of minimal scaffolding, include the supporting polish needed for real use, then verify.".to_string(),
         }
     }
 
@@ -282,7 +367,7 @@ impl PlanningSystem {
         ]
     }
 
-    fn plan_feature_implementation(&self, acceptance_criteria: &[String]) -> Vec<PlanTask> {
+    fn plan_feature_implementation(&self, acceptance_criteria: &[String], has_existing_project: bool) -> Vec<PlanTask> {
         vec![
             PlanTask {
                 id: "define-spec".to_string(),
@@ -298,7 +383,11 @@ impl PlanningSystem {
             },
             PlanTask {
                 id: "design-approach".to_string(),
-                description: "Choose the smallest architecture and UI approach that satisfies the spec".to_string(),
+                description: if has_existing_project {
+                    "Choose the smallest architecture and UI approach that upgrades the existing product to satisfy the spec".to_string()
+                } else {
+                    "Choose the smallest architecture and UI approach that satisfies the spec".to_string()
+                },
                 task_type: "design".to_string(),
                 priority: 2,
                 dependencies: vec!["define-spec".to_string()],
@@ -310,19 +399,31 @@ impl PlanningSystem {
             },
             PlanTask {
                 id: "locate-target-files".to_string(),
-                description: "Identify the files that should be changed to implement the chosen feature slice".to_string(),
+                description: if has_existing_project {
+                    "Identify the existing files and product surfaces that should be changed instead of creating a new starter app".to_string()
+                } else {
+                    "Identify the files that should be changed to implement the chosen feature slice".to_string()
+                },
                 task_type: "analysis".to_string(),
                 priority: 3,
                 dependencies: vec!["design-approach".to_string()],
                 estimated_duration: 20,
                 owner_agent: "context-gatherer".to_string(),
                 deliverable: "Target file shortlist".to_string(),
-                acceptance_criteria: vec!["A likely implementation file is identified before deep reads.".to_string()],
+                acceptance_criteria: vec![if has_existing_project {
+                    "A likely implementation file in the existing project is identified before deep reads or scaffolding.".to_string()
+                } else {
+                    "A likely implementation file is identified before deep reads.".to_string()
+                }],
                 requires_write: false,
             },
             PlanTask {
                 id: "implement-feature".to_string(),
-                description: "Implement the feature according to the spec and chosen slice".to_string(),
+                description: if has_existing_project {
+                    "Implement the feature by upgrading the current project according to the spec and chosen slice".to_string()
+                } else {
+                    "Implement the feature according to the spec and chosen slice".to_string()
+                },
                 task_type: "edit".to_string(),
                 priority: 4,
                 dependencies: vec!["locate-target-files".to_string()],

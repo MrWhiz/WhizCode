@@ -1,0 +1,111 @@
+.confidence-panel {
+  background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 12px 0;
+  color: white;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.confidence-panel .panel-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.confidence-panel .emoji {
+  font-size: 28px;
+  flex-shrink: 0;
+}
+
+.confidence-panel h3 {
+  margin: 0;
+  flex: 1;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.confidence-panel .score-badge {
+  background: rgba(255, 255, 255, 0.2);
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-weight: bold;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.confidence-panel .panel-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.confidence-panel .tool-info {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.confidence-panel .tool-info code {
+  background: rgba(0, 0, 0, 0.2);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: "Courier New", monospace;
+  font-size: 11px;
+}
+
+.confidence-panel .reasons-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.confidence-panel .reasons-for,
+.confidence-panel .reasons-against {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 12px;
+  border-radius: 4px;
+}
+
+.confidence-panel h4 {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.confidence-panel ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.confidence-panel li {
+  margin: 4px 0;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.confidence-panel .recommendation-section {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 12px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.confidence-panel .recommendation-section strong {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.confidence-panel .recommendation-section p {
+  margin: 0;
+  line-height: 1.4;
+}
+
+@media (max-width: 600px) {
+  .confidence-panel .reasons-grid {
+    grid-template-columns: 1fr;
+  }
+}

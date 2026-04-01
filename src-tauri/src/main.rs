@@ -153,7 +153,6 @@ fn main() {
             commands::dialog::dialog_open_folder,
             
             // Agent operations
-            commands::agent::execute_agent_task,
             commands::agent::agent_stop,
             commands::agent::agent_reset,
             commands::agent::agent_permission_response,
@@ -211,12 +210,6 @@ fn main() {
             commands::task_commands::tasks_exist,
             commands::task_commands::get_pending_tasks_count,
             commands::task_commands::get_completed_tasks_count,
-            
-            // Sub-agents operations
-            commands::sub_agents::list_sub_agents,
-            commands::sub_agents::get_sub_agent_config,
-            commands::sub_agents::invoke_sub_agent,
-            commands::sub_agents::orchestrate_sub_agents,
             
             // Learning operations
             commands::learning::learning_analyze_patterns,
@@ -328,16 +321,6 @@ fn main() {
             commands::graph::graph_analyze_reachability,
             commands::graph::graph_get_graph,
             commands::graph::graph_clear_graph,
-            
-            // Agent orchestrator operations
-            commands::agent_orchestrator::execute_agent_loop,
-            commands::agent_orchestrator::agent_reasoning_with_cot,
-            commands::agent_orchestrator::agent_validate_cot_response,
-            commands::agent_orchestrator::agent_get_cot_metrics,
-            commands::agent_orchestrator::agent_evaluate_confidence,
-            commands::agent_orchestrator::agent_calculate_tool_confidence,
-            commands::agent_orchestrator::agent_assess_decision_risk,
-            commands::agent_orchestrator::agent_get_confidence_thresholds,
             
             // Tool metrics operations
             commands::tool_metrics::tool_metrics_record_execution,

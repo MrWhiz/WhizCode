@@ -663,39 +663,11 @@ export const history = {
 
 // Agent Commands
 export const agent = {
-  async executeTask(options: any): Promise<any> {
-    try {
-      return await invoke('execute_agent_task', {
-        task: options.task,
-        model: options.model,
-        workspacePath: options.workspacePath,
-        activeFile: options.activeFile,
-        config: options.config,
-        isAutopilotMode: options.isAutopilotMode,
-        images: options.images
-      })
-    } catch (error) {
-      throw handleError(error)
-    }
-  },
-
-  async executeLoop(options: any): Promise<any> {
-    try {
-      return await invoke('execute_agent_loop', {
-        task: options.task,
-        model: options.model,
-        workspacePath: options.workspacePath,
-        activeFile: options.activeFile,
-      })
-    } catch (error) {
-      throw handleError(error)
-    }
-  },
-
   async executeLoopStreaming(options: any): Promise<any> {
     try {
       const wsPath = options.workspacePath || options.workspace_path || null
       const activeFile = options.activeFile || null
+      const contextLength = options.contextLength ?? options.context_length ?? null
       // FIX #1: Send conversation history so the LLM has multi-turn memory
       const conversationHistory = (options.conversationHistory || []).map((m: any) => ({
         role: m.role === 'user' ? 'user' : 'assistant',
@@ -708,6 +680,7 @@ export const agent = {
         workspacePath: wsPath,
         activeFile: activeFile,
         conversationHistory: conversationHistory,
+        contextLength,
       })
     } catch (error) {
       throw handleError(error)
@@ -1002,50 +975,6 @@ export const tasks = {
 }
 
 // Export all APIs
-export const planner = {
-  async createPlan(context: any): Promise<any> {
-    try {
-      return await invoke('create_plan', context)
-    } catch (error) {
-      throw handleError(error)
-    }
-  },
-}
-
-export const subAgents = {
-  async listAll(): Promise<any[]> {
-    try {
-      return await invoke('list_sub_agents')
-    } catch (error) {
-      throw handleError(error)
-    }
-  },
-
-  async getConfig(agentName: string): Promise<any> {
-    try {
-      return await invoke('get_sub_agent_config', { agentName })
-    } catch (error) {
-      throw handleError(error)
-    }
-  },
-
-  async invoke(agentName: string, taskDescription: string): Promise<string> {
-    try {
-      return await invoke('invoke_sub_agent', { agentName, taskDescription })
-    } catch (error) {
-      throw handleError(error)
-    }
-  },
-
-  async orchestrate(workItems: SubAgentWorkItem[]): Promise<any> {
-    try {
-      return await invoke('orchestrate_sub_agents', { workItems })
-    } catch (error) {
-      throw handleError(error)
-    }
-  },
-}
-
 export const workspaceSearch = vector
 
 export const learning = {
@@ -1450,8 +1379,6 @@ export default {
   mcp,
   specs,
   tasks,
-  planner,
-  subAgents,
   learning,
   contextMemory,
   hooks,

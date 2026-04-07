@@ -109,6 +109,32 @@ fn workspace_has_existing_project(workspace_path: &Option<String>) -> bool {
     false
 }
 
+fn request_is_user_facing(request: &str) -> bool {
+    let lower = request.to_lowercase();
+    [
+        "website",
+        "landing page",
+        "landing",
+        "portfolio",
+        "blog",
+        "travel",
+        "vlog",
+        "dashboard",
+        "ui",
+        "ux",
+        "frontend",
+        "front-end",
+        "page",
+        "app",
+        "site",
+        "product",
+        "marketing",
+        "hero section",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
 impl PlanningSystem {
     pub fn new() -> Self {
         Self {
@@ -120,15 +146,16 @@ impl PlanningSystem {
         let objective = self.extract_objective(user_request);
         let task_type = self.classify_request(user_request);
         let has_existing_project = workspace_has_existing_project(workspace_path);
+        let is_user_facing = request_is_user_facing(user_request);
         let acceptance_criteria = self.derive_acceptance_criteria(user_request, &task_type);
         let assumptions = self.derive_assumptions(user_request, workspace_path, has_existing_project);
         let definition_of_done = self.build_definition_of_done(&task_type, &acceptance_criteria);
         let spec_summary = self.build_spec_summary(user_request, &task_type, &acceptance_criteria, has_existing_project);
-        let execution_strategy = self.build_execution_strategy(&task_type, has_existing_project);
+        let execution_strategy = self.build_execution_strategy(&task_type, has_existing_project, is_user_facing);
 
         let tasks = match task_type.as_str() {
             "bug-fix" => self.plan_bug_fix(&acceptance_criteria),
-            "feature-implementation" => self.plan_feature_implementation(&acceptance_criteria, has_existing_project),
+            "feature-implementation" => self.plan_feature_implementation(&acceptance_criteria, has_existing_project, is_user_facing),
             "refactoring" => self.plan_refactoring(&acceptance_criteria),
             "analysis" => self.plan_analysis(&acceptance_criteria),
             _ => self.plan_generic_task(&acceptance_criteria),
@@ -250,6 +277,12 @@ impl PlanningSystem {
             criteria.push("The delivered product should feel complete in the current scope, not like a starter skeleton awaiting major follow-up work.".to_string());
         }
 
+        if request_is_user_facing(request) {
+            criteria.push("The user-facing result should show deliberate visual hierarchy, spacing, typography, and composition rather than a basic student-project layout.".to_string());
+            criteria.push("The final UI should include enough purposeful sections, content, and styling depth to feel like a real product, not a tutorial exercise.".to_string());
+            criteria.push("A dedicated polish pass should improve visual quality after the main implementation works.".to_string());
+        }
+
         if implies_build_work || lower.contains("production") || lower.contains("deploy") {
             criteria.push("If the current stack supports a production build or equivalent release verification, it should pass before completion.".to_string());
         }
@@ -298,10 +331,12 @@ impl PlanningSystem {
         )
     }
 
-    fn build_execution_strategy(&self, task_type: &str, has_existing_project: bool) -> String {
+    fn build_execution_strategy(&self, task_type: &str, has_existing_project: bool, is_user_facing: bool) -> String {
         match task_type {
             "feature-implementation" => {
-                if has_existing_project {
+                if has_existing_project && is_user_facing {
+                    "Spec-first: define acceptance criteria, identify the existing app surfaces that should change, implement a complete valuable slice at professional quality inside the current project, then do a dedicated polish pass for layout, hierarchy, content, and styling before verification. Do not scaffold a new app unless explicitly requested.".to_string()
+                } else if has_existing_project {
                     "Spec-first: define acceptance criteria, identify the existing app surfaces that should change, implement a complete valuable slice at professional quality inside the current project, finish the supporting states and polish needed for real use, then verify. Do not scaffold a new app unless explicitly requested.".to_string()
                 } else {
                     "Spec-first: define acceptance criteria, confirm target files in the current workspace, implement a complete valuable slice at professional quality, finish the supporting states and polish needed for real use, then verify. Do not scaffold a new app unless explicitly requested.".to_string()
@@ -367,8 +402,8 @@ impl PlanningSystem {
         ]
     }
 
-    fn plan_feature_implementation(&self, acceptance_criteria: &[String], has_existing_project: bool) -> Vec<PlanTask> {
-        vec![
+    fn plan_feature_implementation(&self, acceptance_criteria: &[String], has_existing_project: bool, is_user_facing: bool) -> Vec<PlanTask> {
+        let mut tasks = vec![
             PlanTask {
                 id: "define-spec".to_string(),
                 description: "Define the feature spec, assumptions, and user-visible acceptance criteria".to_string(),
@@ -445,19 +480,40 @@ impl PlanningSystem {
                 acceptance_criteria: vec!["Build or test verification passes after the edit.".to_string()],
                 requires_write: false,
             },
-            PlanTask {
-                id: "review-scope".to_string(),
-                description: "Review the result against the original request and edge cases".to_string(),
+        ];
+
+        if is_user_facing {
+            tasks.push(PlanTask {
+                id: "review-polish".to_string(),
+                description: "Review the user-facing result for visual quality, completeness, and premium feel".to_string(),
                 task_type: "review".to_string(),
                 priority: 6,
                 dependencies: vec!["verify-feature".to_string()],
                 estimated_duration: 15,
-                owner_agent: "code-reviewer".to_string(),
-                deliverable: "Scope review summary".to_string(),
-                acceptance_criteria: vec!["The delivered feature still matches the user's request.".to_string()],
+                owner_agent: "ux-designer".to_string(),
+                deliverable: "UX polish review summary".to_string(),
+                acceptance_criteria: vec![
+                    "The result avoids template-like or student-project aesthetics.".to_string(),
+                    "Layout, hierarchy, and styling feel intentional and production-ready.".to_string(),
+                ],
                 requires_write: false,
-            },
-        ]
+            });
+        }
+
+        tasks.push(PlanTask {
+            id: "review-scope".to_string(),
+            description: "Review the result against the original request and edge cases".to_string(),
+            task_type: "review".to_string(),
+            priority: if is_user_facing { 7 } else { 6 },
+            dependencies: vec![if is_user_facing { "review-polish".to_string() } else { "verify-feature".to_string() }],
+            estimated_duration: 15,
+            owner_agent: "code-reviewer".to_string(),
+            deliverable: "Scope review summary".to_string(),
+            acceptance_criteria: vec!["The delivered feature still matches the user's request.".to_string()],
+            requires_write: false,
+        });
+
+        tasks
     }
 
     fn plan_refactoring(&self, acceptance_criteria: &[String]) -> Vec<PlanTask> {

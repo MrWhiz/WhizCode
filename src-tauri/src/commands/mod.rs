@@ -62,3 +62,4 @@ pub mod task_analyzer;
 pub mod context_integration;
 pub mod steering_files;
 pub mod steering_commands;
+pub mod skills;

@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::commands::retry_manager::{RetryManager, RetryConfig, AutoRecoveryEngine};
 use crate::commands::steering::SteeringSystem;
 use crate::commands::failure_learning::FailureLearningEngine;
+use crate::commands::skills;
 use futures::future::join_all;
 use regex::Regex;
 
@@ -1910,11 +1911,76 @@ impl StreamingAgentOrchestrator {
 
         final_task_msg.push_str(&context_memory_hint);
 
+        // ─────────────────────────────────────────────
+        // PHASE 5: Skills Selection & Integration
+        // ─────────────────────────────────────────────
+        eprintln!("[Agent] === PHASE 5: Skills Selection ===");
+        
+        let mut skills_prompt = String::new();
+        
+        // Try to select skills for this task
+        if let Ok(manager) = skills::commands::get_skills_manager() {
+            let project_type = if let Some(_ws) = &workspace_path {
+                // For now, use "unknown" - can be enhanced to detect from files
+                "unknown".to_string()
+            } else {
+                "unknown".to_string()
+            };
+            
+            // Select skills for this task
+            match skills::agent_integration::select_skills_for_task(
+                &task,
+                workspace_path.clone(),
+                project_type,
+                vec![], // Can be enhanced to include actual file list from workspace
+                manager,
+            ).await {
+                Ok(result) => {
+                    eprintln!("[Agent] Selected {} skills for task", result.selected_skills.len());
+                    
+                    // Emit skills selected event to frontend
+                    if let Some(app) = &self.app_handle {
+                        let _ = app.emit("agent:skills_selected", &serde_json::json!({
+                            "count": result.selected_skills.len(),
+                            "skills": result.selected_skills.iter().map(|s| serde_json::json!({
+                                "name": s.name,
+                                "confidence": s.confidence,
+                                "capabilities": s.capabilities,
+                            })).collect::<Vec<_>>(),
+                            "conflicts": result.conflicts_resolved,
+                        }));
+                    }
+                    
+                    // Create skills system prompt addition
+                    if !result.selected_skills.is_empty() {
+                        skills_prompt = skills::agent_integration::create_skills_system_prompt(&result.selected_skills);
+                        eprintln!("[Agent] Skills prompt length: {} chars", skills_prompt.len());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Agent] Failed to select skills: {}", e);
+                }
+            }
+        } else {
+            eprintln!("[Agent] Skills manager not available, skipping skill selection");
+        }
+
         turn_messages.push((
             "user".to_string(),
             final_task_msg,
         ));
         let task_state_message_index = turn_messages.len() - 1;
+
+        // ── Include skills context in system prompt if skills were selected ──
+        if !skills_prompt.is_empty() {
+            // Update the system prompt to include skills context
+            if let Some((role, prompt)) = turn_messages.first_mut() {
+                if role == "system" {
+                    prompt.push_str(&skills_prompt);
+                    eprintln!("[Agent] Included skills context in system prompt");
+                }
+            }
+        }
 
         // Emit execution phase
         if let Some(app) = &self.app_handle {

@@ -1,0 +1,128 @@
+.skills-display {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  margin: 8px 0;
+  background-color: var(--vscode-editor-background, #1e1e1e);
+  border: 1px solid var(--vscode-list-activeSelectionBorder, #007acc);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.skills-display.error {
+  background-color: var(--vscode-inputValidation-errorBackground, #5a1d1d);
+  border-color: var(--vscode-inputValidation-errorBorder, #be1100);
+  color: var(--vscode-inputValidation-errorForeground, #f48771);
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.skills-display.error .error-icon {
+  flex-shrink: 0;
+  font-size: 14px;
+}
+
+.skills-display.error .error-text {
+  flex: 1;
+}
+
+.skills-display.loading {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--vscode-descriptionForeground, #999999);
+}
+
+.skills-display.loading .spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--vscode-descriptionForeground, #999999);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.skills-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--vscode-list-foreground, #cccccc);
+}
+
+.skills-icon {
+  font-size: 14px;
+}
+
+.skills-title {
+  font-size: 12px;
+}
+
+.skills-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.skill-badge {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background-color: var(--vscode-list-hoverBackground, #2d2d30);
+  border: 1px solid var(--vscode-list-activeSelectionBorder, #007acc);
+  border-radius: 3px;
+  min-width: 120px;
+}
+
+.skill-name {
+  font-weight: 600;
+  color: var(--vscode-list-foreground, #cccccc);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.skill-confidence {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground, #999999);
+  font-weight: 500;
+}
+
+.skill-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.capability-tag {
+  display: inline-block;
+  padding: 2px 4px;
+  background-color: var(--vscode-editor-background, #1e1e1e);
+  border: 1px solid var(--vscode-descriptionForeground, #999999);
+  border-radius: 2px;
+  font-size: 9px;
+  color: var(--vscode-descriptionForeground, #999999);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.capability-tag.more {
+  background-color: var(--vscode-list-activeSelectionBackground, #094771);
+  border-color: var(--vscode-list-activeSelectionBorder, #007acc);
+  color: var(--vscode-list-activeSelectionForeground, #ffffff);
+}

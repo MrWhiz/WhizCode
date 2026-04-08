@@ -376,6 +376,18 @@ fn main() {
             commands::steering_commands::validate_steering_files,
             commands::steering_commands::create_default_steering_files,
             commands::steering_commands::get_steering_context,
+            
+            // Skills operations
+            commands::skills::commands::get_skills,
+            commands::skills::commands::discover_skills,
+            commands::skills::commands::refresh_skills,
+            commands::skills::commands::select_skills,
+            commands::skills::commands::get_skill,
+            commands::skills::commands::enable_skill,
+            commands::skills::commands::disable_skill,
+            commands::skills::commands::set_repository_url,
+            commands::skills::commands::get_skills_config,
+            commands::skills::commands::get_skill_count,
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -393,6 +405,17 @@ fn main() {
             if let Ok(history_service) = commands::history::HistoryService::new(&workspace_path) {
                 app.manage(Arc::new(std::sync::Mutex::new(history_service)));
             }
+            
+            // Initialize skills manager
+            let _app_handle_clone = app_handle.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = commands::skills::commands::init_skills_manager().await {
+                        eprintln!("Failed to initialize skills manager: {}", e);
+                    }
+                });
+            });
             
             Ok(())
         })

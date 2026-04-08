@@ -14,6 +14,7 @@ import { LoopRecoveryPanel } from "./LoopRecoveryPanel";
 import { ConfidencePanel } from "./ConfidencePanel";
 import { ReasoningPanel } from "./ReasoningPanel";
 import { ContextIntegrationPanel } from "./ContextIntegrationPanel";
+import { SkillsDisplay } from "./SkillsDisplay";
 import type { ExecutionPlanSnapshot, TaskSnapshot } from "../../lib/tauri-api";
 
 interface ChatPanelProps {
@@ -1469,6 +1470,7 @@ export const ChatPanel = ({
   const [contextIntegrationData, setContextIntegrationData] = React.useState<
     any | null
   >(null);
+  const [selectedSkills, setSelectedSkills] = React.useState<any | null>(null);
 
   React.useEffect(() => {
     const unlistenPhase = (window as any)
@@ -1616,6 +1618,22 @@ export const ChatPanel = ({
     };
   }, []);
 
+  // Event listener for skills selection
+  React.useEffect(() => {
+    const unlistenSkills = (window as any)
+      .__TAURI_INVOKE__?.("listen", {
+        event: "agent:skills_selected",
+        handler: (event: any) => {
+          setSelectedSkills(event.payload);
+        },
+      })
+      .catch(() => {});
+
+    return () => {
+      unlistenSkills?.then((unlisten: any) => unlisten?.());
+    };
+  }, []);
+
   React.useEffect(() => {
     if (!isLoading) {
       setRespondedSteps({});
@@ -1632,6 +1650,7 @@ export const ChatPanel = ({
       setConfidenceData(null);
       setReasoningData(null);
       setContextIntegrationData(null);
+      setSelectedSkills(null);
       // Reset alwaysRun on task completion? Or keep it? Usually better to reset for safety.
       // setAlwaysRun(false);
     } else {
@@ -1890,6 +1909,20 @@ export const ChatPanel = ({
               </div>
             </div>
           )}
+
+          {selectedSkills &&
+            selectedSkills.skills &&
+            selectedSkills.skills.length > 0 && (
+              <div className="chat-msg assistant">
+                <div className="chat-msg-sender">WHIZCODE</div>
+                <div className="chat-msg-content">
+                  <SkillsDisplay
+                    skills={selectedSkills.skills}
+                    isLoading={false}
+                  />
+                </div>
+              </div>
+            )}
 
           <div ref={messagesEndRef} />
         </div>
